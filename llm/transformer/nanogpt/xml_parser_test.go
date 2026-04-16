@@ -2,6 +2,7 @@ package nanogpt
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -416,5 +417,82 @@ func TestParseXMLToolCalls_FunctionParamEdgeCases(t *testing.T) {
 		var args map[string]interface{}
 		require.NoError(t, json.Unmarshal([]byte(tools[0].Function.Arguments), &args))
 		assert.Equal(t, "second", args["pattern"])
+	})
+}
+
+func TestParseXMLToolCalls_FunctionParamExpanded(t *testing.T) {
+	t.Run("dash in function name", func(t *testing.T) {
+		content := "<function=edit-file>\n<parameter=path>src/main.go</parameter>\n</function>"
+
+		tools, _, err := ParseXMLToolCalls(content)
+		require.NoError(t, err)
+		require.Len(t, tools, 1)
+		assert.Equal(t, "edit-file", tools[0].Function.Name)
+
+		var args map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(tools[0].Function.Arguments), &args))
+		assert.Equal(t, "src/main.go", args["path"])
+	})
+
+	t.Run("dot in function name", func(t *testing.T) {
+		content := "<function=search.web>\n<parameter=query>golang regex</parameter>\n</function>"
+
+		tools, _, err := ParseXMLToolCalls(content)
+		require.NoError(t, err)
+		require.Len(t, tools, 1)
+		assert.Equal(t, "search.web", tools[0].Function.Name)
+	})
+
+	t.Run("dash in parameter name", func(t *testing.T) {
+		content := "<function=edit>\n<parameter=file-path>src/main.go</parameter>\n</function>"
+
+		tools, _, err := ParseXMLToolCalls(content)
+		require.NoError(t, err)
+		require.Len(t, tools, 1)
+
+		var args map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(tools[0].Function.Arguments), &args))
+		assert.Equal(t, "src/main.go", args["file-path"])
+	})
+
+	t.Run("uppercase Function tag", func(t *testing.T) {
+		content := "<Function=grep>\n<Parameter=_i>1</Parameter>\n<Parameter=path>src/</Parameter>\n</Function>"
+
+		tools, _, err := ParseXMLToolCalls(content)
+		require.NoError(t, err)
+		require.Len(t, tools, 1)
+		assert.Equal(t, "grep", tools[0].Function.Name)
+	})
+
+	t.Run("truncated function block - no closing tag", func(t *testing.T) {
+		content := "<function=grep>\n<parameter=_i>1</parameter>\n<parameter=path>src/</parameter>\n<parameter=pattern>foo</parameter>"
+
+		tools, remaining, err := ParseXMLToolCalls(content)
+		require.NoError(t, err)
+		require.Len(t, tools, 1)
+		assert.Equal(t, "grep", tools[0].Function.Name)
+
+		var args map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(tools[0].Function.Arguments), &args))
+		assert.Equal(t, "src/", args["path"])
+		assert.Equal(t, "foo", args["pattern"])
+		assert.Equal(t, "", remaining)
+	})
+
+	t.Run("value with angle brackets preserved", func(t *testing.T) {
+		content := "<function=edit>\n<parameter=path>src/main.go</parameter>\n<parameter=edits>[{\"oldText\":\"<div>old</div>\",\"newText\":\"<span>new</span>\"}]</parameter>\n</function>"
+
+		tools, _, err := ParseXMLToolCalls(content)
+		require.NoError(t, err)
+		require.Len(t, tools, 1)
+
+		var args map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(tools[0].Function.Arguments), &args))
+
+		edits, ok := args["edits"].([]interface{})
+		require.True(t, ok)
+		editMap := edits[0].(map[string]interface{})
+		assert.Contains(t, fmt.Sprintf("%v", editMap["oldText"]), "div")
+		assert.Contains(t, fmt.Sprintf("%v", editMap["newText"]), "span")
 	})
 }

@@ -40,15 +40,20 @@ var mismatchTagPattern = regexp.MustCompile(`<(Write|Read|Write_FILE|Write_file|
 // unclosedPattern matches unclosed opening tags like <Write attr="..."\n</use_tool>
 var unclosedPattern = regexp.MustCompile(`<(Write|Read|Write_FILE|Write_file|Read_FILE|Read_file)([^>]*)\n([\s\S]*?)</use_tool>`)
 
-// functionParamPattern matches the <function=NAME>...<parameter=KEY>VALUE</parameter>...</function> format
+// functionParamPattern matches the <function=NAME>...</function> format
 // used by some NanoGPT models that output tool calls as XML instead of native JSON.
+// Allows hyphens and dots in function names (e.g. edit-file, search.web).
 // Uses (?s).*? instead of [^<] because parameter values may contain < characters (e.g. HTML, code).
 // Go's RE2 engine guarantees bounded execution, so lazy quantifiers don't cause ReDoS.
-var functionParamPattern = regexp.MustCompile(`(?s)<function=([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</function>`)
+var functionParamPattern = regexp.MustCompile(`(?si)<function=([a-zA-Z_][a-zA-Z0-9_.-]*)>(.*?)</function>`)
+
+// functionParamOpenPattern matches an opening <function=NAME> without requiring the closing tag.
+// Used to detect truncated/incomplete function blocks during streaming.
+var functionParamOpenPattern = regexp.MustCompile(`(?si)<function=([a-zA-Z_][a-zA-Z0-9_.-]*)>`)
 
 // paramPattern matches individual <parameter=KEY>VALUE</parameter> elements inside a <function=...> block.
-// Uses (?s).*? for the same reason as functionParamPattern — values may contain < characters.
-var paramPattern = regexp.MustCompile(`(?s)<parameter=([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</parameter>`)
+// Allows hyphens and dots in parameter names. Uses (?s).*? for values that may contain < characters.
+var paramPattern = regexp.MustCompile(`(?si)<parameter=([a-zA-Z_][a-zA-Z0-9_.-]*)>(.*?)</parameter>`)
 // MaybeHasXMLToolCalls is a fast pre-check to determine if content likely contains XML tool calls.
 func MaybeHasXMLToolCalls(content string) bool {
 	// Limit content length to prevent ReDoS
@@ -61,6 +66,7 @@ func MaybeHasXMLToolCalls(content string) bool {
 		(toolCallPattern.MatchString(content) ||
 			selfClosingPattern.MatchString(content) ||
 			strings.Contains(content, "<function=") ||
+			strings.Contains(content, "<Function=") ||
 			strings.Contains(content, "use_tool") ||
 			strings.Contains(content, "Write") ||
 			strings.Contains(content, "Bash") ||
@@ -135,6 +141,45 @@ func ParseXMLToolCalls(content string) ([]llm.ToolCall, string, error) {
 				remainingContent.WriteString(content[lastEnd:m[0]])
 			}
 			lastEnd = m[1]
+		}
+	}
+
+	// Handle truncated <function=NAME>... blocks without closing </function>.
+	// During streaming the closing tag may not have arrived yet.
+	// Only process if we didn't already match a complete function block at this position.
+	for _, m := range functionParamOpenPattern.FindAllStringSubmatchIndex(content, -1) {
+		if len(m) >= 4 && m[1] > lastEnd {
+			funcName := strings.ToLower(content[m[2]:m[3]])
+
+			// Extract everything after the opening tag up to end of content
+			paramsBody := content[m[1]:]
+
+			args := parseFunctionParams(paramsBody)
+			if len(args) == 0 {
+				continue
+			}
+
+			argsJSON, err := json.Marshal(args)
+			if err != nil {
+				argsJSON = []byte("{}")
+			}
+
+			id := generateToolCallID(funcName, string(argsJSON))
+
+			toolCalls = append(toolCalls, llm.ToolCall{
+				Index: len(toolCalls),
+				ID:    id,
+				Type:  "function",
+				Function: llm.FunctionCall{
+					Name:      funcName,
+					Arguments: string(argsJSON),
+				},
+			})
+
+			if lastEnd < m[0] {
+				remainingContent.WriteString(content[lastEnd:m[0]])
+			}
+			lastEnd = len(content)
 		}
 	}
 
@@ -415,28 +460,98 @@ func ToOpenAIMessageContent(content string) openai.MessageContent {
 }
 
 // parseFunctionParams extracts parameter key-value pairs from the body of a <function=...> element.
+// Uses a scanner instead of regex to correctly handle values containing < characters.
 // Each <parameter=KEY>VALUE</parameter> child is parsed. Values are attempted as JSON first;
 // if that fails they are kept as plain strings. Empty values become empty strings.
 func parseFunctionParams(paramsBody string) map[string]interface{} {
 	args := make(map[string]interface{})
-	for _, p := range paramPattern.FindAllStringSubmatchIndex(paramsBody, -1) {
-		if len(p) >= 6 {
-			key := paramsBody[p[2]:p[3]]
-			value := strings.TrimSpace(paramsBody[p[4]:p[5]])
 
-			if value == "" {
-				args[key] = ""
-				continue
+	// Scanner-based extraction that handles < in parameter values correctly
+	// by tracking nesting depth of <parameter=...> tags.
+	body := paramsBody
+	for {
+		// Find the next <parameter=KEY> opening
+		openIdx := strings.Index(body, "<parameter=")
+		if openIdx == -1 {
+			openIdx = strings.Index(body, "<Parameter=")
+		}
+		if openIdx == -1 {
+			break
+		}
+
+		// Extract the key: everything between <parameter= and the first >
+		gtIdx := strings.Index(body[openIdx:], ">")
+		if gtIdx == -1 {
+			break
+		}
+		key := strings.TrimSpace(body[openIdx+len("<parameter=") : openIdx+gtIdx])
+
+		// Find the matching </parameter> by scanning for it
+		// We need to handle nested <parameter=...> tags inside the value
+		valueStart := openIdx + gtIdx + 1
+		depth := 1
+		scanPos := valueStart
+		valueEnd := -1
+
+		for scanPos < len(body) {
+			nextOpen := strings.Index(body[scanPos:], "<parameter=")
+			if nextOpen == -1 {
+				nextOpen = strings.Index(body[scanPos:], "<Parameter=")
+			}
+			nextClose := strings.Index(body[scanPos:], "</parameter>")
+			if nextClose == -1 {
+				nextClose = strings.Index(body[scanPos:], "</Parameter>")
 			}
 
-			var jsonVal interface{}
-			if err := json.Unmarshal([]byte(value), &jsonVal); err == nil {
-				args[key] = jsonVal
+			if nextClose == -1 {
+				break
+			}
+
+			if nextOpen != -1 && nextOpen < nextClose {
+				depth++
+				scanPos += nextOpen + len("<parameter=")
 			} else {
-				args[key] = value
+				depth--
+				if depth == 0 {
+					valueEnd = scanPos + nextClose
+					break
+				}
+				scanPos += nextClose + len("</parameter>")
 			}
 		}
+
+		if valueEnd == -1 {
+			// No matching close tag found; take rest of content as value
+			value := strings.TrimSpace(body[valueStart:])
+			if key != "" {
+				args[key] = coerceParamValue(value)
+			}
+			break
+		}
+
+		value := strings.TrimSpace(body[valueStart:valueEnd])
+		if key != "" {
+			args[key] = coerceParamValue(value)
+		}
+
+		// Move past </parameter>
+		body = body[valueEnd+len("</parameter>"):]
 	}
+
 	return args
+}
+
+// coerceParamValue attempts to parse a string as JSON; falls back to plain string.
+// Empty strings are returned as-is.
+func coerceParamValue(value string) interface{} {
+	if value == "" {
+		return ""
+	}
+
+	var jsonVal interface{}
+	if err := json.Unmarshal([]byte(value), &jsonVal); err == nil {
+		return jsonVal
+	}
+	return value
 }
 
