@@ -121,6 +121,7 @@ type RetryPolicy {
   maxSingleChannelRetries: Int!
   retryDelayMs: Int!
   loadBalancerStrategy: String!
+  loadBalancerPriority: String!
   enabled: Boolean!
   autoDisableChannel: AutoDisableChannel!
   emptyResponseDetection: Boolean!
@@ -141,6 +142,7 @@ input UpdateRetryPolicyInput {
   maxSingleChannelRetries: Int
   retryDelayMs: Int
   loadBalancerStrategy: String
+  loadBalancerPriority: String
   enabled: Boolean
   autoDisableChannel: AutoDisableChannelInput
   emptyResponseDetection: Boolean

@@ -24,6 +24,7 @@ var defaultRetryPolicy = RetryPolicy{
 	MaxSingleChannelRetries: 2,
 	RetryDelayMs:            1000,
 	LoadBalancerStrategy:    "adaptive",
+	LoadBalancerPriority:    "ttft",
 	Enabled:                 true,
 }
 

@@ -24,14 +24,27 @@ const (
 // Streaming requests are scored by first-token latency plus output throughput.
 // Non-streaming requests are scored by end-to-end latency.
 type LatencyAwareStrategy struct {
-	metricsProvider ChannelMetricsProvider
-	maxScore        float64
+	metricsProvider  ChannelMetricsProvider
+	maxScore         float64
+	firstTokenWeight float64 // Default: 0.7
+	throughputWeight float64 // Default: 0.3
 }
 
 func NewLatencyAwareStrategy(metricsProvider ChannelMetricsProvider) *LatencyAwareStrategy {
 	return &LatencyAwareStrategy{
-		metricsProvider: metricsProvider,
-		maxScore:        defaultLatencyMaxScore,
+		metricsProvider:  metricsProvider,
+		maxScore:         defaultLatencyMaxScore,
+		firstTokenWeight: streamingFirstTokenWeight,
+		throughputWeight: streamingThroughputWeight,
+	}
+}
+
+func NewLatencyAwareStrategyWithWeights(metricsProvider ChannelMetricsProvider, firstTokenWeight, throughputWeight float64) *LatencyAwareStrategy {
+	return &LatencyAwareStrategy{
+		metricsProvider:  metricsProvider,
+		maxScore:         defaultLatencyMaxScore,
+		firstTokenWeight: firstTokenWeight,
+		throughputWeight: throughputWeight,
 	}
 }
 
@@ -123,7 +136,7 @@ func (s *LatencyAwareStrategy) calculateStreamingScore(metrics *biz.AggregatedMe
 		throughputScore = clampNormalized(metrics.StreamingTokensPerSecondEWMA, defaultStreamingMinTokensPerSecond, defaultStreamingMaxTokensPerSecond)
 	}
 
-	score := s.maxScore * (streamingFirstTokenWeight*firstTokenScore + streamingThroughputWeight*throughputScore)
+	score := s.maxScore * (s.firstTokenWeight*firstTokenScore + s.throughputWeight*throughputScore)
 
 	details["streaming_samples"] = metrics.StreamingSampleCount
 	details["first_token_latency_ewma_ms"] = metrics.StreamingFirstTokenLatencyEWMA

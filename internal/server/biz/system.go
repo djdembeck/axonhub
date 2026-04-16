@@ -172,6 +172,17 @@ const (
 	LoadBalancerStrategyCircuitBreaker = "circuit-breaker"
 )
 
+const (
+	// LoadBalancerPriorityCost prioritizes cost optimization in the adaptive load balancer.
+	LoadBalancerPriorityCost = "cost"
+
+	// LoadBalancerPriorityTPS prioritizes throughput (TPS) in the adaptive load balancer.
+	LoadBalancerPriorityTPS = "tps"
+
+	// LoadBalancerPriorityTTFT prioritizes time-to-first-token (TTFT) in the adaptive load balancer.
+	LoadBalancerPriorityTTFT = "ttft"
+)
+
 // RetryPolicy represents the retry policy configuration.
 type RetryPolicy struct {
 	// Enabled controls whether retry policy is active
@@ -185,6 +196,8 @@ type RetryPolicy struct {
 	// LoadBalancerStrategy defines which channel load balancer strategy to use.
 	// Supported values: "adaptive", "failover", "circuit-breaker".
 	LoadBalancerStrategy string `json:"load_balancer_strategy"`
+	// LoadBalancerPriority defines which factor the adaptive load balancer prioritizes.
+	LoadBalancerPriority string `json:"load_balancer_priority"`
 
 	// AutoDisableChannel controls whether to auto-disable a channel or API key when it exceeds the maximum number of retries.
 	// For compatibility with legacy setting, the name is AutoDisableChannel.
@@ -219,13 +232,13 @@ type WebhookNotifierConfig struct {
 }
 
 type WebhookTarget struct {
-	Name      string                `json:"name"`
-	Enabled   bool                  `json:"enabled"`
-	URL       string                `json:"url"`
+	Name      string                  `json:"name"`
+	Enabled   bool                    `json:"enabled"`
+	URL       string                  `json:"url"`
 	Proxy     *httpclient.ProxyConfig `json:"proxy,omitempty"`
-	TimeoutMs int                   `json:"timeout_ms"`
-	Headers   []objects.HeaderEntry `json:"headers"`
-	Body      string                `json:"body"`
+	TimeoutMs int                     `json:"timeout_ms"`
+	Headers   []objects.HeaderEntry   `json:"headers"`
+	Body      string                  `json:"body"`
 }
 
 type WebhookSubscription struct {

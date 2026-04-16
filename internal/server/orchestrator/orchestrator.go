@@ -38,11 +38,31 @@ func NewChatCompletionOrchestrator(
 
 	rateLimitStrategy := NewRateLimitAwareStrategy(rateLimitTracker, connectionTracker)
 
-	adaptiveLoadBalancer := NewLoadBalancer(systemService, channelService,
+	// TTFT priority (default — current behavior)
+	ttftPriorityLB := NewLoadBalancer(systemService, channelService,
 		NewTraceAwareStrategy(requestService),
 		NewErrorAwareStrategy(channelService),
 		NewWeightRoundRobinStrategy(channelService),
 		NewLatencyAwareStrategy(channelService),
+		rateLimitStrategy,
+	)
+
+	// TPS priority — inverted latency weights, boosted
+	tpsPriorityLB := NewLoadBalancer(systemService, channelService,
+		NewTraceAwareStrategy(requestService),
+		NewErrorAwareStrategy(channelService),
+		NewWeightRoundRobinStrategy(channelService),
+		NewLatencyAwareStrategyWithWeights(channelService, 0.3, 0.7),
+		rateLimitStrategy,
+	)
+
+	// Cost priority — adds CostAwareStrategy
+	costPriorityLB := NewLoadBalancer(systemService, channelService,
+		NewTraceAwareStrategy(requestService),
+		NewErrorAwareStrategy(channelService),
+		NewWeightRoundRobinStrategy(channelService),
+		NewLatencyAwareStrategy(channelService),
+		NewCostAwareStrategy(channelService),
 		rateLimitStrategy,
 	)
 
@@ -53,15 +73,15 @@ func NewChatCompletionOrchestrator(
 		NewWeightStrategy(), NewModelAwareCircuitBreakerStrategy(modelCircuitBreaker), rateLimitStrategy)
 
 	return &ChatCompletionOrchestrator{
-		Inbound:         inbound,
-		RequestService:  requestService,
-		ChannelService:  channelService,
-		SystemService:   systemService,
-		UsageLogService: usageLogService,
-		QuotaService:    quotaService,
+		Inbound:            inbound,
+		RequestService:     requestService,
+		ChannelService:     channelService,
+		SystemService:      systemService,
+		UsageLogService:    usageLogService,
+		QuotaService:       quotaService,
 		LiveStreamRegistry: liveStreamRegistry,
-		PromptProvider:  promptService,
-		PromptProtecter: promptProtectionRuleService,
+		PromptProvider:     promptService,
+		PromptProtecter:    promptProtectionRuleService,
 		Middlewares: []pipeline.Middleware{
 			cc.StripBillingHeaderCCH(),
 			stream.EnsureUsage(),
@@ -71,7 +91,9 @@ func NewChatCompletionOrchestrator(
 		channelSelector:            defaultSelector,
 		connectionTracker:          connectionTracker,
 		rateLimitTracker:           rateLimitTracker,
-		adaptiveLoadBalancer:       adaptiveLoadBalancer,
+		ttftPriorityLB:             ttftPriorityLB,
+		tpsPriorityLB:              tpsPriorityLB,
+		costPriorityLB:             costPriorityLB,
 		failoverLoadBalancer:       failoverLoadBalancer,
 		circuitBreakerLoadBalancer: circuitBreakerLoadBalancer,
 		modelCircuitBreaker:        modelCircuitBreaker,
@@ -80,25 +102,27 @@ func NewChatCompletionOrchestrator(
 }
 
 type ChatCompletionOrchestrator struct {
-	Inbound         transformer.Inbound
-	RequestService  *biz.RequestService
-	ChannelService  *biz.ChannelService
-	SystemService   *biz.SystemService
-	UsageLogService *biz.UsageLogService
-	QuotaService    *biz.QuotaService
+	Inbound            transformer.Inbound
+	RequestService     *biz.RequestService
+	ChannelService     *biz.ChannelService
+	SystemService      *biz.SystemService
+	UsageLogService    *biz.UsageLogService
+	QuotaService       *biz.QuotaService
 	LiveStreamRegistry *biz.LiveStreamRegistry
-	PromptProvider  PromptProvider
-	PromptProtecter PromptProtecter
-	Middlewares     []pipeline.Middleware
-	PipelineFactory *pipeline.Factory
-	ModelMapper     *ModelMapper
+	PromptProvider     PromptProvider
+	PromptProtecter    PromptProtecter
+	Middlewares        []pipeline.Middleware
+	PipelineFactory    *pipeline.Factory
+	ModelMapper        *ModelMapper
 
 	// The runtime fields.
 
 	// The default channel selector.
 	channelSelector CandidateSelector
 	// The load balancer for channel load balancing.
-	adaptiveLoadBalancer       *LoadBalancer
+	ttftPriorityLB             *LoadBalancer
+	tpsPriorityLB              *LoadBalancer
+	costPriorityLB             *LoadBalancer
 	failoverLoadBalancer       *LoadBalancer
 	circuitBreakerLoadBalancer *LoadBalancer
 	// The connection tracker used for request lifetime tracking and rate-limit concurrency fallback.
@@ -134,6 +158,31 @@ func (processor *ChatCompletionOrchestrator) WithProxy(proxy *httpclient.ProxyCo
 	return &c
 }
 
+// selectLoadBalancer chooses the appropriate load balancer based on the
+// resolved strategy and priority. Non-adaptive strategies (failover,
+// circuit-breaker) ignore priority entirely.
+func (processor *ChatCompletionOrchestrator) selectLoadBalancer(strategy, priority string) *LoadBalancer {
+	switch strategy {
+	case biz.LoadBalancerStrategyAdaptive:
+		switch priority {
+		case biz.LoadBalancerPriorityCost:
+			return processor.costPriorityLB
+		case biz.LoadBalancerPriorityTPS:
+			return processor.tpsPriorityLB
+		case biz.LoadBalancerPriorityTTFT:
+			return processor.ttftPriorityLB
+		default:
+			return processor.ttftPriorityLB
+		}
+	case biz.LoadBalancerStrategyFailover:
+		return processor.failoverLoadBalancer
+	case biz.LoadBalancerStrategyCircuitBreaker:
+		return processor.circuitBreakerLoadBalancer
+	default:
+		return processor.ttftPriorityLB
+	}
+}
+
 type ChatCompletionResult struct {
 	ChatCompletion       *httpclient.Response
 	ChatCompletionStream streams.Stream[*httpclient.StreamEvent]
@@ -159,18 +208,7 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 		)
 	}
 
-	loadBalancer := processor.adaptiveLoadBalancer
-
-	switch strategy {
-	case biz.LoadBalancerStrategyAdaptive:
-		loadBalancer = processor.adaptiveLoadBalancer
-	case biz.LoadBalancerStrategyFailover:
-		loadBalancer = processor.failoverLoadBalancer
-	case biz.LoadBalancerStrategyCircuitBreaker:
-		loadBalancer = processor.circuitBreakerLoadBalancer
-	default:
-		// Default to adaptive load balancer
-	}
+	loadBalancer := processor.selectLoadBalancer(strategy, retryPolicy.LoadBalancerPriority)
 
 	state := &PersistenceState{
 		APIKey:                apiKey,

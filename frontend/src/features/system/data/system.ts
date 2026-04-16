@@ -95,6 +95,7 @@ const RETRY_POLICY_QUERY = `
       maxSingleChannelRetries
       retryDelayMs
       loadBalancerStrategy
+      loadBalancerPriority
       enabled
       emptyResponseDetection
       autoDisableChannel {
@@ -304,6 +305,7 @@ export interface RetryPolicy {
   maxSingleChannelRetries: number;
   retryDelayMs: number;
   loadBalancerStrategy: string;
+  loadBalancerPriority: string;
   enabled: boolean;
   autoDisableChannel: AutoDisableChannel;
   emptyResponseDetection: boolean;
@@ -324,6 +326,7 @@ export interface RetryPolicyInput {
   maxSingleChannelRetries?: number;
   retryDelayMs?: number;
   loadBalancerStrategy?: string;
+  loadBalancerPriority?: string;
   enabled?: boolean;
   autoDisableChannel?: AutoDisableChannelInput;
   emptyResponseDetection?: boolean;

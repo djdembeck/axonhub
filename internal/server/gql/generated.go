@@ -1282,6 +1282,7 @@ type ComplexityRoot struct {
 		AutoDisableChannel      func(childComplexity int) int
 		EmptyResponseDetection  func(childComplexity int) int
 		Enabled                 func(childComplexity int) int
+		LoadBalancerPriority    func(childComplexity int) int
 		LoadBalancerStrategy    func(childComplexity int) int
 		MaxChannelRetries       func(childComplexity int) int
 		MaxSingleChannelRetries func(childComplexity int) int
@@ -7637,6 +7638,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.complexity.RetryPolicy.Enabled(childComplexity), true
+	case "RetryPolicy.loadBalancerPriority":
+		if e.complexity.RetryPolicy.LoadBalancerPriority == nil {
+			break
+		}
+
+		return e.complexity.RetryPolicy.LoadBalancerPriority(childComplexity), true
 	case "RetryPolicy.loadBalancerStrategy":
 		if e.complexity.RetryPolicy.LoadBalancerStrategy == nil {
 			break
@@ -37124,6 +37131,8 @@ func (ec *executionContext) fieldContext_Query_retryPolicy(_ context.Context, fi
 				return ec.fieldContext_RetryPolicy_retryDelayMs(ctx, field)
 			case "loadBalancerStrategy":
 				return ec.fieldContext_RetryPolicy_loadBalancerStrategy(ctx, field)
+			case "loadBalancerPriority":
+				return ec.fieldContext_RetryPolicy_loadBalancerPriority(ctx, field)
 			case "enabled":
 				return ec.fieldContext_RetryPolicy_enabled(ctx, field)
 			case "autoDisableChannel":
@@ -41120,6 +41129,35 @@ func (ec *executionContext) _RetryPolicy_loadBalancerStrategy(ctx context.Contex
 }
 
 func (ec *executionContext) fieldContext_RetryPolicy_loadBalancerStrategy(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "RetryPolicy",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return nil, errors.New("field of type String does not have child fields")
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _RetryPolicy_loadBalancerPriority(ctx context.Context, field graphql.CollectedField, obj *biz.RetryPolicy) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		ec.fieldContext_RetryPolicy_loadBalancerPriority,
+		func(ctx context.Context) (any, error) {
+			return obj.LoadBalancerPriority, nil
+		},
+		nil,
+		ec.marshalNString2string,
+		true,
+		true,
+	)
+}
+
+func (ec *executionContext) fieldContext_RetryPolicy_loadBalancerPriority(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	fc = &graphql.FieldContext{
 		Object:     "RetryPolicy",
 		Field:      field,
@@ -71521,7 +71559,7 @@ func (ec *executionContext) unmarshalInputUpdateRetryPolicyInput(ctx context.Con
 		asMap[k] = v
 	}
 
-	fieldsInOrder := [...]string{"maxChannelRetries", "maxSingleChannelRetries", "retryDelayMs", "loadBalancerStrategy", "enabled", "autoDisableChannel", "emptyResponseDetection"}
+	fieldsInOrder := [...]string{"maxChannelRetries", "maxSingleChannelRetries", "retryDelayMs", "loadBalancerStrategy", "loadBalancerPriority", "enabled", "autoDisableChannel", "emptyResponseDetection"}
 	for _, k := range fieldsInOrder {
 		v, ok := asMap[k]
 		if !ok {
@@ -71556,6 +71594,13 @@ func (ec *executionContext) unmarshalInputUpdateRetryPolicyInput(ctx context.Con
 				return it, err
 			}
 			it.LoadBalancerStrategy = data
+		case "loadBalancerPriority":
+			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("loadBalancerPriority"))
+			data, err := ec.unmarshalOString2string(ctx, v)
+			if err != nil {
+				return it, err
+			}
+			it.LoadBalancerPriority = data
 		case "enabled":
 			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("enabled"))
 			data, err := ec.unmarshalOBoolean2bool(ctx, v)
@@ -87744,6 +87789,11 @@ func (ec *executionContext) _RetryPolicy(ctx context.Context, sel ast.SelectionS
 			}
 		case "loadBalancerStrategy":
 			out.Values[i] = ec._RetryPolicy_loadBalancerStrategy(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "loadBalancerPriority":
+			out.Values[i] = ec._RetryPolicy_loadBalancerPriority(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}

@@ -23,6 +23,7 @@ export function RetrySettings() {
     maxSingleChannelRetries: 2,
     retryDelayMs: 1000,
     loadBalancerStrategy: 'adaptive',
+    loadBalancerPriority: 'ttft',
     emptyResponseDetection: false,
     autoDisableChannel: {
       enabled: false,
@@ -38,6 +39,7 @@ export function RetrySettings() {
         maxSingleChannelRetries: retryPolicy.maxSingleChannelRetries,
         retryDelayMs: retryPolicy.retryDelayMs,
         loadBalancerStrategy: retryPolicy.loadBalancerStrategy,
+        loadBalancerPriority: retryPolicy.loadBalancerPriority,
         emptyResponseDetection: retryPolicy.emptyResponseDetection,
         autoDisableChannel: {
           enabled: retryPolicy.autoDisableChannel?.enabled || false,
@@ -160,6 +162,36 @@ export function RetrySettings() {
                   </div>
                 )}
               </div>
+
+              {/* Load Balancer Priority - Only show when strategy is adaptive */}
+              {formData.loadBalancerStrategy === 'adaptive' && (
+                <div className='space-y-2'>
+                  <Label htmlFor='load-balancer-priority'>{t('system.retry.loadBalancerPriority.label')}</Label>
+                  <div className='text-muted-foreground mb-2 text-sm'>{t('system.retry.loadBalancerPriority.description')}</div>
+                  <Select
+                    value={formData.loadBalancerPriority || 'ttft'}
+                    onValueChange={(value) => value && handleInputChange('loadBalancerPriority', value)}
+                  >
+                    <SelectTrigger id='load-balancer-priority' className='w-56'>
+                      <SelectValue placeholder={t('system.retry.loadBalancerPriority.placeholder')} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='ttft'>{t('system.retry.loadBalancerPriority.options.ttft')}</SelectItem>
+                      <SelectItem value='tps'>{t('system.retry.loadBalancerPriority.options.tps')}</SelectItem>
+                      <SelectItem value='cost'>{t('system.retry.loadBalancerPriority.options.cost')}</SelectItem>
+                    </SelectContent>
+                  </Select>
+
+                  {/* Priority Documentation */}
+                  {formData.loadBalancerPriority && (
+                    <div className='bg-muted/50 mt-3 rounded-md border p-3'>
+                      <div className='text-muted-foreground text-xs leading-relaxed'>
+                        {t(`system.retry.loadBalancerPriority.documentation.${formData.loadBalancerPriority}`)}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Max Channel Retries */}
               <div className='space-y-2' id='retry-max-retries'>
