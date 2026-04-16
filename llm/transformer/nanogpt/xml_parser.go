@@ -39,6 +39,16 @@ var mismatchTagPattern = regexp.MustCompile(`<(Write|Read|Write_FILE|Write_file|
 
 // unclosedPattern matches unclosed opening tags like <Write attr="..."\n</use_tool>
 var unclosedPattern = regexp.MustCompile(`<(Write|Read|Write_FILE|Write_file|Read_FILE|Read_file)([^>]*)\n([\s\S]*?)</use_tool>`)
+
+// functionParamPattern matches the <function=NAME>...<parameter=KEY>VALUE</parameter>...</function> format
+// used by some NanoGPT models that output tool calls as XML instead of native JSON.
+// Uses (?s).*? instead of [^<] because parameter values may contain < characters (e.g. HTML, code).
+// Go's RE2 engine guarantees bounded execution, so lazy quantifiers don't cause ReDoS.
+var functionParamPattern = regexp.MustCompile(`(?s)<function=([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</function>`)
+
+// paramPattern matches individual <parameter=KEY>VALUE</parameter> elements inside a <function=...> block.
+// Uses (?s).*? for the same reason as functionParamPattern — values may contain < characters.
+var paramPattern = regexp.MustCompile(`(?s)<parameter=([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</parameter>`)
 // MaybeHasXMLToolCalls is a fast pre-check to determine if content likely contains XML tool calls.
 func MaybeHasXMLToolCalls(content string) bool {
 	// Limit content length to prevent ReDoS
@@ -50,6 +60,7 @@ func MaybeHasXMLToolCalls(content string) bool {
 	return strings.Contains(content, "<") && strings.Contains(content, ">") &&
 		(toolCallPattern.MatchString(content) ||
 			selfClosingPattern.MatchString(content) ||
+			strings.Contains(content, "<function=") ||
 			strings.Contains(content, "use_tool") ||
 			strings.Contains(content, "Write") ||
 			strings.Contains(content, "Bash") ||
@@ -58,6 +69,7 @@ func MaybeHasXMLToolCalls(content string) bool {
 
 // ParseXMLToolCalls extracts tool calls from XML content using regex-based parsing.
 // Handles various XML formats including:
+// - <function=NAME><parameter=KEY>VALUE</parameter>...</function>
 // - <use_tool name="X"><arg>value</arg></use_tool>
 // - <Write file_path="X" content="Y"/>
 // - <Write file_path="X">content</Write>
@@ -67,6 +79,11 @@ func ParseXMLToolCalls(content string) ([]llm.ToolCall, string, error) {
 	// Fast check - if no XML tool tags, return as-is
 	if !MaybeHasXMLToolCalls(content) {
 		return nil, content, nil
+	}
+
+	// Enforce length limit during parsing in addition to the pre-check
+	if len(content) > maxXMLParseLength {
+		content = content[:maxXMLParseLength]
 	}
 
 	// Normalize common malformed variations
@@ -87,6 +104,39 @@ func ParseXMLToolCalls(content string) ([]llm.ToolCall, string, error) {
 	}
 
 	var matches []matchInfo
+
+	// Handle <function=NAME>/<parameter=KEY>VALUE</parameter>...</function> format
+	// Processed first as it's the most specific and self-contained pattern.
+	for _, m := range functionParamPattern.FindAllStringSubmatchIndex(content, -1) {
+		if len(m) >= 6 {
+			funcName := strings.ToLower(content[m[2]:m[3]])
+			paramsBody := content[m[4]:m[5]]
+
+			args := parseFunctionParams(paramsBody)
+
+			argsJSON, err := json.Marshal(args)
+			if err != nil {
+				argsJSON = []byte("{}")
+			}
+
+			id := generateToolCallID(funcName, string(argsJSON))
+
+			toolCalls = append(toolCalls, llm.ToolCall{
+				Index: len(toolCalls),
+				ID:    id,
+				Type:  "function",
+				Function: llm.FunctionCall{
+					Name:      funcName,
+					Arguments: string(argsJSON),
+				},
+			})
+
+			if lastEnd < m[0] {
+				remainingContent.WriteString(content[lastEnd:m[0]])
+			}
+			lastEnd = m[1]
+		}
+	}
 
 	// Handle nested XML format: <Write><file_path>X</file_path><content>Y</content></Write>
 	// This must be processed before other patterns to avoid matching inner elements
@@ -155,6 +205,14 @@ func ParseXMLToolCalls(content string) ([]llm.ToolCall, string, error) {
 	})
 
 	for _, match := range matches {
+		// Skip matches fully consumed by functionParam processing
+		if match.end <= lastEnd {
+			continue
+		}
+		// Partially overlapping match: adjust start to avoid re-consuming content
+		if match.start < lastEnd {
+			match.start = lastEnd
+		}
 		// Skip if not a valid tool tag
 		toolName := extractToolName(match.tagName, match.attrs)
 		if toolName == "" {
@@ -354,5 +412,31 @@ func ToOpenAIMessageContent(content string) openai.MessageContent {
 	return openai.MessageContent{
 		Content: &content,
 	}
+}
+
+// parseFunctionParams extracts parameter key-value pairs from the body of a <function=...> element.
+// Each <parameter=KEY>VALUE</parameter> child is parsed. Values are attempted as JSON first;
+// if that fails they are kept as plain strings. Empty values become empty strings.
+func parseFunctionParams(paramsBody string) map[string]interface{} {
+	args := make(map[string]interface{})
+	for _, p := range paramPattern.FindAllStringSubmatchIndex(paramsBody, -1) {
+		if len(p) >= 6 {
+			key := paramsBody[p[2]:p[3]]
+			value := strings.TrimSpace(paramsBody[p[4]:p[5]])
+
+			if value == "" {
+				args[key] = ""
+				continue
+			}
+
+			var jsonVal interface{}
+			if err := json.Unmarshal([]byte(value), &jsonVal); err == nil {
+				args[key] = jsonVal
+			} else {
+				args[key] = value
+			}
+		}
+	}
+	return args
 }
 
