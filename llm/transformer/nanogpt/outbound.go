@@ -108,19 +108,24 @@ func (t *OutboundTransformer) TransformResponse(
 }
 
 // TransformStream transforms a stream of HTTP events to a stream of llm.Response.
+// It wraps the standard per-chunk transformation with XML tool call buffering:
+// NanoGPT models may emit tool calls as XML in the content field during streaming.
+// Without buffering, this XML leaks as plain text to the client. The buffer accumulates
+// content across chunks and, when a complete XML tool call is detected, emits it as
+// a native tool_call instead of text content.
 func (t *OutboundTransformer) TransformStream(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
-	// Filter out upstream DONE events
 	filteredStream := streams.Filter(stream, func(event *httpclient.StreamEvent) bool {
 		return !bytes.HasPrefix(event.Data, []byte("[DONE]"))
 	})
 
-	// Transform remaining events
 	transformedStream := streams.MapErr(filteredStream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
 		return t.TransformStreamChunk(ctx, event)
 	})
 
-	// Always append our own DONE event at the end
-	return streams.AppendStream(transformedStream, llm.DoneResponse), nil
+	// Wrap with XML tool call buffer to convert streamed XML tool calls to native tool_calls
+	bufferedStream := newXMLToolCallBufferStream(transformedStream)
+
+	return streams.AppendStream(bufferedStream, llm.DoneResponse), nil
 }
 
 // TransformStreamChunk transforms a single stream event to llm.Response.

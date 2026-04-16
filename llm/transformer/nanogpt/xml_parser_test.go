@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/streams"
 )
 
 func TestMaybeHasXMLToolCalls(t *testing.T) {
@@ -495,4 +496,94 @@ func TestParseXMLToolCalls_FunctionParamExpanded(t *testing.T) {
 		assert.Contains(t, fmt.Sprintf("%v", editMap["oldText"]), "div")
 		assert.Contains(t, fmt.Sprintf("%v", editMap["newText"]), "span")
 	})
+}
+
+func TestXMLToolCallBufferStream_PlainText(t *testing.T) {
+	chunks := []*llm.Response{
+		textResponseTest("Hello, "),
+		textResponseTest("world!"),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	var collected []string
+	for buf.Next() {
+		resp := buf.Current()
+		if content := extractContentFromResponse(resp); content != "" {
+			collected = append(collected, content)
+		}
+	}
+	require.NoError(t, buf.Err())
+	assert.Equal(t, []string{"Hello, ", "world!"}, collected)
+}
+
+func TestXMLToolCallBufferStream_XMLToolCallConverted(t *testing.T) {
+	xmlContent := "<function=grep>\n<parameter=_i>1</parameter>\n<parameter=path>src/</parameter>\n<parameter=pattern>foo</parameter>\n</function>"
+	chunks := []*llm.Response{
+		textResponseTest(xmlContent),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	var textParts []string
+	var toolCallCount int
+	for buf.Next() {
+		resp := buf.Current()
+		if resp == nil {
+			continue
+		}
+		if len(resp.Choices) > 0 && resp.Choices[0].Delta != nil {
+			delta := resp.Choices[0].Delta
+			if delta.Content.Content != nil && *delta.Content.Content != "" {
+				textParts = append(textParts, *delta.Content.Content)
+			}
+			if len(delta.ToolCalls) > 0 {
+				toolCallCount += len(delta.ToolCalls)
+			}
+		}
+	}
+	require.NoError(t, buf.Err())
+	assert.Equal(t, 0, len(textParts), "should not emit any text content for XML tool calls")
+	assert.Equal(t, 1, toolCallCount, "should emit one tool call")
+}
+
+func TestXMLToolCallBufferStream_XMLAcrossChunks(t *testing.T) {
+	chunks := []*llm.Response{
+		textResponseTest("I'll search for that.\n<func"),
+		textResponseTest("tion=grep>\n<parameter=_i>1</parameter>\n<parameter=path>src/</parameter>"),
+		textResponseTest("\n<parameter=pattern>foo</parameter>\n</function>"),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	var textParts []string
+	var toolCallCount int
+	for buf.Next() {
+		resp := buf.Current()
+		if resp == nil {
+			continue
+		}
+		if len(resp.Choices) > 0 && resp.Choices[0].Delta != nil {
+			delta := resp.Choices[0].Delta
+			if delta.Content.Content != nil && *delta.Content.Content != "" {
+				textParts = append(textParts, *delta.Content.Content)
+			}
+			if len(delta.ToolCalls) > 0 {
+				toolCallCount += len(delta.ToolCalls)
+			}
+		}
+	}
+	require.NoError(t, buf.Err())
+	assert.Equal(t, []string{"I'll search for that.\n"}, textParts, "prefix text before XML should be preserved")
+	assert.Equal(t, 1, toolCallCount, "should parse one tool call from buffered chunks")
+}
+
+func textResponseTest(content string) *llm.Response {
+	return &llm.Response{
+		Choices: []llm.Choice{{
+			Delta: &llm.Message{
+				Content: llm.MessageContent{Content: &content},
+			},
+		}},
+	}
 }
