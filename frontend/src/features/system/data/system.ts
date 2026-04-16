@@ -305,7 +305,7 @@ export interface RetryPolicy {
   maxSingleChannelRetries: number;
   retryDelayMs: number;
   loadBalancerStrategy: string;
-  loadBalancerPriority: string;
+  loadBalancerPriority: string | null;
   enabled: boolean;
   autoDisableChannel: AutoDisableChannel;
   emptyResponseDetection: boolean;

@@ -15,9 +15,12 @@ const (
 	defaultStreamingMinTokensPerSecond     = 5.0
 	defaultStreamingMaxTokensPerSecond     = 100.0
 	defaultNonStreamingMaxLatencyMs        = 3000.0
+)
 
-	streamingFirstTokenWeight = 0.7
-	streamingThroughputWeight = 0.3
+// Default streaming score weights — used when no custom weights are provided.
+const (
+	defaultStreamingFirstTokenWeight = 0.7
+	defaultStreamingThroughputWeight = 0.3
 )
 
 // LatencyAwareStrategy prioritizes channels using request-type-specific UX signals.
@@ -34,12 +37,27 @@ func NewLatencyAwareStrategy(metricsProvider ChannelMetricsProvider) *LatencyAwa
 	return &LatencyAwareStrategy{
 		metricsProvider:  metricsProvider,
 		maxScore:         defaultLatencyMaxScore,
-		firstTokenWeight: streamingFirstTokenWeight,
-		throughputWeight: streamingThroughputWeight,
+		firstTokenWeight: defaultStreamingFirstTokenWeight,
+		throughputWeight: defaultStreamingThroughputWeight,
 	}
 }
 
 func NewLatencyAwareStrategyWithWeights(metricsProvider ChannelMetricsProvider, firstTokenWeight, throughputWeight float64) *LatencyAwareStrategy {
+	// Clamp weights to [0, 1] to prevent degenerate scoring (e.g., all-zero scores
+	// or scores exceeding maxScore). Callers are responsible for ensuring the
+	// weights represent their intended trade-off between first-token latency and
+	// throughput; we do not enforce they sum to exactly 1.0.
+	if firstTokenWeight < 0 {
+		firstTokenWeight = 0
+	} else if firstTokenWeight > 1 {
+		firstTokenWeight = 1
+	}
+	if throughputWeight < 0 {
+		throughputWeight = 0
+	} else if throughputWeight > 1 {
+		throughputWeight = 1
+	}
+
 	return &LatencyAwareStrategy{
 		metricsProvider:  metricsProvider,
 		maxScore:         defaultLatencyMaxScore,

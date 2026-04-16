@@ -232,13 +232,13 @@ type WebhookNotifierConfig struct {
 }
 
 type WebhookTarget struct {
-	Name      string                  `json:"name"`
-	Enabled   bool                    `json:"enabled"`
-	URL       string                  `json:"url"`
+	Name      string                `json:"name"`
+	Enabled   bool                  `json:"enabled"`
+	URL       string                `json:"url"`
 	Proxy     *httpclient.ProxyConfig `json:"proxy,omitempty"`
-	TimeoutMs int                     `json:"timeout_ms"`
-	Headers   []objects.HeaderEntry   `json:"headers"`
-	Body      string                  `json:"body"`
+	TimeoutMs int                   `json:"timeout_ms"`
+	Headers   []objects.HeaderEntry `json:"headers"`
+	Body      string                `json:"body"`
 }
 
 type WebhookSubscription struct {
@@ -847,6 +847,17 @@ func normalizeRetryPolicy(policy *RetryPolicy) {
 	// The weighted load balancer strategy is deprecated. Use the failover strategy instead.
 	if policy.LoadBalancerStrategy == "weighted" {
 		policy.LoadBalancerStrategy = LoadBalancerStrategyFailover
+	}
+
+	// Default and validate LoadBalancerPriority.
+	if policy.LoadBalancerPriority == "" {
+		policy.LoadBalancerPriority = defaultRetryPolicy.LoadBalancerPriority
+	}
+
+	// Only the adaptive strategy uses priority. Clear it for other strategies
+	// to avoid storing a meaningless value that could confuse operators.
+	if policy.LoadBalancerStrategy != LoadBalancerStrategyAdaptive {
+		policy.LoadBalancerPriority = ""
 	}
 
 	if policy.AutoDisableChannel.Statuses == nil {

@@ -85,9 +85,9 @@ func TestCostAwareStrategy_Score_MoreExpensiveChannelScoresLower(t *testing.T) {
 func TestCostAwareStrategy_Score_FlatFeePricing(t *testing.T) {
 	ctx := contextWithRequestedModel(context.Background(), "gpt-4")
 
-	// Channel with flat fee pricing
-	ch1Price := createTestFlatFeePrice("0.5") // $0.50 flat fee
-	ch2Price := createTestFlatFeePrice("1.5") // $1.50 flat fee
+	// Flat fee pricing within the realistic range (under $0.10/1K)
+	ch1Price := createTestFlatFeePrice("0.02")
+	ch2Price := createTestFlatFeePrice("0.08")
 
 	mockProvider := &mockChannelPriceProvider{
 		prices: map[int]map[string]*ent.ChannelModelPrice{
@@ -157,9 +157,9 @@ func TestCostAwareStrategy_Score_UsageTieredPricing(t *testing.T) {
 func TestCostAwareStrategy_Score_MixedPricingModes(t *testing.T) {
 	ctx := contextWithRequestedModel(context.Background(), "gpt-4")
 
-	// Compare flat fee vs usage_per_unit at typical usage
-	// Flat fee: $0.10, Usage: $0.02/1K tokens * 1000 tokens = $0.02
-	ch1Price := createTestFlatFeePrice("0.10")
+	// Compare flat fee vs usage_per_unit: raw dollar values are used directly
+	// without token-count normalization (see extractRepresentativeCost docs).
+	ch1Price := createTestFlatFeePrice("0.08")
 	ch2Price := createTestPrice(objects.PricingModeUsagePerUnit, "0.002")
 
 	mockProvider := &mockChannelPriceProvider{
@@ -176,8 +176,8 @@ func TestCostAwareStrategy_Score_MixedPricingModes(t *testing.T) {
 	scoreCh1 := strategy.Score(ctx, ch1)
 	scoreCh2 := strategy.Score(ctx, ch2)
 
-	// At 1000 tokens, usage-based ($0.02) is cheaper than flat fee ($0.10)
-	// So usage-based should score higher
+	// Flat fee of $0.10 scores 0 (exactly at the max reference), per-unit $0.002/1K scores high.
+	// Per-unit should score higher because its representative cost is lower.
 	assert.Greater(t, scoreCh2, scoreCh1, "usage-based should score higher at low token count")
 }
 
@@ -194,6 +194,109 @@ func TestCostAwareStrategy_Score_EmptyModelID_ReturnsNeutral(t *testing.T) {
 	channel := &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}
 	score := strategy.Score(ctx, channel)
 	assert.Equal(t, defaultCostMaxScore/2, score)
+}
+
+func TestCostAwareStrategy_Score_ZeroCost_ReturnsMaxScore(t *testing.T) {
+	ctx := contextWithRequestedModel(context.Background(), "free-model")
+
+	freePrice := createTestPrice(objects.PricingModeUsagePerUnit, "0")
+
+	mockProvider := &mockChannelPriceProvider{
+		prices: map[int]map[string]*ent.ChannelModelPrice{
+			1: {"free-model": freePrice},
+		},
+	}
+	strategy := NewCostAwareStrategy(mockProvider)
+
+	channel := &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "free-channel"}}
+	score := strategy.Score(ctx, channel)
+	assert.Equal(t, defaultCostMaxScore, score, "zero cost should yield maximum score")
+}
+
+func TestCostAwareStrategy_Score_CostExceedingMax_ReturnsZero(t *testing.T) {
+	ctx := contextWithRequestedModel(context.Background(), "expensive-model")
+
+	// Cost of $0.50/1K exceeds defaultMaxCostPer1kTokens ($0.10), so score should be 0.
+	expensivePrice := createTestPrice(objects.PricingModeUsagePerUnit, "0.50")
+
+	mockProvider := &mockChannelPriceProvider{
+		prices: map[int]map[string]*ent.ChannelModelPrice{
+			1: {"expensive-model": expensivePrice},
+		},
+	}
+	strategy := NewCostAwareStrategy(mockProvider)
+
+	channel := &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ultra-expensive"}}
+	score := strategy.Score(ctx, channel)
+	assert.Equal(t, 0.0, score, "cost exceeding max should yield zero score")
+}
+
+func TestCostAwareStrategy_Score_ProviderError_ReturnsNeutral(t *testing.T) {
+	ctx := contextWithRequestedModel(context.Background(), "gpt-4")
+
+	mockProvider := &mockChannelPriceProvider{
+		err: assert.AnError,
+	}
+	strategy := NewCostAwareStrategy(mockProvider)
+
+	channel := &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}
+	score := strategy.Score(ctx, channel)
+	assert.Equal(t, defaultCostMaxScore/2, score, "provider error should yield neutral score")
+}
+
+func TestCostAwareStrategy_Score_PromptOnlyPricing_ReturnsNeutral(t *testing.T) {
+	ctx := contextWithRequestedModel(context.Background(), "prompt-only-model")
+
+	// Model with only prompt_tokens pricing, no completion_tokens item.
+	promptOnlyPrice := &ent.ChannelModelPrice{
+		ModelID: "prompt-only-model",
+		Price: objects.ModelPrice{
+			Items: []objects.ModelPriceItem{
+				{
+					ItemCode: objects.PriceItemCodeUsage,
+					Pricing: objects.Pricing{
+						Mode:         objects.PricingModeUsagePerUnit,
+						UsagePerUnit: func() *decimal.Decimal { d, _ := decimal.NewFromString("0.01"); return &d }(),
+					},
+				},
+			},
+		},
+	}
+
+	mockProvider := &mockChannelPriceProvider{
+		prices: map[int]map[string]*ent.ChannelModelPrice{
+			1: {"prompt-only-model": promptOnlyPrice},
+		},
+	}
+	strategy := NewCostAwareStrategy(mockProvider)
+
+	channel := &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}
+	score := strategy.Score(ctx, channel)
+
+	// Falls back to Items[0] as representative cost since no completion item exists.
+	// Score should be > neutral since $0.01 is well under $0.10 max.
+	assert.Greater(t, score, defaultCostMaxScore/2, "prompt-only pricing should fall back to first item, not yield neutral")
+}
+
+func TestCostAwareStrategy_Score_NoItems_ReturnsNeutral(t *testing.T) {
+	ctx := contextWithRequestedModel(context.Background(), "empty-model")
+
+	// Model with no pricing items at all.
+	emptyPrice := &ent.ChannelModelPrice{
+		ModelID: "empty-model",
+		Price:   objects.ModelPrice{Items: nil},
+	}
+
+	mockProvider := &mockChannelPriceProvider{
+		prices: map[int]map[string]*ent.ChannelModelPrice{
+			1: {"empty-model": emptyPrice},
+		},
+	}
+	strategy := NewCostAwareStrategy(mockProvider)
+
+	channel := &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}
+	score := strategy.Score(ctx, channel)
+	assert.Equal(t, defaultCostMaxScore/2, score, "no pricing items should yield neutral score")
 }
 
 // Helper functions for creating test prices

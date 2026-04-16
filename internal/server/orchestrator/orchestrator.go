@@ -161,7 +161,7 @@ func (processor *ChatCompletionOrchestrator) WithProxy(proxy *httpclient.ProxyCo
 // selectLoadBalancer chooses the appropriate load balancer based on the
 // resolved strategy and priority. Non-adaptive strategies (failover,
 // circuit-breaker) ignore priority entirely.
-func (processor *ChatCompletionOrchestrator) selectLoadBalancer(strategy, priority string) *LoadBalancer {
+func (processor *ChatCompletionOrchestrator) selectLoadBalancer(ctx context.Context, strategy, priority string) *LoadBalancer {
 	switch strategy {
 	case biz.LoadBalancerStrategyAdaptive:
 		switch priority {
@@ -172,6 +172,11 @@ func (processor *ChatCompletionOrchestrator) selectLoadBalancer(strategy, priori
 		case biz.LoadBalancerPriorityTTFT:
 			return processor.ttftPriorityLB
 		default:
+			if priority != "" {
+				log.Warn(ctx, "selectLoadBalancer: unknown adaptive priority, defaulting to ttft",
+					log.String("priority", priority),
+				)
+			}
 			return processor.ttftPriorityLB
 		}
 	case biz.LoadBalancerStrategyFailover:
@@ -179,6 +184,9 @@ func (processor *ChatCompletionOrchestrator) selectLoadBalancer(strategy, priori
 	case biz.LoadBalancerStrategyCircuitBreaker:
 		return processor.circuitBreakerLoadBalancer
 	default:
+		log.Warn(ctx, "selectLoadBalancer: unknown strategy, defaulting to adaptive/ttft",
+			log.String("strategy", strategy),
+		)
 		return processor.ttftPriorityLB
 	}
 }
@@ -208,7 +216,7 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 		)
 	}
 
-	loadBalancer := processor.selectLoadBalancer(strategy, retryPolicy.LoadBalancerPriority)
+	loadBalancer := processor.selectLoadBalancer(ctx, strategy, retryPolicy.LoadBalancerPriority)
 
 	state := &PersistenceState{
 		APIKey:                apiKey,

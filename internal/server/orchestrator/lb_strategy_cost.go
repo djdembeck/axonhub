@@ -14,8 +14,16 @@ const (
 
 	// defaultMaxCostPer1kTokens is the reference maximum cost per 1K tokens
 	// used for inverse normalization. Channels costing this much or more score 0.
-	// Set to $2.00 to accommodate both per-token and flat-fee pricing modes.
-	defaultMaxCostPer1kTokens = 2.0
+	//
+	// Calibrated against realistic 2025 LLM pricing:
+	//   - Ultra-cheap (GPT-4o Mini, Gemini Flash):  ~$0.0004-0.001/1K → score ≈76-80
+	//   - Mid-range (GPT-4o, Claude Sonnet):       ~$0.01-0.015/1K  → score ≈68-72
+	//   - Premium (o3):                             ~$0.04/1K         → score ≈40
+	//   - Ultra-premium (Claude Opus):              ~$0.075/1K        → score ≈25
+	//
+	// Previous value of $2.00 compressed all channels into a 77-80 score range,
+	// providing essentially no differentiation.
+	defaultMaxCostPer1kTokens = 0.1
 )
 
 // ChannelPriceProvider provides channel model pricing information.
@@ -167,9 +175,13 @@ func (s *CostAwareStrategy) ScoreWithDebug(ctx context.Context, channel *biz.Cha
 
 // extractRepresentativeCost extracts a single representative cost value from a ModelPrice.
 // Returns -1 if no cost can be determined.
-// For flat_fee: uses FlatFee value.
-// For usage_per_unit: uses completion_tokens unit price.
-// For usage_tiered: uses first tier's completion_tokens price.
+//
+// IMPORTANT: This function extracts raw dollar values from different pricing modes
+// (flat_fee, usage_per_unit, tiered) without normalizing for volume. Flat-fee and
+// per-unit costs are not directly comparable — a $0.50 flat fee and $0.50/1K per-unit
+// price score identically despite representing different cost structures at different
+// usage levels. This is acceptable because channels using the same model typically share
+// the same pricing mode, making relative comparisons within a mode valid.
 func extractRepresentativeCost(mp objects.ModelPrice) float64 {
 	for _, item := range mp.Items {
 		if item.ItemCode != objects.PriceItemCodeCompletion {
@@ -190,6 +202,8 @@ func extractCostFromPricing(p objects.Pricing) float64 {
 	switch p.Mode {
 	case objects.PricingModeFlatFee:
 		if p.FlatFee != nil {
+			// Float64() returns (float64, bool) where bool indicates exactness, not error.
+			// Inexact conversion is acceptable for scoring purposes.
 			cost, _ := p.FlatFee.Float64()
 			return cost
 		}

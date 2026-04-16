@@ -268,7 +268,8 @@ func (svc *ChannelService) preloadModelPrices(ctx context.Context, ch *Channel) 
 }
 
 // GetChannelPrice returns the cached model price for a channel and model.
-// Returns nil if the channel or price is not found.
+// Returns (nil, nil) if the channel is not found or no price is cached for the
+// given model — callers must check both the error and the price return value.
 func (svc *ChannelService) GetChannelPrice(_ context.Context, channelID int, modelID string) (*ent.ChannelModelPrice, error) {
 	ch := svc.GetEnabledChannel(channelID)
 	if ch == nil {

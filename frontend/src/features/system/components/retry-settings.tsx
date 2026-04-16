@@ -39,7 +39,7 @@ export function RetrySettings() {
         maxSingleChannelRetries: retryPolicy.maxSingleChannelRetries,
         retryDelayMs: retryPolicy.retryDelayMs,
         loadBalancerStrategy: retryPolicy.loadBalancerStrategy,
-        loadBalancerPriority: retryPolicy.loadBalancerPriority,
+        loadBalancerPriority: retryPolicy.loadBalancerPriority || 'ttft',
         emptyResponseDetection: retryPolicy.emptyResponseDetection,
         autoDisableChannel: {
           enabled: retryPolicy.autoDisableChannel?.enabled || false,
@@ -99,7 +99,13 @@ export function RetrySettings() {
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
-      await updateRetryPolicy.mutateAsync(formData);
+      // Strip loadBalancerPriority when strategy is not 'adaptive' — priority only
+      // applies to the adaptive strategy and sending a stale value would be confusing.
+      const submitData = { ...formData };
+      if (submitData.loadBalancerStrategy !== 'adaptive') {
+        delete submitData.loadBalancerPriority;
+      }
+      await updateRetryPolicy.mutateAsync(submitData);
     },
     [updateRetryPolicy, formData]
   );
@@ -183,13 +189,11 @@ export function RetrySettings() {
                   </Select>
 
                   {/* Priority Documentation */}
-                  {formData.loadBalancerPriority && (
-                    <div className='bg-muted/50 mt-3 rounded-md border p-3'>
-                      <div className='text-muted-foreground text-xs leading-relaxed'>
-                        {t(`system.retry.loadBalancerPriority.documentation.${formData.loadBalancerPriority}`)}
-                      </div>
+                  <div className='bg-muted/50 mt-3 rounded-md border p-3'>
+                    <div className='text-muted-foreground text-xs leading-relaxed'>
+                      {t(`system.retry.loadBalancerPriority.documentation.${formData.loadBalancerPriority || 'ttft'}`)}
                     </div>
-                  )}
+                  </div>
                 </div>
               )}
 
