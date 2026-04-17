@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/transformer/openai"
@@ -51,22 +52,19 @@ var functionParamPattern = regexp.MustCompile(`(?si)<function=([a-zA-Z_][a-zA-Z0
 // Used to detect truncated/incomplete function blocks during streaming.
 var functionParamOpenPattern = regexp.MustCompile(`(?si)<function=([a-zA-Z_][a-zA-Z0-9_.-]*)>`)
 
-// paramPattern matches individual <parameter=KEY>VALUE</parameter> elements inside a <function=...> block.
-// Allows hyphens and dots in parameter names. Uses (?s).*? for values that may contain < characters.
-var paramPattern = regexp.MustCompile(`(?si)<parameter=([a-zA-Z_][a-zA-Z0-9_.-]*)>(.*?)</parameter>`)
+// Note: parameter extraction is handled by the scanner-based parseFunctionParams
+// rather than a regex, to correctly handle values containing < characters.
 // MaybeHasXMLToolCalls is a fast pre-check to determine if content likely contains XML tool calls.
 func MaybeHasXMLToolCalls(content string) bool {
-	// Limit content length to prevent ReDoS
 	if len(content) > maxXMLParseLength {
-		content = content[:maxXMLParseLength]
+		content = truncateToValidUTF8(content, maxXMLParseLength)
 	}
 
 	// Check for common tool-related patterns
 	return strings.Contains(content, "<") && strings.Contains(content, ">") &&
 		(toolCallPattern.MatchString(content) ||
 			selfClosingPattern.MatchString(content) ||
-			strings.Contains(content, "<function=") ||
-			strings.Contains(content, "<Function=") ||
+			containsFunctionTag(content) ||
 			strings.Contains(content, "use_tool") ||
 			strings.Contains(content, "Write") ||
 			strings.Contains(content, "Bash") ||
@@ -87,9 +85,10 @@ func ParseXMLToolCalls(content string) ([]llm.ToolCall, string, error) {
 		return nil, content, nil
 	}
 
-	// Enforce length limit during parsing in addition to the pre-check
+	// Enforce length limit during parsing in addition to the pre-check.
+	// Truncate at a valid UTF-8 boundary to avoid splitting mid-character.
 	if len(content) > maxXMLParseLength {
-		content = content[:maxXMLParseLength]
+		content = truncateToValidUTF8(content, maxXMLParseLength)
 	}
 
 	// Normalize common malformed variations
@@ -147,8 +146,10 @@ func ParseXMLToolCalls(content string) ([]llm.ToolCall, string, error) {
 	// Handle truncated <function=NAME>... blocks without closing </function>.
 	// During streaming the closing tag may not have arrived yet.
 	// Only process if we didn't already match a complete function block at this position.
+	// Check m[0] (start position) against lastEnd to avoid overlapping with
+	// complete blocks already consumed above.
 	for _, m := range functionParamOpenPattern.FindAllStringSubmatchIndex(content, -1) {
-		if len(m) >= 4 && m[1] > lastEnd {
+		if len(m) >= 4 && m[0] >= lastEnd {
 			funcName := strings.ToLower(content[m[2]:m[3]])
 
 			// Extract everything after the opening tag up to end of content
@@ -466,62 +467,23 @@ func ToOpenAIMessageContent(content string) openai.MessageContent {
 func parseFunctionParams(paramsBody string) map[string]interface{} {
 	args := make(map[string]interface{})
 
-	// Scanner-based extraction that handles < in parameter values correctly
-	// by tracking nesting depth of <parameter=...> tags.
 	body := paramsBody
 	for {
-		// Find the next <parameter=KEY> opening
-		openIdx := strings.Index(body, "<parameter=")
-		if openIdx == -1 {
-			openIdx = strings.Index(body, "<Parameter=")
-		}
+		openIdx := findParameterOpenTag(body)
 		if openIdx == -1 {
 			break
 		}
 
-		// Extract the key: everything between <parameter= and the first >
 		gtIdx := strings.Index(body[openIdx:], ">")
 		if gtIdx == -1 {
 			break
 		}
 		key := strings.TrimSpace(body[openIdx+len("<parameter=") : openIdx+gtIdx])
 
-		// Find the matching </parameter> by scanning for it
-		// We need to handle nested <parameter=...> tags inside the value
 		valueStart := openIdx + gtIdx + 1
-		depth := 1
-		scanPos := valueStart
-		valueEnd := -1
-
-		for scanPos < len(body) {
-			nextOpen := strings.Index(body[scanPos:], "<parameter=")
-			if nextOpen == -1 {
-				nextOpen = strings.Index(body[scanPos:], "<Parameter=")
-			}
-			nextClose := strings.Index(body[scanPos:], "</parameter>")
-			if nextClose == -1 {
-				nextClose = strings.Index(body[scanPos:], "</Parameter>")
-			}
-
-			if nextClose == -1 {
-				break
-			}
-
-			if nextOpen != -1 && nextOpen < nextClose {
-				depth++
-				scanPos += nextOpen + len("<parameter=")
-			} else {
-				depth--
-				if depth == 0 {
-					valueEnd = scanPos + nextClose
-					break
-				}
-				scanPos += nextClose + len("</parameter>")
-			}
-		}
+		valueEnd := findParameterCloseTag(body, valueStart)
 
 		if valueEnd == -1 {
-			// No matching close tag found; take rest of content as value
 			value := strings.TrimSpace(body[valueStart:])
 			if key != "" {
 				args[key] = coerceParamValue(value)
@@ -534,11 +496,50 @@ func parseFunctionParams(paramsBody string) map[string]interface{} {
 			args[key] = coerceParamValue(value)
 		}
 
-		// Move past </parameter>
 		body = body[valueEnd+len("</parameter>"):]
 	}
 
 	return args
+}
+
+// findParameterOpenTag finds the index of the next <parameter= opening tag,
+// using case-insensitive matching to match the (?si) regex behavior.
+func findParameterOpenTag(body string) int {
+	lower := strings.ToLower(body)
+	idx := strings.Index(lower, "<parameter=")
+	return idx
+}
+
+// findParameterCloseTag scans from valueStart to find the matching </parameter>
+// closing tag, handling nested <parameter=...> tags with depth tracking.
+// Uses case-insensitive matching to match the (?si) regex behavior.
+// Returns the index of the start of </parameter>, or -1 if not found.
+func findParameterCloseTag(body string, valueStart int) int {
+	depth := 1
+	scanPos := valueStart
+	lower := strings.ToLower(body)
+
+	for scanPos < len(body) {
+		nextOpen := strings.Index(lower[scanPos:], "<parameter=")
+		nextClose := strings.Index(lower[scanPos:], "</parameter>")
+
+		if nextClose == -1 {
+			break
+		}
+
+		if nextOpen != -1 && nextOpen < nextClose {
+			depth++
+			scanPos += nextOpen + len("<parameter=")
+		} else {
+			depth--
+			if depth == 0 {
+				return scanPos + nextClose
+			}
+			scanPos += nextClose + len("</parameter>")
+		}
+	}
+
+	return -1
 }
 
 // coerceParamValue attempts to parse a string as JSON; falls back to plain string.
@@ -550,8 +551,33 @@ func coerceParamValue(value string) interface{} {
 
 	var jsonVal interface{}
 	if err := json.Unmarshal([]byte(value), &jsonVal); err == nil {
+		// Preserve JSON null as a sentinel string rather than Go nil.
+		// Go nil marshals as JSON null which is ambiguous — the model may
+		// have intended the literal string "null" rather than a JSON null value.
+		// Keeping it as a string ensures round-trip consistency.
+		if jsonVal == nil {
+			return value
+		}
 		return jsonVal
 	}
 	return value
+}
+
+// containsFunctionTag checks for <function= in a case-insensitive manner,
+// matching the (?si) behavior of functionParamPattern.
+func containsFunctionTag(content string) bool {
+	return strings.Contains(strings.ToLower(content), "<function=")
+}
+
+// truncateToValidUTF8 truncates content to at most maxLen bytes, backing up
+// if the cut would split a multi-byte UTF-8 character.
+func truncateToValidUTF8(content string, maxLen int) string {
+	if len(content) <= maxLen {
+		return content
+	}
+	for maxLen > 0 && !utf8.RuneStart(content[maxLen]) {
+		maxLen--
+	}
+	return content[:maxLen]
 }
 

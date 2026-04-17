@@ -3,6 +3,7 @@ package nanogpt
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -405,7 +406,9 @@ func TestParseXMLToolCalls_FunctionParamEdgeCases(t *testing.T) {
 
 		var args map[string]interface{}
 		require.NoError(t, json.Unmarshal([]byte(tools[0].Function.Arguments), &args))
-		assert.Nil(t, args["edits"])
+		// JSON null is preserved as the string "null" to avoid ambiguity with
+		// Go nil (which would marshal identically but could mean a missing key).
+		assert.Equal(t, "null", args["edits"])
 	})
 
 	t.Run("duplicate parameter keys - last wins", func(t *testing.T) {
@@ -586,4 +589,237 @@ func textResponseTest(content string) *llm.Response {
 			},
 		}},
 	}
+}
+
+// responseWithFinishReasonAndUsage creates a response with content, finish_reason, and usage.
+func responseWithFinishReasonAndUsage(content string, finishReason *string, usage *llm.Usage) *llm.Response {
+	resp := &llm.Response{
+		Choices: []llm.Choice{{
+			Delta: &llm.Message{
+				Content: llm.MessageContent{Content: &content},
+			},
+			FinishReason: finishReason,
+		}},
+	}
+	if usage != nil {
+		resp.Usage = usage
+	}
+	return resp
+}
+
+// collectStreamResults reads all items from the buffer stream and returns
+// text parts, tool call count, and any captured finish reasons.
+func collectStreamResults(buf *xmlToolCallBufferStream) (textParts []string, toolCallCount int, finishReasons []string, usages []*llm.Usage) {
+	for buf.Next() {
+		resp := buf.Current()
+		if resp == nil {
+			continue
+		}
+		if len(resp.Choices) > 0 {
+			choice := resp.Choices[0]
+			if choice.FinishReason != nil {
+				finishReasons = append(finishReasons, *choice.FinishReason)
+			}
+			if choice.Delta != nil {
+				if choice.Delta.Content.Content != nil && *choice.Delta.Content.Content != "" {
+					textParts = append(textParts, *choice.Delta.Content.Content)
+				}
+				if len(choice.Delta.ToolCalls) > 0 {
+					toolCallCount += len(choice.Delta.ToolCalls)
+				}
+			}
+		}
+		if resp.Usage != nil {
+			usages = append(usages, resp.Usage)
+		}
+	}
+	return
+}
+
+func TestXMLToolCallBufferStream_FinishReasonPreserved(t *testing.T) {
+	finishReason := "stop"
+	xmlContent := "<function=grep>\n<parameter=_i>1</parameter>\n<parameter=path>src/</parameter>\n<parameter=pattern>foo</parameter>\n</function>"
+	chunks := []*llm.Response{
+		textResponseTest(xmlContent),
+		responseWithFinishReasonAndUsage("", &finishReason, nil),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	_, toolCallCount, finishReasons, _ := collectStreamResults(buf)
+	require.NoError(t, buf.Err())
+	assert.Equal(t, 1, toolCallCount)
+	assert.Contains(t, finishReasons, "tool_calls", "tool call response should have finish_reason=tool_calls")
+}
+
+func TestXMLToolCallBufferStream_UsagePreserved(t *testing.T) {
+	usage := &llm.Usage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30}
+	xmlContent := "<function=grep>\n<parameter=_i>1</parameter>\n<parameter=path>src/</parameter>\n<parameter=pattern>foo</parameter>\n</function>"
+	chunks := []*llm.Response{
+		textResponseTest(xmlContent),
+		responseWithFinishReasonAndUsage("", nil, usage),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	_, _, _, usages := collectStreamResults(buf)
+	require.NoError(t, buf.Err())
+	require.Len(t, usages, 1, "usage should be preserved during buffering")
+	assert.Equal(t, int64(10), usages[0].PromptTokens)
+	assert.Equal(t, int64(20), usages[0].CompletionTokens)
+}
+
+func TestXMLToolCallBufferStream_FalsePositiveFlushesAsText(t *testing.T) {
+	chunks := []*llm.Response{
+		textResponseTest("I'll <Read"),
+		textResponseTest(" the document now."),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	textParts, toolCallCount, _, _ := collectStreamResults(buf)
+	require.NoError(t, buf.Err())
+	assert.Equal(t, 0, toolCallCount, "should not emit tool calls for non-XML text")
+	// The buffer splits at <Read and then flushes as text when it determines it's not XML.
+	// The text before <Read and the <Read portion are emitted as separate text parts.
+	allText := strings.Join(textParts, "")
+	assert.Equal(t, "I'll <Read the document now.", allText, "false-positive should flush all content as text")
+}
+
+func TestXMLToolCallBufferStream_RemainingContentWithSecondToolCall(t *testing.T) {
+	content := "<function=grep>\n<parameter=_i>1</parameter>\n<parameter=path>src/</parameter>\n<parameter=pattern>foo</parameter>\n</function>\n<function=edit>\n<parameter=_i>2</parameter>\n<parameter=path>src/main.go</parameter>\n<parameter=edits>[{\"oldText\":\"a\",\"newText\":\"b\"}]</parameter>\n</function>"
+	chunks := []*llm.Response{
+		textResponseTest(content),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	_, toolCallCount, _, _ := collectStreamResults(buf)
+	require.NoError(t, buf.Err())
+	assert.Equal(t, 2, toolCallCount, "should parse both tool calls from remaining content")
+}
+
+func TestXMLToolCallBufferStream_BufferLimitFlushesText(t *testing.T) {
+	longContent := "<Read something that never closes with a proper tag"
+	for i := 0; i < 10000; i++ {
+		longContent += " more text content that keeps going"
+	}
+	chunks := []*llm.Response{
+		textResponseTest(longContent),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	textParts, toolCallCount, _, _ := collectStreamResults(buf)
+	require.NoError(t, buf.Err())
+	assert.Equal(t, 0, toolCallCount, "should not emit tool calls for non-XML content")
+	assert.True(t, len(textParts) > 0, "should flush buffered content as text")
+	assert.Contains(t, textParts[0], "<Read", "original content should be preserved")
+}
+
+func TestXMLToolCallBufferStream_NativeToolCallsPreserved(t *testing.T) {
+	xmlContent := "<function=grep>\n<parameter=_i>1</parameter>\n<parameter=path>src/</parameter>\n<parameter=pattern>foo</parameter>\n</function>"
+	nativeToolCall := llm.ToolCall{
+		ID:   "native-id",
+		Type: "function",
+		Function: llm.FunctionCall{
+			Name:      "native_tool",
+			Arguments: "{}",
+		},
+	}
+
+	chunks := []*llm.Response{
+		textResponseTest(xmlContent),
+		{
+			Choices: []llm.Choice{{
+				Delta: &llm.Message{
+					ToolCalls: []llm.ToolCall{nativeToolCall},
+				},
+			}},
+		},
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	_, toolCallCount, _, _ := collectStreamResults(buf)
+	require.NoError(t, buf.Err())
+	assert.Equal(t, 2, toolCallCount, "should preserve native tool_calls alongside parsed XML")
+}
+
+func TestXMLToolCallBufferStream_WriteFormatToolCall(t *testing.T) {
+	content := "<Write file_path=\"/test/file.txt\" content=\"hello\"/>"
+	chunks := []*llm.Response{
+		textResponseTest(content),
+	}
+	stream := streams.SliceStream(chunks)
+	buf := newXMLToolCallBufferStream(stream)
+
+	textParts, toolCallCount, _, _ := collectStreamResults(buf)
+	require.NoError(t, buf.Err())
+	assert.Equal(t, 0, len(textParts), "should not emit text for Write XML tool calls")
+	assert.Equal(t, 1, toolCallCount, "should parse Write format tool call")
+}
+
+func TestMaybeHasXMLToolCalls_CaseInsensitive(t *testing.T) {
+	assert.True(t, MaybeHasXMLToolCalls("<FUNCTION=GREP><PARAMETER=_i>1</PARAMETER></FUNCTION>"), "should detect uppercase FUNCTION tag")
+	assert.True(t, MaybeHasXMLToolCalls("<Function=Edit><Parameter=path>src/</Parameter></Function>"), "should detect mixed-case Function tag")
+}
+
+func TestParseXMLToolCalls_UpperCaseFunctionTag(t *testing.T) {
+	content := "<FUNCTION=GREP>\n<PARAMETER=_i>1</PARAMETER>\n<PARAMETER=path>src/</PARAMETER>\n<PARAMETER=pattern>foo</PARAMETER>\n</FUNCTION>"
+
+	tools, _, err := ParseXMLToolCalls(content)
+	require.NoError(t, err)
+	require.Len(t, tools, 1)
+	assert.Equal(t, "grep", tools[0].Function.Name)
+
+	var args map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(tools[0].Function.Arguments), &args))
+	assert.Equal(t, "src/", args["path"])
+	assert.Equal(t, "foo", args["pattern"])
+}
+
+func TestCoerceParamValue_NullHandling(t *testing.T) {
+	result := coerceParamValue("null")
+	assert.Equal(t, "null", result, "JSON null should be kept as string to avoid ambiguity")
+
+	result = coerceParamValue("true")
+	assert.Equal(t, true, result)
+
+	result = coerceParamValue("42")
+	assert.Equal(t, float64(42), result)
+
+	result = coerceParamValue("hello")
+	assert.Equal(t, "hello", result)
+}
+
+func TestTruncateToValidUTF8(t *testing.T) {
+	result := truncateToValidUTF8("hello world", 5)
+	assert.Equal(t, "hello", result)
+
+	content := "héllo"
+	result = truncateToValidUTF8(content, 2)
+	assert.Equal(t, "h", result, "should not split mid-UTF8 character")
+
+	result = truncateToValidUTF8("hi", 100)
+	assert.Equal(t, "hi", result)
+}
+
+func TestContainsFunctionTag(t *testing.T) {
+	assert.True(t, containsFunctionTag("<function=grep>"))
+	assert.True(t, containsFunctionTag("<Function=Edit>"))
+	assert.True(t, containsFunctionTag("<FUNCTION=GREP>"))
+	assert.True(t, containsFunctionTag("<fUnCtIoN=foo>"))
+	assert.False(t, containsFunctionTag("no function tag here"))
+}
+
+func TestHasCompleteXMLTag(t *testing.T) {
+	assert.True(t, hasCompleteXMLTag("content</function>"))
+	assert.True(t, hasCompleteXMLTag("content</Function>"))
+	assert.True(t, hasCompleteXMLTag("content</use_tool>"))
+	assert.True(t, hasCompleteXMLTag("content</Write>"))
+	assert.True(t, hasCompleteXMLTag("content</Read>"))
+	assert.True(t, hasCompleteXMLTag("content</Bash>"))
+	assert.True(t, hasCompleteXMLTag("<Write file=\"x\"/>"))
+	assert.False(t, hasCompleteXMLTag("<function=grep>no closing"))
 }
