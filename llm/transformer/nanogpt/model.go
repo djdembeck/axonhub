@@ -1,6 +1,8 @@
 package nanogpt
 
 import (
+	"strings"
+
 	"github.com/looplj/axonhub/llm/transformer/openai"
 )
 
@@ -55,30 +57,104 @@ type Message struct {
 	Reasoning *string `json:"reasoning,omitempty"`
 }
 
+const minLeakedThinkingPrefixLen = 50
+
 // ToOpenAIMessage converts the NanoGPT Message to an OpenAI Message.
-// It maps the Reasoning field to ReasoningContent for compatibility.
-// It also parses XML tool calls from content if present.
 func (m *Message) ToOpenAIMessage() openai.Message {
-	// Map reasoning to reasoning_content if present
+	m.mapReasoningToReasoningContent()
+	m.clearLeakedThinkingContent()
+	m.parseXMLToolCallsFromContent()
+	m.extractAndStripXMLFromReasoningContent()
+
+	return m.Message
+}
+
+func (m *Message) mapReasoningToReasoningContent() {
 	if m.Reasoning != nil {
 		m.ReasoningContent = m.Reasoning
 	}
+}
 
-	// Parse XML tool calls from content if present
-	if m.Content.Content != nil && *m.Content.Content != "" {
-		content := *m.Content.Content
-		if MaybeHasXMLToolCalls(content) {
-			tools, remaining, err := ParseXMLToolCalls(content)
-			if err == nil && len(tools) > 0 {
-				m.ToolCalls = ToOpenAIToolCalls(tools)
-				if remaining != "" {
-					m.Content = ToOpenAIMessageContent(remaining)
-				} else {
-					m.Content = openai.MessageContent{Content: nil}
-				}
-			}
-		}
+func isLeakedThinkingContent(content, reasoning string) bool {
+	if content == reasoning {
+		return true
+	}
+	if len(content) < minLeakedThinkingPrefixLen {
+		return false
+	}
+	return strings.HasPrefix(reasoning, content)
+}
+
+func (m *Message) clearLeakedThinkingContent() {
+	if m.Content.Content == nil || *m.Content.Content == "" || m.ReasoningContent == nil {
+		return
 	}
 
-	return m.Message
+	content := *m.Content.Content
+	reasoning := *m.ReasoningContent
+
+	if isLeakedThinkingContent(content, reasoning) {
+		m.Content = openai.MessageContent{Content: nil}
+	}
+}
+
+func (m *Message) parseXMLToolCallsFromContent() {
+	if m.Content.Content == nil || *m.Content.Content == "" {
+		return
+	}
+
+	content := *m.Content.Content
+	if !MaybeHasXMLToolCalls(content) {
+		return
+	}
+
+	tools, remaining, err := ParseXMLToolCalls(content)
+	if err != nil || len(tools) == 0 {
+		return
+	}
+
+	if len(m.ToolCalls) > 0 {
+		m.setContentOrClear(remaining)
+	} else {
+		m.ToolCalls = ToOpenAIToolCalls(tools)
+		m.setContentOrClear(remaining)
+	}
+}
+
+func (m *Message) extractAndStripXMLFromReasoningContent() {
+	if m.ReasoningContent == nil || *m.ReasoningContent == "" {
+		return
+	}
+
+	reasoning := *m.ReasoningContent
+	if !MaybeHasXMLToolCalls(reasoning) {
+		return
+	}
+
+	tools, remaining, err := ParseXMLToolCalls(reasoning)
+	if err != nil {
+		return
+	}
+
+	cleaned := strings.TrimSpace(remaining)
+	m.ReasoningContent = stringPtrOrNil(cleaned)
+
+	if len(tools) > 0 && len(m.ToolCalls) == 0 {
+		m.ToolCalls = ToOpenAIToolCalls(tools)
+	}
+}
+
+func (m *Message) setContentOrClear(remaining string) {
+	if remaining != "" {
+		m.Content = ToOpenAIMessageContent(remaining)
+	} else {
+		m.Content = openai.MessageContent{Content: nil}
+	}
+}
+
+func stringPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
