@@ -10,12 +10,14 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/apikey"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/request"
+	"github.com/looplj/axonhub/internal/ent/trace"
 	"github.com/looplj/axonhub/internal/ent/user"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/scopes"
@@ -23,6 +25,25 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/samber/lo"
 )
+
+// LinkedProfilesCount is the resolver for the linkedProfilesCount field.
+func (r *aPIKeyProfileTemplateResolver) LinkedProfilesCount(ctx context.Context, obj *ent.APIKeyProfileTemplate) (int, error) {
+	return r.apiKeyProfileTemplateService.CountLinkedProfiles(ctx, obj)
+}
+
+// DefaultEndpoints is the resolver for the defaultEndpoints field.
+func (r *channelResolver) DefaultEndpoints(ctx context.Context, obj *ent.Channel) ([]*objects.ChannelEndpoint, error) {
+	if obj == nil {
+		return []*objects.ChannelEndpoint{}, nil
+	}
+
+	endpoints := biz.DefaultEndpointsForChannelType(obj.Type)
+	if len(endpoints) == 0 {
+		return []*objects.ChannelEndpoint{}, nil
+	}
+
+	return lo.ToSlicePtr(endpoints), nil
+}
 
 // AllModelEntries is the resolver for the allModelEntries field.
 func (r *channelResolver) AllModelEntries(ctx context.Context, obj *ent.Channel) ([]*biz.ChannelModelEntry, error) {
@@ -70,6 +91,38 @@ func (r *channelResolver) DisabledAPIKeys(ctx context.Context, obj *ent.Channel)
 	return lo.ToSlicePtr(obj.DisabledAPIKeys), nil
 }
 
+// LiveLimiterStats is the resolver for the liveLimiterStats field.
+func (r *channelResolver) LiveLimiterStats(ctx context.Context, obj *ent.Channel) (*ChannelLimiterStats, error) {
+	if r.channelLimiterManager == nil || obj == nil {
+		return nil, nil
+	}
+
+	if obj.Settings == nil || obj.Settings.RateLimit == nil {
+		return nil, nil
+	}
+
+	rl := obj.Settings.RateLimit
+	if rl.MaxConcurrent == nil || *rl.MaxConcurrent <= 0 {
+		return nil, nil
+	}
+
+	queueSize := 0
+	if rl.QueueSize != nil && *rl.QueueSize > 0 {
+		queueSize = int(*rl.QueueSize)
+	}
+
+	// Stats returns ok=false until the first request creates the limiter; in
+	// that case in-flight / waiting are simply 0.
+	inFlight, waiting, _ := r.channelLimiterManager.Stats(obj.ID)
+
+	return &ChannelLimiterStats{
+		InFlight:  inFlight,
+		Waiting:   waiting,
+		Capacity:  int(*rl.MaxConcurrent),
+		QueueSize: queueSize,
+	}, nil
+}
+
 // HeaderOverrideOperations is the resolver for the headerOverrideOperations field.
 func (r *channelSettingsResolver) HeaderOverrideOperations(ctx context.Context, obj *objects.ChannelSettings) ([]*objects.OverrideOperation, error) {
 	if obj == nil {
@@ -111,6 +164,11 @@ func (r *mutationResolver) CreateChannel(ctx context.Context, input ent.CreateCh
 	return r.channelService.CreateChannel(ctx, input)
 }
 
+// DuplicateChannel is the resolver for the duplicateChannel field.
+func (r *mutationResolver) DuplicateChannel(ctx context.Context, sourceID objects.GUID, input ent.CreateChannelInput) (*ent.Channel, error) {
+	return r.channelService.DuplicateChannel(ctx, sourceID.ID, input)
+}
+
 // BulkCreateChannels is the resolver for the bulkCreateChannels field.
 func (r *mutationResolver) BulkCreateChannels(ctx context.Context, input biz.BulkCreateChannelsInput) ([]*ent.Channel, error) {
 	return r.channelService.BulkCreateChannels(ctx, input)
@@ -119,6 +177,11 @@ func (r *mutationResolver) BulkCreateChannels(ctx context.Context, input biz.Bul
 // UpdateChannel is the resolver for the updateChannel field.
 func (r *mutationResolver) UpdateChannel(ctx context.Context, id objects.GUID, input ent.UpdateChannelInput) (*ent.Channel, error) {
 	return r.channelService.UpdateChannel(ctx, id.ID, &input)
+}
+
+// SaveChannelEndpoints is the resolver for the saveChannelEndpoints field.
+func (r *mutationResolver) SaveChannelEndpoints(ctx context.Context, input biz.SaveChannelEndpointsInput) (*ent.Channel, error) {
+	return r.channelService.SaveChannelEndpoints(ctx, input)
 }
 
 // UpdateChannelStatus is the resolver for the updateChannelStatus field.
@@ -241,6 +304,24 @@ func (r *mutationResolver) TestChannelAPIKeys(ctx context.Context, channelID obj
 	}, nil
 }
 
+// TestChannelAPIKey is the resolver for the testChannelAPIKey field.
+func (r *mutationResolver) TestChannelAPIKey(ctx context.Context, channelID objects.GUID, key string, modelID *string) (*TestAPIKeyResult, error) {
+	ctx = contexts.WithSource(ctx, request.SourceTest)
+
+	result, err := r.TestChannelOrchestrator.TestSingleAPIKey(ctx, channelID, key, modelID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to test channel API key: %w", err)
+	}
+
+	return &TestAPIKeyResult{
+		KeyPrefix: result.KeyPrefix,
+		Success:   result.Success,
+		Latency:   result.Latency,
+		Error:     result.Error,
+		Disabled:  result.Disabled,
+	}, nil
+}
+
 // BulkImportChannels is the resolver for the bulkImportChannels field.
 func (r *mutationResolver) BulkImportChannels(ctx context.Context, input BulkImportChannelsInput) (*biz.BulkImportChannelsResult, error) {
 	result, err := r.channelService.BulkImportChannels(ctx, input.Channels)
@@ -335,6 +416,11 @@ func (r *mutationResolver) UpdateAPIKeyStatus(ctx context.Context, id objects.GU
 // UpdateAPIKeyProfiles is the resolver for the updateAPIKeyProfiles field.
 func (r *mutationResolver) UpdateAPIKeyProfiles(ctx context.Context, id objects.GUID, input objects.APIKeyProfiles) (*ent.APIKey, error) {
 	return r.apiKeyService.UpdateAPIKeyProfiles(ctx, id.ID, input)
+}
+
+// RotateAPIKey is the resolver for the rotateAPIKey field.
+func (r *mutationResolver) RotateAPIKey(ctx context.Context, id objects.GUID) (*ent.APIKey, error) {
+	return r.apiKeyService.RotateAPIKey(ctx, id.ID)
 }
 
 // BulkDisableAPIKeys is the resolver for the bulkDisableAPIKeys field.
@@ -520,16 +606,38 @@ func (r *mutationResolver) DeleteChannelOverrideTemplate(ctx context.Context, id
 func (r *mutationResolver) ApplyChannelOverrideTemplate(ctx context.Context, input ApplyChannelOverrideTemplateInput) (*ApplyChannelOverrideTemplatePayload, error) {
 	channelIDs := objects.IntGuids(input.ChannelIDs)
 
+	mode := biz.ApplyTemplateModeMerge
+	if input.Mode != nil && *input.Mode == OverrideApplyModeReplace {
+		mode = biz.ApplyTemplateModeReplace
+	}
+
 	updatedChannels, err := r.channelOverrideTemplateService.ApplyTemplate(
 		ctx,
 		input.TemplateID.ID,
 		channelIDs,
+		mode,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to apply template: %w", err)
 	}
 
 	return &ApplyChannelOverrideTemplatePayload{
+		Success:  true,
+		Updated:  len(updatedChannels),
+		Channels: updatedChannels,
+	}, nil
+}
+
+// ClearChannelOverrideTemplates is the resolver for the clearChannelOverrideTemplates field.
+func (r *mutationResolver) ClearChannelOverrideTemplates(ctx context.Context, input ClearChannelOverrideTemplatesInput) (*ClearChannelOverrideTemplatesPayload, error) {
+	channelIDs := objects.IntGuids(input.ChannelIDs)
+
+	updatedChannels, err := r.channelOverrideTemplateService.ClearTemplates(ctx, channelIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to clear templates: %w", err)
+	}
+
+	return &ClearChannelOverrideTemplatesPayload{
 		Success:  true,
 		Updated:  len(updatedChannels),
 		Channels: updatedChannels,
@@ -549,6 +657,98 @@ func (r *mutationResolver) SyncChannelModels(ctx context.Context, channelID obje
 	}, nil
 }
 
+// CreateAPIKeyProfileTemplate is the resolver for the createApiKeyProfileTemplate field.
+func (r *mutationResolver) CreateAPIKeyProfileTemplate(ctx context.Context, input ent.CreateAPIKeyProfileTemplateInput, profile objects.APIKeyProfile) (*ent.APIKeyProfileTemplate, error) {
+	return r.apiKeyProfileTemplateService.CreateTemplate(ctx, input, &profile)
+}
+
+// UpdateAPIKeyProfileTemplate is the resolver for the updateApiKeyProfileTemplate field.
+func (r *mutationResolver) UpdateAPIKeyProfileTemplate(ctx context.Context, id objects.GUID, input ent.UpdateAPIKeyProfileTemplateInput, profile *objects.APIKeyProfile) (*ent.APIKeyProfileTemplate, error) {
+	return r.apiKeyProfileTemplateService.UpdateTemplate(ctx, id.ID, input, profile)
+}
+
+// DeleteAPIKeyProfileTemplate is the resolver for the deleteApiKeyProfileTemplate field.
+func (r *mutationResolver) DeleteAPIKeyProfileTemplate(ctx context.Context, id objects.GUID) (*ent.APIKeyProfileTemplate, error) {
+	return r.apiKeyProfileTemplateService.DeleteTemplate(ctx, id.ID)
+}
+
+// LoadAPIKeyProfileTemplate is the resolver for the loadApiKeyProfileTemplate field.
+func (r *mutationResolver) LoadAPIKeyProfileTemplate(ctx context.Context, input LoadAPIKeyProfileTemplateInput) (*ent.APIKey, error) {
+	return r.apiKeyProfileTemplateService.LoadTemplate(ctx, input.TemplateID.ID, input.APIKeyID.ID)
+}
+
+// ArchiveTrace is the resolver for the archiveTrace field.
+func (r *mutationResolver) ArchiveTrace(ctx context.Context, id objects.GUID) (bool, error) {
+	if err := r.traceService.Archive(ctx, id.ID); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// UnarchiveTrace is the resolver for the unarchiveTrace field.
+func (r *mutationResolver) UnarchiveTrace(ctx context.Context, id objects.GUID) (bool, error) {
+	if err := r.traceService.Unarchive(ctx, id.ID); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// RetainTrace is the resolver for the retainTrace field.
+func (r *mutationResolver) RetainTrace(ctx context.Context, id objects.GUID) (bool, error) {
+	if err := r.traceService.Retain(ctx, id.ID); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// UnretainTrace is the resolver for the unretainTrace field.
+func (r *mutationResolver) UnretainTrace(ctx context.Context, id objects.GUID) (bool, error) {
+	if err := r.traceService.Unretain(ctx, id.ID); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// ArchiveThread is the resolver for the archiveThread field.
+func (r *mutationResolver) ArchiveThread(ctx context.Context, id objects.GUID) (bool, error) {
+	if err := r.threadService.Archive(ctx, id.ID); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// UnarchiveThread is the resolver for the unarchiveThread field.
+func (r *mutationResolver) UnarchiveThread(ctx context.Context, id objects.GUID) (bool, error) {
+	if err := r.threadService.Unarchive(ctx, id.ID); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// RetainThread is the resolver for the retainThread field.
+func (r *mutationResolver) RetainThread(ctx context.Context, id objects.GUID) (bool, error) {
+	if err := r.threadService.Retain(ctx, id.ID); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// UnretainThread is the resolver for the unretainThread field.
+func (r *mutationResolver) UnretainThread(ctx context.Context, id objects.GUID) (bool, error) {
+	if err := r.threadService.Unretain(ctx, id.ID); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 // AllChannelSummarys is the resolver for the allChannelSummarys field.
 func (r *queryResolver) AllChannelSummarys(ctx context.Context, includeArchived *bool) ([]*ent.Channel, error) {
 	statusFilter := []channel.Status{channel.StatusEnabled, channel.StatusDisabled}
@@ -556,20 +756,49 @@ func (r *queryResolver) AllChannelSummarys(ctx context.Context, includeArchived 
 		statusFilter = append(statusFilter, channel.StatusArchived)
 	}
 
-	channels, err := r.client.Channel.Query().
-		Where(channel.StatusIn(statusFilter...)).
-		Order(ent.Desc(channel.FieldOrderingWeight)).
-		All(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query channels: %w", err)
-	}
-
 	projectID, ok := contexts.GetProjectID(ctx)
+	canReadChannels := authz.HasScope(ctx, scopes.ScopeReadChannels)
 	if !ok || projectID == 0 {
+		if !canReadChannels {
+			return nil, authz.RequireScope(ctx, scopes.ScopeReadChannels)
+		}
+		channels, err := r.client.Channel.Query().
+			Where(channel.StatusIn(statusFilter...)).
+			Order(ent.Desc(channel.FieldOrderingWeight)).
+			All(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query channels: %w", err)
+		}
 		return channels, nil
 	}
 
-	proj, err := r.client.Project.Get(ctx, projectID)
+	var (
+		channels []*ent.Channel
+		err      error
+	)
+	if canReadChannels {
+		channels, err = r.client.Channel.Query().
+			Where(channel.StatusIn(statusFilter...)).
+			Order(ent.Desc(channel.FieldOrderingWeight)).
+			All(ctx)
+	} else {
+		if !authz.HasScope(ctx, scopes.ScopeWriteRequests) && !authz.HasScope(ctx, scopes.ScopeWriteAPIKeys) {
+			return nil, authz.RequireScope(ctx, scopes.ScopeWriteRequests)
+		}
+		channels, err = authz.RunWithSystemBypass(ctx, "project-available-channels", func(ctx context.Context) ([]*ent.Channel, error) {
+			return r.client.Channel.Query().
+				Where(channel.StatusEQ(channel.StatusEnabled)).
+				Order(ent.Desc(channel.FieldOrderingWeight)).
+				All(ctx)
+		})
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query project channels: %w", err)
+	}
+
+	proj, err := authz.RunWithSystemBypass(ctx, "project-available-channels-profile", func(ctx context.Context) (*ent.Project, error) {
+		return r.client.Project.Get(ctx, projectID)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get project: %w", err)
 	}
@@ -655,34 +884,24 @@ func (r *queryResolver) APIKeyQuotaUsages(ctx context.Context, apiKeyID objects.
 		return nil, fmt.Errorf("failed to get api key: %w", err)
 	}
 
-	if apiKey.Profiles == nil || len(apiKey.Profiles.Profiles) == 0 {
-		return []*APIKeyProfileQuotaUsage{}, nil
+	usages, err := r.quotaService.ProfileQuotaUsages(ctx, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get api key quota usage: %w", err)
 	}
 
-	quotaService := biz.NewQuotaService(r.client, r.systemService)
-
-	result := make([]*APIKeyProfileQuotaUsage, 0, len(apiKey.Profiles.Profiles))
-	for _, profile := range apiKey.Profiles.Profiles {
-		if profile.Quota == nil {
-			continue
-		}
-
-		quotaRes, err := quotaService.GetQuota(ctx, apiKey.ID, profile.Quota)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get api key quota usage: %w", err)
-		}
-
+	result := make([]*APIKeyProfileQuotaUsage, 0, len(usages))
+	for _, u := range usages {
 		result = append(result, &APIKeyProfileQuotaUsage{
-			ProfileName: profile.Name,
-			Quota:       profile.Quota,
+			ProfileName: u.ProfileName,
+			Quota:       u.Quota,
 			Window: &APIKeyQuotaWindow{
-				Start: quotaRes.Window.Start,
-				End:   quotaRes.Window.End,
+				Start: u.Window.Start,
+				End:   u.Window.End,
 			},
 			Usage: &APIKeyQuotaUsage{
-				RequestCount: int(quotaRes.Usage.RequestCount),
-				TotalTokens:  int(quotaRes.Usage.TotalTokens),
-				TotalCost:    quotaRes.Usage.TotalCost,
+				RequestCount: int(u.Usage.RequestCount),
+				TotalTokens:  int(u.Usage.TotalTokens),
+				TotalCost:    u.Usage.TotalCost,
 			},
 		})
 	}
@@ -712,6 +931,19 @@ func (r *threadResolver) FirstUserQuery(ctx context.Context, obj *ent.Thread) (*
 // UsageMetadata is the resolver for the usageMetadata field.
 func (r *threadResolver) UsageMetadata(ctx context.Context, obj *ent.Thread) (*biz.UsageMetadata, error) {
 	return r.threadService.UsageMetadata(ctx, obj.ID)
+}
+
+// ArchivedTracesCount is the resolver for the archivedTracesCount field.
+func (r *threadResolver) ArchivedTracesCount(ctx context.Context, obj *ent.Thread) (int, error) {
+	count, err := r.client.Trace.Query().Where(
+		trace.ThreadIDEQ(obj.ID),
+		trace.StatusEQ(trace.StatusArchived),
+	).Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count archived traces: %w", err)
+	}
+
+	return count, nil
 }
 
 // RootSegment is the resolver for the rootSegment field.

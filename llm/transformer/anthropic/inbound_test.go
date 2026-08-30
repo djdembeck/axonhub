@@ -481,6 +481,71 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 	}
 }
 
+func TestInboundTransformer_TransformRequest_PreservesMultipleThinkingSignaturesForResponses(t *testing.T) {
+	transformer := NewInboundTransformer()
+	httpReq := &httpclient.Request{
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{
+			"model":"gpt-5",
+			"max_tokens":1024,
+			"messages":[{
+				"role":"assistant",
+				"content":[
+					{"type":"thinking","thinking":"first","signature":"gAAAA_FIRST_BLOB"},
+					{"type":"thinking","thinking":"second","signature":"gAAAA_SECOND_BLOB"},
+					{"type":"tool_use","id":"call_task","name":"TaskOutput","input":{"task_id":"task_1","block":true}}
+				]
+			}]
+		}`),
+	}
+
+	result, err := transformer.TransformRequest(t.Context(), httpReq)
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 1)
+	require.Equal(t, []llm.ReasoningItem{
+		{Content: "first", Signature: "gAAAA_FIRST_BLOB"},
+		{Content: "second", Signature: "gAAAA_SECOND_BLOB"},
+	}, result.Messages[0].ReasoningItems)
+	require.Equal(t, "firstsecond", lo.FromPtr(result.Messages[0].ReasoningContent))
+	require.Equal(t, "gAAAA_SECOND_BLOB", lo.FromPtr(result.Messages[0].ReasoningSignature))
+	require.Len(t, result.Messages[0].ToolCalls, 1)
+}
+
+func TestInboundTransformer_TransformResponse_RemovesEmptyReadPages(t *testing.T) {
+	transformer := NewInboundTransformer()
+	finishReason := "tool_calls"
+
+	resp, err := transformer.TransformResponse(t.Context(), &llm.Response{
+		ID:      "msg_read_pages",
+		Object:  "chat.completion",
+		Model:   "claude-sonnet-4-6",
+		Created: 1234567890,
+		Choices: []llm.Choice{{
+			Index: 0,
+			Message: &llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					ID:   "call_read",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "Read",
+						Arguments: `{"file_path":"/tmp/a.go","pages":""}`,
+					},
+				}},
+			},
+			FinishReason: &finishReason,
+		}},
+	})
+	require.NoError(t, err)
+
+	var msg Message
+	require.NoError(t, json.Unmarshal(resp.Body, &msg))
+	require.Len(t, msg.Content, 1)
+	require.Equal(t, "tool_use", msg.Content[0].Type)
+	require.Equal(t, "Read", *msg.Content[0].Name)
+	require.JSONEq(t, `{"file_path":"/tmp/a.go"}`, string(msg.Content[0].Input))
+}
+
 func TestInboundTransformer_TransformRequest_ThinkingValidation(t *testing.T) {
 	transformer := NewInboundTransformer()
 
@@ -504,7 +569,7 @@ func TestInboundTransformer_TransformRequest_ThinkingValidation(t *testing.T) {
 		got, err := transformer.TransformRequest(t.Context(), req)
 		require.NoError(t, err)
 		require.NotNil(t, got)
-		require.Empty(t, got.ReasoningEffort)
+		require.Equal(t, "none", got.ReasoningEffort)
 		require.Nil(t, got.ReasoningBudget)
 	})
 
@@ -1726,6 +1791,186 @@ func TestInboundTransformer_ErrorHandling(t *testing.T) {
 	})
 }
 
+func TestConvertToAnthropicResponse_WithAnnotations(t *testing.T) {
+	chatResp := &llm.Response{
+		ID:     "msg_annotations",
+		Object: "chat.completion",
+		Model:  "claude-3-sonnet-20240229",
+		Choices: []llm.Choice{{
+			Index: 0,
+			Message: &llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{Type: "image_url", ImageURL: &llm.ImageURL{URL: "https://example.com/image.png"}},
+						{Type: "text", Text: lo.ToPtr("hello")},
+						{Type: "text", Text: lo.ToPtr("world")},
+					},
+				},
+				Annotations: []llm.Annotation{
+					{
+						Type: "url_citation",
+						URLCitation: &llm.URLCitation{
+							URL:   "https://example.com/a",
+							Title: "Example A",
+						},
+					},
+					{
+						Type:       "url_citation",
+						StartIndex: lo.ToPtr(int64(1)),
+						EndIndex:   lo.ToPtr(int64(3)),
+						URLCitation: &llm.URLCitation{
+							URL:   "https://example.com/b",
+							Title: "Example B",
+						},
+					},
+				},
+			},
+		}},
+	}
+
+	resp := convertToAnthropicResponse(chatResp)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Content, 3)
+	require.Equal(t, "image", resp.Content[0].Type)
+	require.Equal(t, "text", resp.Content[1].Type)
+	require.Equal(t, "hello", lo.FromPtr(resp.Content[1].Text))
+	require.Len(t, resp.Content[1].Citations, 2)
+	require.Equal(t, []TextCitation{
+		{
+			Type:  "url_citation",
+			URL:   "https://example.com/a",
+			Title: "Example A",
+		},
+		{
+			Type:  "url_citation",
+			URL:   "https://example.com/b",
+			Title: "Example B",
+		},
+	}, resp.Content[1].Citations)
+	require.Equal(t, "text", resp.Content[2].Type)
+	require.Equal(t, "world", lo.FromPtr(resp.Content[2].Text))
+	require.Nil(t, resp.Content[2].Citations)
+}
+
+func TestConvertToAnthropicResponse_WithAnnotationsAndNoTextBlock(t *testing.T) {
+	chatResp := &llm.Response{
+		ID:     "msg_annotations_no_text",
+		Object: "chat.completion",
+		Model:  "claude-3-sonnet-20240229",
+		Choices: []llm.Choice{{
+			Index: 0,
+			Message: &llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{Type: "image_url", ImageURL: &llm.ImageURL{URL: "https://example.com/image.png"}},
+					},
+				},
+				Annotations: []llm.Annotation{{
+					Type: "url_citation",
+					URLCitation: &llm.URLCitation{
+						URL:   "https://example.com/only",
+						Title: "Only Citation",
+					},
+				}},
+			},
+		}},
+	}
+
+	resp := convertToAnthropicResponse(chatResp)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Content, 2)
+	require.Equal(t, "image", resp.Content[0].Type)
+	require.Equal(t, "text", resp.Content[1].Type)
+	require.Equal(t, "", lo.FromPtr(resp.Content[1].Text))
+	require.Equal(t, []TextCitation{{
+		Type:  "url_citation",
+		URL:   "https://example.com/only",
+		Title: "Only Citation",
+	}}, resp.Content[1].Citations)
+}
+
+func TestConvertToAnthropicResponse_WithAnnotationsDefaultsCitationType(t *testing.T) {
+	chatResp := &llm.Response{
+		ID:     "msg_annotations_default_type",
+		Object: "chat.completion",
+		Model:  "claude-3-sonnet-20240229",
+		Choices: []llm.Choice{{
+			Index: 0,
+			Message: &llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Grounded answer"),
+				},
+				Annotations: []llm.Annotation{{
+					URLCitation: &llm.URLCitation{
+						URL:   "https://example.com/default",
+						Title: "Default Citation",
+					},
+				}},
+			},
+		}},
+	}
+
+	resp := convertToAnthropicResponse(chatResp)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Content, 1)
+	require.Equal(t, "text", resp.Content[0].Type)
+	require.Len(t, resp.Content[0].Citations, 1)
+	require.Equal(t, TextCitation{
+		Type:  "web_search_result_location",
+		URL:   "https://example.com/default",
+		Title: "Default Citation",
+	}, resp.Content[0].Citations[0])
+}
+
+func TestConvertToAnthropicResponse_NormalizesOpenAIWebSearchCitationType(t *testing.T) {
+	chatResp := &llm.Response{
+		ID:     "msg_annotations_openai_web_search_type",
+		Object: "chat.completion",
+		Model:  "gpt-5.4-2026-03-05",
+		TransformerMetadata: map[string]any{
+			"openai_responses_web_search_calls": []map[string]any{{
+				"id":     "ws_123",
+				"type":   "web_search_call",
+				"status": "completed",
+				"action": map[string]any{
+					"type":  "search",
+					"query": "latest ai news",
+				},
+			}},
+		},
+		Choices: []llm.Choice{{
+			Index: 0,
+			Message: &llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Grounded answer"),
+				},
+				Annotations: []llm.Annotation{{
+					Type: "url_citation",
+					URLCitation: &llm.URLCitation{
+						URL:   "https://example.com/search",
+						Title: "Search Result",
+					},
+				}},
+			},
+		}},
+	}
+
+	resp := convertToAnthropicResponse(chatResp)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Content, 1)
+	require.Equal(t, "text", resp.Content[0].Type)
+	require.Len(t, resp.Content[0].Citations, 1)
+	require.Equal(t, TextCitation{
+		Type:  "web_search_result_location",
+		URL:   "https://example.com/search",
+		Title: "Search Result",
+	}, resp.Content[0].Citations[0])
+}
+
 func TestInboundTransformer_ValidationEdgeCases(t *testing.T) {
 	transformer := NewInboundTransformer()
 
@@ -1960,6 +2205,63 @@ func TestInboundTransformer_TransformResponse_EdgeCases(t *testing.T) {
 				require.Equal(t, "tool_use", resp.Content[0].Type)
 				require.Equal(t, "call_only", resp.Content[0].ID)
 				require.Equal(t, "search", *resp.Content[0].Name)
+			},
+		},
+		{
+			name: "response with tool call and no finish reason",
+			chatResp: &llm.Response{
+				ID:      "msg_tool_without_finish_reason",
+				Object:  "chat.completion",
+				Model:   "claude-3-sonnet-20240229",
+				Created: 1234567890,
+				Choices: []llm.Choice{{
+					Index: 0,
+					Message: &llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{{
+							ID:   "call_without_finish_reason",
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "search",
+								Arguments: `{"query":"test"}`,
+							},
+						}},
+					},
+				}},
+			},
+			expectError: false,
+			validate: func(t *testing.T, resp *Message) {
+				t.Helper()
+				require.Len(t, resp.Content, 1)
+				require.Equal(t, "tool_use", resp.Content[0].Type)
+				require.NotNil(t, resp.StopReason)
+				require.Equal(t, "tool_use", *resp.StopReason)
+			},
+		},
+		{
+			name: "response with text and no finish reason",
+			chatResp: &llm.Response{
+				ID:      "msg_text_without_finish_reason",
+				Object:  "chat.completion",
+				Model:   "claude-3-sonnet-20240229",
+				Created: 1234567890,
+				Choices: []llm.Choice{{
+					Index: 0,
+					Message: &llm.Message{
+						Role: "assistant",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Done"),
+						},
+					},
+				}},
+			},
+			expectError: false,
+			validate: func(t *testing.T, resp *Message) {
+				t.Helper()
+				require.Len(t, resp.Content, 1)
+				require.Equal(t, "text", resp.Content[0].Type)
+				require.NotNil(t, resp.StopReason)
+				require.Equal(t, "end_turn", *resp.StopReason)
 			},
 		},
 		{

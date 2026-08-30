@@ -253,6 +253,40 @@ func (_u *RequestExecutionUpdate) ClearRequestHeaders() *RequestExecutionUpdate 
 	return _u
 }
 
+// SetRequestURL sets the "request_url" field.
+func (_u *RequestExecutionUpdate) SetRequestURL(v string) *RequestExecutionUpdate {
+	_u.mutation.SetRequestURL(v)
+	return _u
+}
+
+// SetNillableRequestURL sets the "request_url" field if the given value is not nil.
+func (_u *RequestExecutionUpdate) SetNillableRequestURL(v *string) *RequestExecutionUpdate {
+	if v != nil {
+		_u.SetRequestURL(*v)
+	}
+	return _u
+}
+
+// ClearRequestURL clears the value of the "request_url" field.
+func (_u *RequestExecutionUpdate) ClearRequestURL() *RequestExecutionUpdate {
+	_u.mutation.ClearRequestURL()
+	return _u
+}
+
+// SetPassThroughApplied sets the "pass_through_applied" field.
+func (_u *RequestExecutionUpdate) SetPassThroughApplied(v bool) *RequestExecutionUpdate {
+	_u.mutation.SetPassThroughApplied(v)
+	return _u
+}
+
+// SetNillablePassThroughApplied sets the "pass_through_applied" field if the given value is not nil.
+func (_u *RequestExecutionUpdate) SetNillablePassThroughApplied(v *bool) *RequestExecutionUpdate {
+	if v != nil {
+		_u.SetPassThroughApplied(*v)
+	}
+	return _u
+}
+
 // Mutation returns the RequestExecutionMutation object of the builder.
 func (_u *RequestExecutionUpdate) Mutation() *RequestExecutionMutation {
 	return _u.mutation
@@ -296,6 +330,11 @@ func (_u *RequestExecutionUpdate) defaults() {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *RequestExecutionUpdate) check() error {
+	if v, ok := _u.mutation.ExternalID(); ok {
+		if err := requestexecution.ExternalIDValidator(v); err != nil {
+			return &ValidationError{Name: "external_id", err: fmt.Errorf(`ent: validator failed for field "RequestExecution.external_id": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := requestexecution.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "RequestExecution.status": %w`, err)}
@@ -333,6 +372,9 @@ func (_u *RequestExecutionUpdate) sqlSave(ctx context.Context) (_node int, err e
 	}
 	if _u.mutation.ExternalIDCleared() {
 		_spec.ClearField(requestexecution.FieldExternalID, field.TypeString)
+	}
+	if _u.mutation.ReasoningEffortCleared() {
+		_spec.ClearField(requestexecution.FieldReasoningEffort, field.TypeString)
 	}
 	if value, ok := _u.mutation.ResponseBody(); ok {
 		_spec.SetField(requestexecution.FieldResponseBody, field.TypeJSON, value)
@@ -411,6 +453,15 @@ func (_u *RequestExecutionUpdate) sqlSave(ctx context.Context) (_node int, err e
 	}
 	if _u.mutation.RequestHeadersCleared() {
 		_spec.ClearField(requestexecution.FieldRequestHeaders, field.TypeJSON)
+	}
+	if value, ok := _u.mutation.RequestURL(); ok {
+		_spec.SetField(requestexecution.FieldRequestURL, field.TypeString, value)
+	}
+	if _u.mutation.RequestURLCleared() {
+		_spec.ClearField(requestexecution.FieldRequestURL, field.TypeString)
+	}
+	if value, ok := _u.mutation.PassThroughApplied(); ok {
+		_spec.SetField(requestexecution.FieldPassThroughApplied, field.TypeBool, value)
 	}
 	_spec.AddModifiers(_u.modifiers...)
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
@@ -656,6 +707,40 @@ func (_u *RequestExecutionUpdateOne) ClearRequestHeaders() *RequestExecutionUpda
 	return _u
 }
 
+// SetRequestURL sets the "request_url" field.
+func (_u *RequestExecutionUpdateOne) SetRequestURL(v string) *RequestExecutionUpdateOne {
+	_u.mutation.SetRequestURL(v)
+	return _u
+}
+
+// SetNillableRequestURL sets the "request_url" field if the given value is not nil.
+func (_u *RequestExecutionUpdateOne) SetNillableRequestURL(v *string) *RequestExecutionUpdateOne {
+	if v != nil {
+		_u.SetRequestURL(*v)
+	}
+	return _u
+}
+
+// ClearRequestURL clears the value of the "request_url" field.
+func (_u *RequestExecutionUpdateOne) ClearRequestURL() *RequestExecutionUpdateOne {
+	_u.mutation.ClearRequestURL()
+	return _u
+}
+
+// SetPassThroughApplied sets the "pass_through_applied" field.
+func (_u *RequestExecutionUpdateOne) SetPassThroughApplied(v bool) *RequestExecutionUpdateOne {
+	_u.mutation.SetPassThroughApplied(v)
+	return _u
+}
+
+// SetNillablePassThroughApplied sets the "pass_through_applied" field if the given value is not nil.
+func (_u *RequestExecutionUpdateOne) SetNillablePassThroughApplied(v *bool) *RequestExecutionUpdateOne {
+	if v != nil {
+		_u.SetPassThroughApplied(*v)
+	}
+	return _u
+}
+
 // Mutation returns the RequestExecutionMutation object of the builder.
 func (_u *RequestExecutionUpdateOne) Mutation() *RequestExecutionMutation {
 	return _u.mutation
@@ -712,6 +797,11 @@ func (_u *RequestExecutionUpdateOne) defaults() {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *RequestExecutionUpdateOne) check() error {
+	if v, ok := _u.mutation.ExternalID(); ok {
+		if err := requestexecution.ExternalIDValidator(v); err != nil {
+			return &ValidationError{Name: "external_id", err: fmt.Errorf(`ent: validator failed for field "RequestExecution.external_id": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := requestexecution.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "RequestExecution.status": %w`, err)}
@@ -766,6 +856,9 @@ func (_u *RequestExecutionUpdateOne) sqlSave(ctx context.Context) (_node *Reques
 	}
 	if _u.mutation.ExternalIDCleared() {
 		_spec.ClearField(requestexecution.FieldExternalID, field.TypeString)
+	}
+	if _u.mutation.ReasoningEffortCleared() {
+		_spec.ClearField(requestexecution.FieldReasoningEffort, field.TypeString)
 	}
 	if value, ok := _u.mutation.ResponseBody(); ok {
 		_spec.SetField(requestexecution.FieldResponseBody, field.TypeJSON, value)
@@ -844,6 +937,15 @@ func (_u *RequestExecutionUpdateOne) sqlSave(ctx context.Context) (_node *Reques
 	}
 	if _u.mutation.RequestHeadersCleared() {
 		_spec.ClearField(requestexecution.FieldRequestHeaders, field.TypeJSON)
+	}
+	if value, ok := _u.mutation.RequestURL(); ok {
+		_spec.SetField(requestexecution.FieldRequestURL, field.TypeString, value)
+	}
+	if _u.mutation.RequestURLCleared() {
+		_spec.ClearField(requestexecution.FieldRequestURL, field.TypeString)
+	}
+	if value, ok := _u.mutation.PassThroughApplied(); ok {
+		_spec.SetField(requestexecution.FieldPassThroughApplied, field.TypeBool, value)
 	}
 	_spec.AddModifiers(_u.modifiers...)
 	_node = &RequestExecution{config: _u.config}

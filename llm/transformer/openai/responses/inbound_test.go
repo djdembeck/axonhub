@@ -11,8 +11,8 @@ import (
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
-	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestNewInboundTransformer(t *testing.T) {
@@ -151,6 +151,104 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 				require.Equal(t, "function", result.Tools[0].Type)
 				require.Equal(t, "get_weather", result.Tools[0].Function.Name)
 				require.Equal(t, "Get weather information", result.Tools[0].Function.Description)
+			},
+		},
+		{
+			name: "request with namespace tools",
+			httpReq: &httpclient.Request{
+				Body: []byte(`{
+					"model": "gpt-4o",
+					"input": "List the projects.",
+					"tools": [
+						{
+							"type": "namespace",
+							"name": "mcp__codebase_memory_mcp",
+							"tools": [
+								{
+									"type": "function",
+									"name": "list_projects",
+									"description": "List stored projects",
+									"parameters": {
+										"type": "object",
+										"properties": {}
+									},
+									"strict": true
+								},
+								{
+									"type": "function",
+									"name": "get_project",
+									"description": "Get a stored project",
+									"parameters": {
+										"type": "object",
+										"properties": {"id": {"type": "string"}},
+										"required": ["id"]
+									}
+								},
+								{
+									"type": "web_search",
+									"name": "unsupported_nested_tool"
+								}
+							]
+						},
+						{
+							"type": "function",
+							"name": "get_weather",
+							"parameters": {"type": "object", "properties": {}}
+						}
+					]
+				}`),
+			},
+			expectError: false,
+			validate: func(t *testing.T, result *llm.Request) {
+				require.Len(t, result.Tools, 3)
+
+				namespaceTool := result.Tools[0]
+				require.Equal(t, "function", namespaceTool.Type)
+				require.Equal(t, "mcp__codebase_memory_mcp__list_projects", namespaceTool.Function.Name)
+				require.Equal(t, "List stored projects", namespaceTool.Function.Description)
+				require.JSONEq(t, `{"type":"object","properties":{}}`, string(namespaceTool.Function.Parameters))
+				require.NotNil(t, namespaceTool.Function.Strict)
+				require.True(t, *namespaceTool.Function.Strict)
+
+				require.Equal(t, "mcp__codebase_memory_mcp__get_project", result.Tools[1].Function.Name)
+				require.Equal(t, "get_weather", result.Tools[2].Function.Name)
+			},
+		},
+		{
+			name: "captures responses provider raw tools and tool choice",
+			httpReq: &httpclient.Request{
+				Body: []byte(`{
+					"model": "gpt-4o",
+					"input": "Search and run shell.",
+					"tools": [
+						{
+							"type": "tool_search",
+							"name": "search_docs",
+							"namespace": "docs"
+						},
+						{
+							"type": "function",
+							"name": "get_weather",
+							"parameters": {"type": "object", "properties": {}}
+						}
+					],
+					"tool_choice": {
+						"type": "tool_search",
+						"tools": [
+							{"type": "tool_search", "name": "search_docs"}
+						]
+					}
+				}`),
+			},
+			expectError: false,
+			validate: func(t *testing.T, result *llm.Request) {
+				require.Len(t, result.Tools, 1)
+				require.NotNil(t, result.ProviderExtensions)
+				require.NotNil(t, result.ProviderExtensions.OpenAIResponses)
+				require.NotNil(t, result.ProviderExtensions.OpenAIResponses.Request)
+				require.Len(t, result.ProviderExtensions.OpenAIResponses.Request.RawTools, 1)
+				require.JSONEq(t, `{"type":"tool_search","name":"search_docs","namespace":"docs"}`, string(result.ProviderExtensions.OpenAIResponses.Request.RawTools[0].Raw))
+				require.JSONEq(t, `{"type":"tool_search","tools":[{"type":"tool_search","name":"search_docs"}]}`, string(result.ProviderExtensions.OpenAIResponses.Request.RawToolChoice))
 			},
 		},
 		{
@@ -453,6 +551,202 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInboundTransformer_TransformRequest_PreservesWebSearchTools(t *testing.T) {
+	trans := NewInboundTransformer()
+
+	result, err := trans.TransformRequest(context.Background(), &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-5.4",
+			"input": "Use web search.",
+			"tool_choice": "required",
+			"tools": [
+				{
+					"type": "web_search",
+					"filters": {
+						"allowed_domains": ["example.com"]
+					},
+					"user_location": {
+						"city": "San Francisco",
+						"country": "US"
+					}
+				}
+			]
+		}`),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, result.Tools, 1)
+	tool := result.Tools[0]
+	require.Equal(t, llm.ToolTypeWebSearch, tool.Type)
+	require.NotNil(t, tool.WebSearch)
+	require.Equal(t, []string{"example.com"}, tool.WebSearch.AllowedDomains)
+	require.Equal(t, "San Francisco", tool.WebSearch.UserLocation.City)
+	require.Equal(t, "US", tool.WebSearch.UserLocation.Country)
+	require.Equal(t, "approximate", tool.WebSearch.UserLocation.Type)
+}
+
+func TestInboundTransformer_TransformStream_AttachesAnnotationsToFirstTextItem(t *testing.T) {
+	trans := NewInboundTransformer()
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			ID:      "resp_stream_annotations",
+			Object:  "chat.completion.chunk",
+			Created: 1677652288,
+			Model:   "gpt-4o",
+			Choices: []llm.Choice{{
+				Delta: &llm.Message{
+					Role: "assistant",
+					Annotations: []llm.Annotation{{
+						Type:       "url_citation",
+						StartIndex: lo.ToPtr(int64(0)),
+						EndIndex:   lo.ToPtr(int64(5)),
+						URLCitation: &llm.URLCitation{
+							URL:   "https://example.com/stream",
+							Title: "Stream Example",
+						},
+					}},
+					Content: llm.MessageContent{Content: lo.ToPtr("Hello")},
+				},
+			}},
+		},
+		{
+			ID:      "resp_stream_annotations",
+			Object:  "chat.completion.chunk",
+			Created: 1677652288,
+			Model:   "gpt-4o",
+			Choices: []llm.Choice{{FinishReason: lo.ToPtr("stop")}},
+			Usage:   &llm.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+		},
+	}))
+	require.NoError(t, err)
+
+	events, err := streams.All(stream)
+	require.NoError(t, err)
+
+	var contentAdded *StreamEvent
+	var itemDone *StreamEvent
+	for _, raw := range events {
+		var ev StreamEvent
+		require.NoError(t, json.Unmarshal(raw.Data, &ev))
+		switch ev.Type {
+		case StreamEventTypeContentPartAdded:
+			contentAdded = &ev
+		case StreamEventTypeOutputItemDone:
+			if ev.Item != nil && ev.Item.Type == "message" {
+				itemDone = &ev
+			}
+		}
+	}
+
+	require.NotNil(t, contentAdded)
+	require.NotNil(t, contentAdded.Part)
+	require.Len(t, contentAdded.Part.Annotations, 1)
+	require.Equal(t, "url_citation", contentAdded.Part.Annotations[0].Type)
+	require.NotNil(t, itemDone)
+	require.NotNil(t, itemDone.Item)
+	require.NotNil(t, itemDone.Item.Content)
+	require.Len(t, itemDone.Item.Content.Items, 1)
+	require.Len(t, itemDone.Item.Content.Items[0].Annotations, 1)
+	require.Equal(t, "https://example.com/stream", itemDone.Item.Content.Items[0].Annotations[0].URLCitation.URL)
+}
+
+func TestInboundTransformer_TransformStream_AttachesAnnotationsFromChoiceMessageToFirstTextItem(t *testing.T) {
+	trans := NewInboundTransformer()
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			ID:      "resp_stream_message_annotations",
+			Object:  "chat.completion.chunk",
+			Created: 1677652288,
+			Model:   "gpt-4o",
+			Choices: []llm.Choice{{
+				Message: &llm.Message{
+					Annotations: []llm.Annotation{{
+						Type:       "url_citation",
+						StartIndex: lo.ToPtr(int64(0)),
+						EndIndex:   lo.ToPtr(int64(5)),
+						URLCitation: &llm.URLCitation{
+							URL:   "https://example.com/message-stream",
+							Title: "Message Stream Example",
+						},
+					}},
+				},
+				Delta: &llm.Message{
+					Role:    "assistant",
+					Content: llm.MessageContent{Content: lo.ToPtr("Hello")},
+				},
+			}},
+		},
+		{
+			ID:      "resp_stream_message_annotations",
+			Object:  "chat.completion.chunk",
+			Created: 1677652288,
+			Model:   "gpt-4o",
+			Choices: []llm.Choice{{FinishReason: lo.ToPtr("stop")}},
+			Usage:   &llm.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+		},
+	}))
+	require.NoError(t, err)
+
+	events, err := streams.All(stream)
+	require.NoError(t, err)
+
+	var contentAdded *StreamEvent
+	var itemDone *StreamEvent
+	for _, raw := range events {
+		var ev StreamEvent
+		require.NoError(t, json.Unmarshal(raw.Data, &ev))
+		switch ev.Type {
+		case StreamEventTypeContentPartAdded:
+			contentAdded = &ev
+		case StreamEventTypeOutputItemDone:
+			if ev.Item != nil && ev.Item.Type == "message" {
+				itemDone = &ev
+			}
+		}
+	}
+
+	require.NotNil(t, contentAdded)
+	require.NotNil(t, contentAdded.Part)
+	require.Len(t, contentAdded.Part.Annotations, 1)
+	require.Equal(t, "url_citation", contentAdded.Part.Annotations[0].Type)
+	require.Equal(t, "https://example.com/message-stream", contentAdded.Part.Annotations[0].URLCitation.URL)
+	require.NotNil(t, itemDone)
+	require.NotNil(t, itemDone.Item)
+	require.NotNil(t, itemDone.Item.Content)
+	require.Len(t, itemDone.Item.Content.Items, 1)
+	require.Len(t, itemDone.Item.Content.Items[0].Annotations, 1)
+	require.Equal(t, "https://example.com/message-stream", itemDone.Item.Content.Items[0].Annotations[0].URLCitation.URL)
+}
+
+func TestInboundTransformer_TransformRequest_GroupsConsecutiveFunctionCalls(t *testing.T) {
+	trans := NewInboundTransformer()
+
+	result, err := trans.TransformRequest(context.Background(), &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-4o",
+			"input": [
+				{"role": "user", "content": "Run both tools."},
+				{"type": "function_call", "call_id": "call_a", "name": "first_tool", "arguments": "{}"},
+				{"type": "function_call", "call_id": "call_b", "name": "second_tool", "arguments": "{}"},
+				{"type": "function_call_output", "call_id": "call_a", "output": "first result"},
+				{"type": "function_call_output", "call_id": "call_b", "output": "second result"}
+			]
+		}`),
+	})
+
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 4)
+	require.Equal(t, "user", result.Messages[0].Role)
+	require.Equal(t, "assistant", result.Messages[1].Role)
+	require.Len(t, result.Messages[1].ToolCalls, 2)
+	require.Equal(t, "call_a", result.Messages[1].ToolCalls[0].ID)
+	require.Equal(t, "call_b", result.Messages[1].ToolCalls[1].ID)
+	require.Equal(t, "tool", result.Messages[2].Role)
+	require.Equal(t, "call_a", lo.FromPtr(result.Messages[2].ToolCallID))
+	require.Equal(t, "tool", result.Messages[3].Role)
+	require.Equal(t, "call_b", lo.FromPtr(result.Messages[3].ToolCallID))
 }
 
 func TestInboundTransformer_TransformResponse(t *testing.T) {
@@ -931,6 +1225,7 @@ func TestInboundTransformer_TransformResponse_WithCompactionContent(t *testing.T
 				require.Equal(t, http.StatusOK, result.StatusCode)
 
 				var resp Response
+
 				err := json.Unmarshal(result.Body, &resp)
 				require.NoError(t, err)
 				require.Equal(t, "response", resp.Object)
@@ -982,6 +1277,7 @@ func TestInboundTransformer_TransformResponse_WithCompactionContent(t *testing.T
 				require.Equal(t, http.StatusOK, result.StatusCode)
 
 				var resp Response
+
 				err := json.Unmarshal(result.Body, &resp)
 				require.NoError(t, err)
 
@@ -1115,6 +1411,19 @@ func TestConvertToolChoiceToLLM(t *testing.T) {
 				require.NotNil(t, result.NamedToolChoice)
 				require.Equal(t, "function", result.NamedToolChoice.Type)
 				require.Equal(t, "get_weather", result.NamedToolChoice.Function.Name)
+			},
+		},
+		{
+			name: "specific non-function tool without name",
+			input: &ToolChoice{
+				Type: lo.ToPtr("image_generation"),
+			},
+			validate: func(t *testing.T, result *llm.ToolChoice) {
+				require.NotNil(t, result)
+				require.Nil(t, result.ToolChoice)
+				require.NotNil(t, result.NamedToolChoice)
+				require.Equal(t, "image_generation", result.NamedToolChoice.Type)
+				require.Empty(t, result.NamedToolChoice.Function.Name)
 			},
 		},
 	}
@@ -1301,6 +1610,122 @@ func TestConvertItemToMessage_Reasoning(t *testing.T) {
 	require.Nil(t, result, "reasoning items should return nil from convertItemToMessage")
 }
 
+func TestConvertInputToMessages_GroupsConsecutiveToolCalls(t *testing.T) {
+	input := &Input{Items: []Item{
+		{Role: "user", Content: &Input{Text: lo.ToPtr("Run both tools.")}},
+		{Type: "function_call", CallID: "call_a", Name: "first_tool", Arguments: `{}`},
+		{Type: "function_call", CallID: "call_b", Name: "second_tool", Arguments: `{"value":2}`},
+		{Type: "function_call_output", CallID: "call_a", Output: &Input{Text: lo.ToPtr("first result")}},
+		{Type: "function_call_output", CallID: "call_b", Output: &Input{Text: lo.ToPtr("second result")}},
+		{Role: "user", Content: &Input{Text: lo.ToPtr("Continue.")}},
+	}}
+
+	messages, err := convertInputToMessages(input)
+	require.NoError(t, err)
+	require.Len(t, messages, 5)
+
+	require.Equal(t, "user", messages[0].Role)
+	require.Equal(t, "Run both tools.", lo.FromPtr(messages[0].Content.Content))
+
+	require.Equal(t, "assistant", messages[1].Role)
+	require.Len(t, messages[1].ToolCalls, 2)
+	require.Equal(t, "call_a", messages[1].ToolCalls[0].ID)
+	require.Equal(t, "first_tool", messages[1].ToolCalls[0].Function.Name)
+	require.Equal(t, `{}`, messages[1].ToolCalls[0].Function.Arguments)
+	require.Equal(t, "call_b", messages[1].ToolCalls[1].ID)
+	require.Equal(t, "second_tool", messages[1].ToolCalls[1].Function.Name)
+	require.Equal(t, `{"value":2}`, messages[1].ToolCalls[1].Function.Arguments)
+
+	require.Equal(t, "tool", messages[2].Role)
+	require.Equal(t, "call_a", lo.FromPtr(messages[2].ToolCallID))
+	require.Equal(t, "first result", lo.FromPtr(messages[2].Content.Content))
+	require.Equal(t, "tool", messages[3].Role)
+	require.Equal(t, "call_b", lo.FromPtr(messages[3].ToolCallID))
+	require.Equal(t, "second result", lo.FromPtr(messages[3].Content.Content))
+
+	require.Equal(t, "user", messages[4].Role)
+	require.Equal(t, "Continue.", lo.FromPtr(messages[4].Content.Content))
+}
+
+func TestConvertInputToMessages_GroupsMixedToolCallTypes(t *testing.T) {
+	input := &Input{Items: []Item{
+		{
+			Type:      "function_call",
+			CallID:    "call_function",
+			Name:      "function_tool",
+			Namespace: "namespace",
+			Arguments: `{"query":"value"}`,
+		},
+		{
+			Type:   "custom_tool_call",
+			CallID: "call_custom",
+			Name:   "custom_tool",
+			Input:  lo.ToPtr("freeform input"),
+		},
+	}}
+
+	messages, err := convertInputToMessages(input)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "assistant", messages[0].Role)
+	require.Len(t, messages[0].ToolCalls, 2)
+
+	functionCall := messages[0].ToolCalls[0]
+	require.Equal(t, "call_function", functionCall.ID)
+	require.Equal(t, "function", functionCall.Type)
+	require.Equal(t, "function_tool", functionCall.Function.Name)
+	require.Equal(t, "namespace", functionCall.Function.Namespace)
+	require.Equal(t, `{"query":"value"}`, functionCall.Function.Arguments)
+
+	customCall := messages[0].ToolCalls[1]
+	require.Equal(t, "call_custom", customCall.ID)
+	require.Equal(t, llm.ToolTypeResponsesCustomTool, customCall.Type)
+	require.NotNil(t, customCall.ResponseCustomToolCall)
+	require.Equal(t, "call_custom", customCall.ResponseCustomToolCall.CallID)
+	require.Equal(t, "custom_tool", customCall.ResponseCustomToolCall.Name)
+	require.Equal(t, "freeform input", customCall.ResponseCustomToolCall.Input)
+}
+
+func TestConvertInputToMessages_DoesNotGroupToolCallsAcrossBoundaries(t *testing.T) {
+	t.Run("tool output", func(t *testing.T) {
+		input := &Input{Items: []Item{
+			{Type: "function_call", CallID: "call_a", Name: "first_tool", Arguments: `{}`},
+			{Type: "function_call_output", CallID: "call_a", Output: &Input{Text: lo.ToPtr("result")}},
+			{Type: "function_call", CallID: "call_b", Name: "second_tool", Arguments: `{}`},
+		}}
+
+		messages, err := convertInputToMessages(input)
+		require.NoError(t, err)
+		require.Len(t, messages, 3)
+		require.Equal(t, []string{"assistant", "tool", "assistant"}, []string{
+			messages[0].Role,
+			messages[1].Role,
+			messages[2].Role,
+		})
+		require.Equal(t, "call_a", messages[0].ToolCalls[0].ID)
+		require.Equal(t, "call_b", messages[2].ToolCalls[0].ID)
+	})
+
+	t.Run("user message", func(t *testing.T) {
+		input := &Input{Items: []Item{
+			{Type: "function_call", CallID: "call_a", Name: "first_tool", Arguments: `{}`},
+			{Role: "user", Content: &Input{Text: lo.ToPtr("New turn.")}},
+			{Type: "function_call", CallID: "call_b", Name: "second_tool", Arguments: `{}`},
+		}}
+
+		messages, err := convertInputToMessages(input)
+		require.NoError(t, err)
+		require.Len(t, messages, 3)
+		require.Equal(t, []string{"assistant", "user", "assistant"}, []string{
+			messages[0].Role,
+			messages[1].Role,
+			messages[2].Role,
+		})
+		require.Equal(t, "call_a", messages[0].ToolCalls[0].ID)
+		require.Equal(t, "call_b", messages[2].ToolCalls[0].ID)
+	})
+}
+
 func TestConvertReasoningWithFollowing(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1339,7 +1764,7 @@ func TestConvertReasoningWithFollowing(t *testing.T) {
 					Summary: []ReasoningSummary{
 						{Type: "summary_text", Text: "Reasoning summary"},
 					},
-					EncryptedContent: lo.ToPtr(shared.OpenAIEncryptedContentPrefix + "encrypted_data_here"),
+					EncryptedContent: lo.ToPtr("encrypted_data_here"),
 				},
 			},
 			startIdx: 0,
@@ -1351,7 +1776,7 @@ func TestConvertReasoningWithFollowing(t *testing.T) {
 				require.NotNil(t, result.ReasoningContent)
 				require.Equal(t, "Reasoning summary", *result.ReasoningContent)
 				require.NotNil(t, result.ReasoningSignature)
-				require.Equal(t, shared.OpenAIEncryptedContentPrefix+"encrypted_data_here", *result.ReasoningSignature)
+				require.Equal(t, "encrypted_data_here", *result.ReasoningSignature)
 			},
 		},
 		{
@@ -1400,6 +1825,43 @@ func TestConvertReasoningWithFollowing(t *testing.T) {
 				require.Len(t, result.ToolCalls, 1)
 				require.Equal(t, "call_123", result.ToolCalls[0].ID)
 				require.Equal(t, "get_weather", result.ToolCalls[0].Function.Name)
+			},
+		},
+		{
+			name: "consecutive reasoning items merged with function_call",
+			items: []Item{
+				{
+					ID:               "rs_first",
+					Type:             "reasoning",
+					Summary:          []ReasoningSummary{{Type: "summary_text", Text: "first"}},
+					EncryptedContent: lo.ToPtr("gAAAA_FIRST_BLOB"),
+				},
+				{
+					ID:               "rs_second",
+					Type:             "reasoning",
+					Summary:          []ReasoningSummary{{Type: "summary_text", Text: "second"}},
+					EncryptedContent: lo.ToPtr("gAAAA_SECOND_BLOB"),
+				},
+				{
+					Type:      "function_call",
+					CallID:    "call_123",
+					Name:      "get_weather",
+					Arguments: `{}`,
+				},
+			},
+			startIdx: 0,
+			validate: func(t *testing.T, result *llm.Message, consumed int, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				require.Equal(t, 3, consumed)
+				require.Equal(t, []llm.ReasoningItem{
+					{ID: "rs_first", Content: "first", Signature: "gAAAA_FIRST_BLOB"},
+					{ID: "rs_second", Content: "second", Signature: "gAAAA_SECOND_BLOB"},
+				}, result.ReasoningItems)
+				require.Equal(t, "firstsecond", lo.FromPtr(result.ReasoningContent))
+				require.Equal(t, "gAAAA_SECOND_BLOB", lo.FromPtr(result.ReasoningSignature))
+				require.Len(t, result.ToolCalls, 1)
+				require.Equal(t, "call_123", result.ToolCalls[0].ID)
 			},
 		},
 		{
@@ -1490,6 +1952,16 @@ func TestConvertReasoningWithFollowing(t *testing.T) {
 			tt.validate(t, result, consumed, err)
 		})
 	}
+}
+
+func TestBuildReasoningItems_OmitsEmptyEncryptedContent(t *testing.T) {
+	items := buildReasoningItems(llm.Message{
+		ReasoningItems: []llm.ReasoningItem{{ID: "rs_summary", Content: "summary only"}},
+	})
+
+	require.Len(t, items, 1)
+	require.Equal(t, "rs_summary", items[0].ID)
+	require.Nil(t, items[0].EncryptedContent)
 }
 
 func TestInboundTransformer_TransformRequest_WithReasoningInput(t *testing.T) {
@@ -1587,7 +2059,89 @@ func TestInboundTransformer_TransformRequest_WithReasoningInput(t *testing.T) {
 	}
 }
 
-func TestInboundTransformer_TransformResponse_WithReasoning(t *testing.T) {
+func TestConvertToResponsesAPIResponse_AttachesAnnotationsToFirstTextItem(t *testing.T) {
+	resp := convertToResponsesAPIResponse(&llm.Response{
+		ID:      "resp_annotations",
+		Created: 1677652288,
+		Model:   "gpt-4o",
+		Choices: []llm.Choice{{
+			Message: &llm.Message{
+				ID:   "msg_annotations",
+				Role: "assistant",
+				Annotations: []llm.Annotation{
+					{
+						Type:       "url_citation",
+						StartIndex: lo.ToPtr(int64(0)),
+						EndIndex:   lo.ToPtr(int64(5)),
+						URLCitation: &llm.URLCitation{
+							URL:   "https://example.com",
+							Title: "Example",
+						},
+					},
+				},
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{Type: "text", Text: lo.ToPtr("Hello")},
+						{Type: "text", Text: lo.ToPtr(" world")},
+					},
+				},
+			},
+			FinishReason: lo.ToPtr("stop"),
+		}},
+	})
+
+	require.Len(t, resp.Output, 1)
+	require.NotNil(t, resp.Output[0].Content)
+	require.Len(t, resp.Output[0].Content.Items, 2)
+	require.Len(t, resp.Output[0].Content.Items[0].Annotations, 1)
+	require.Empty(t, resp.Output[0].Content.Items[1].Annotations)
+	require.Equal(t, "url_citation", resp.Output[0].Content.Items[0].Annotations[0].Type)
+	require.NotNil(t, resp.Output[0].Content.Items[0].Annotations[0].URLCitation)
+	require.Equal(t, "https://example.com", resp.Output[0].Content.Items[0].Annotations[0].URLCitation.URL)
+}
+
+func TestConvertToResponsesAPIResponse_PreservesMultipleReasoningItems(t *testing.T) {
+	resp := convertToResponsesAPIResponse(&llm.Response{
+		ID:      "resp_reasoning_items",
+		Model:   "gpt-5",
+		Created: 1,
+		Choices: []llm.Choice{{
+			Message: &llm.Message{
+				Role: "assistant",
+				ReasoningItems: []llm.ReasoningItem{
+					{ID: "rs_first", Content: "first", Signature: "gAAAA_FIRST_BLOB"},
+					{ID: "rs_second", Content: "second", Signature: "gAAAA_SECOND_BLOB"},
+				},
+				ToolCalls: []llm.ToolCall{{
+					ID:   "call_tool",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "lookup",
+						Arguments: "{}",
+					},
+				}},
+			},
+		}},
+	})
+
+	require.Len(t, resp.Output, 3)
+	require.Equal(t, "reasoning", resp.Output[0].Type)
+	require.Equal(t, "rs_first", resp.Output[0].ID)
+	require.Len(t, resp.Output[0].Summary, 1)
+	require.Equal(t, "first", resp.Output[0].Summary[0].Text)
+	require.NotNil(t, resp.Output[0].EncryptedContent)
+	require.Equal(t, "gAAAA_FIRST_BLOB", *resp.Output[0].EncryptedContent)
+
+	require.Equal(t, "reasoning", resp.Output[1].Type)
+	require.Equal(t, "rs_second", resp.Output[1].ID)
+	require.Len(t, resp.Output[1].Summary, 1)
+	require.Equal(t, "second", resp.Output[1].Summary[0].Text)
+	require.NotNil(t, resp.Output[1].EncryptedContent)
+	require.Equal(t, "gAAAA_SECOND_BLOB", *resp.Output[1].EncryptedContent)
+	require.Equal(t, "function_call", resp.Output[2].Type)
+}
+
+func TestInboundTransformer_TransformResponse_WithReasoningContent(t *testing.T) {
 	trans := NewInboundTransformer()
 
 	tests := []struct {
@@ -1609,7 +2163,7 @@ func TestInboundTransformer_TransformResponse_WithReasoning(t *testing.T) {
 						Message: &llm.Message{
 							Role:               "assistant",
 							ReasoningContent:   lo.ToPtr("I analyzed the problem step by step."),
-							ReasoningSignature: lo.ToPtr(shared.OpenAIEncryptedContentPrefix + "encrypted_data_here"),
+							ReasoningSignature: lo.ToPtr("encrypted_data_here"),
 							Content: llm.MessageContent{
 								Content: lo.ToPtr("The answer is 42."),
 							},
@@ -1645,12 +2199,12 @@ func TestInboundTransformer_TransformResponse_WithReasoning(t *testing.T) {
 				require.Equal(t, "reasoning", reasoningOutput.Type)
 				require.Len(t, reasoningOutput.Summary, 1)
 				require.Equal(t, "summary_text", reasoningOutput.Summary[0].Type)
-					require.Equal(t, "I analyzed the problem step by step.", reasoningOutput.Summary[0].Text)
-					require.NotNil(t, reasoningOutput.EncryptedContent)
-					require.Equal(t, shared.OpenAIEncryptedContentPrefix+"encrypted_data_here", *reasoningOutput.EncryptedContent)
+				require.Equal(t, "I analyzed the problem step by step.", reasoningOutput.Summary[0].Text)
+				require.NotNil(t, reasoningOutput.EncryptedContent)
+				require.Equal(t, "encrypted_data_here", *reasoningOutput.EncryptedContent)
 
-					// Second output should be message
-					messageOutput := resp.Output[1]
+				// Second output should be message
+				messageOutput := resp.Output[1]
 				require.Equal(t, "message", messageOutput.Type)
 				require.Equal(t, "assistant", messageOutput.Role)
 

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { useQuery } from '@tanstack/react-query';
 import { graphqlRequest } from '@/gql/graphql';
+import { useSelectedProjectId } from '@/stores/projectStore';
 
 // Schema definitions
 export const requestStatsSchema = z.object({
@@ -44,6 +45,7 @@ export const tokensByAPIKeySchema = z.object({
 });
 
 export const tokensByChannelSchema = z.object({
+  channelId: z.string(),
   channelName: z.string(),
   inputTokens: z.number(),
   outputTokens: z.number(),
@@ -100,6 +102,7 @@ export const channelSuccessRateSchema = z.object({
   channelId: z.string(),
   channelName: z.string(),
   channelType: z.string(),
+  channelDisabled: z.boolean(),
   successCount: z.number(),
   failedCount: z.number(),
   totalCount: z.number(),
@@ -221,6 +224,7 @@ const TOKENS_BY_API_KEY_QUERY = `
 const TOKENS_BY_CHANNEL_QUERY = `
   query GetTokensByChannel($timeWindow: String) {
     tokenStatsByChannel(timeWindow: $timeWindow) {
+      channelId
       channelName
       inputTokens
       outputTokens
@@ -304,11 +308,12 @@ const TOP_PROJECTS_QUERY = `
 `;
 
 const CHANNEL_SUCCESS_RATES_QUERY = `
-  query GetChannelSuccessRates {
-    channelSuccessRates {
+  query GetChannelSuccessRates($timeWindow: String, $limit: Int) {
+    channelSuccessRates(timeWindow: $timeWindow, limit: $limit) {
       channelId
       channelName
       channelType
+      channelDisabled
       successCount
       failedCount
       totalCount
@@ -316,6 +321,48 @@ const CHANNEL_SUCCESS_RATES_QUERY = `
     }
   }
 `;
+
+export const usageStatsByUserSchema = z.object({
+  userId: z.string(),
+  userName: z.string(),
+  requestCount: z.number(),
+  totalTokens: z.number(),
+  totalCost: z.number(),
+});
+
+export type UsageStatsByUser = z.infer<typeof usageStatsByUserSchema>;
+
+const USAGE_STATS_BY_USER_QUERY = `
+  query GetUsageStatsByUser($timeWindow: String) {
+    usageStatsByUser(timeWindow: $timeWindow) {
+      userId
+      userName
+      requestCount
+      totalTokens
+      totalCost
+    }
+  }
+`;
+
+export function useUsageStatsByUser(timeWindow?: string) {
+  const selectedProjectId = useSelectedProjectId();
+
+  return useQuery({
+    queryKey: ['usageStatsByUser', timeWindow, selectedProjectId],
+    queryFn: async () => {
+      const headers = selectedProjectId ? { 'X-Project-ID': selectedProjectId } : undefined;
+      const data = await graphqlRequest<{ usageStatsByUser: UsageStatsByUser[] }>(
+        USAGE_STATS_BY_USER_QUERY,
+        { timeWindow },
+        headers
+      );
+      return data.usageStatsByUser.map((item) => usageStatsByUserSchema.parse(item));
+    },
+    enabled: !!selectedProjectId,
+    refetchInterval: 60000,
+    placeholderData: (previousData) => previousData,
+  });
+}
 
 const MODEL_PERFORMANCE_STATS_QUERY = `
   query ModelPerformanceStats {
@@ -556,14 +603,18 @@ export function useTokenStats() {
   });
 }
 
-export function useChannelSuccessRates() {
+export function useChannelSuccessRates(limit?: number, timeWindow?: string) {
   return useQuery({
-    queryKey: ['channelSuccessRates'],
+    queryKey: ['channelSuccessRates', limit, timeWindow],
     queryFn: async () => {
-      const data = await graphqlRequest<{ channelSuccessRates: ChannelSuccessRate[] }>(CHANNEL_SUCCESS_RATES_QUERY);
+      const data = await graphqlRequest<{ channelSuccessRates: ChannelSuccessRate[] }>(
+        CHANNEL_SUCCESS_RATES_QUERY,
+        { ...(timeWindow != null && { timeWindow }), ...(limit != null && { limit }) }
+      );
       return data.channelSuccessRates.map((item) => channelSuccessRateSchema.parse(item));
     },
     refetchInterval: 300000,
+    placeholderData: (previousData) => previousData,
   });
 }
 

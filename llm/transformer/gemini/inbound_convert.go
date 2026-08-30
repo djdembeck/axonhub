@@ -335,15 +335,17 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 				textParts = append(textParts, llm.MessageContentPart{
 					Type: "video_url",
 					VideoURL: &llm.VideoURL{
-						URL: dataURL,
+						URL:      dataURL,
+						MIMEType: part.InlineData.MIMEType,
 					},
 				})
 			} else if isAudioMIMEType(part.InlineData.MIMEType) {
 				textParts = append(textParts, llm.MessageContentPart{
 					Type: "input_audio",
 					InputAudio: &llm.InputAudio{
-						Format: audioMIMETypeToFormat(part.InlineData.MIMEType),
-						Data:   part.InlineData.Data,
+						Format:   audioMIMETypeToFormat(part.InlineData.MIMEType),
+						Data:     part.InlineData.Data,
+						MIMEType: part.InlineData.MIMEType,
 					},
 				})
 			} else {
@@ -351,14 +353,18 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 				textParts = append(textParts, llm.MessageContentPart{
 					Type: "image_url",
 					ImageURL: &llm.ImageURL{
-						URL: dataURL,
+						URL:      dataURL,
+						MIMEType: part.InlineData.MIMEType,
 					},
 				})
 			}
 
 		case part.FileData != nil:
 			// Convert file data based on MIME type or URL extension
-			mimeType := part.FileData.MIMEType
+			mimeType := mediaMIMEType(part.FileData.MIMEType, part.FileData.FileURI, func(mediaType string) bool {
+				return isDocumentMIMEType(mediaType) || isVideoMIMEType(mediaType) ||
+					isAudioMIMEType(mediaType) || strings.HasPrefix(mediaType, "image/")
+			})
 			if isDocumentMIMEType(mimeType) {
 				// Document type (PDF, Word, etc.)
 				textParts = append(textParts, llm.MessageContentPart{
@@ -372,14 +378,17 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 				textParts = append(textParts, llm.MessageContentPart{
 					Type: "video_url",
 					VideoURL: &llm.VideoURL{
-						URL: part.FileData.FileURI,
+						URL:      part.FileData.FileURI,
+						MIMEType: mimeType,
 					},
 				})
 			} else if isAudioMIMEType(mimeType) {
 				textParts = append(textParts, llm.MessageContentPart{
 					Type: "input_audio",
 					InputAudio: &llm.InputAudio{
-						Format: audioMIMETypeToFormat(mimeType),
+						Format:   audioMIMETypeToFormat(mimeType),
+						URL:      part.FileData.FileURI,
+						MIMEType: mimeType,
 					},
 				})
 			} else {
@@ -387,7 +396,8 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 				textParts = append(textParts, llm.MessageContentPart{
 					Type: "image_url",
 					ImageURL: &llm.ImageURL{
-						URL: part.FileData.FileURI,
+						URL:      part.FileData.FileURI,
+						MIMEType: mimeType,
 					},
 				})
 			}
@@ -397,6 +407,7 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 			if part.FunctionCall.Args != nil {
 				argsJSON, _ = json.Marshal(part.FunctionCall.Args)
 			}
+
 			tc := llm.ToolCall{
 				ID:   part.FunctionCall.ID,
 				Type: "function",
@@ -451,6 +462,34 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 	}
 
 	return msg, nil
+}
+
+func citationMetadataFromLLMAnnotations(annotations []llm.Annotation) *CitationMetadata {
+	citations := make([]*Citation, 0, len(annotations))
+	for _, ann := range annotations {
+		if ann.URLCitation == nil || ann.URLCitation.URL == "" {
+			continue
+		}
+
+		citation := &Citation{
+			URI:   ann.URLCitation.URL,
+			Title: ann.URLCitation.Title,
+		}
+		if ann.StartIndex != nil {
+			citation.StartIndex = *ann.StartIndex
+		}
+		if ann.EndIndex != nil {
+			citation.EndIndex = *ann.EndIndex
+		}
+
+		citations = append(citations, citation)
+	}
+
+	if len(citations) == 0 {
+		return nil
+	}
+
+	return &CitationMetadata{Citations: citations}
 }
 
 // convertLLMToGeminiResponse converts unified Response to Gemini GenerateContentResponse.
@@ -544,7 +583,7 @@ func convertLLMChoiceToGeminiCandidate(choice *llm.Choice, isStream bool) *Candi
 				case "image_url":
 					// Handle image_url type
 					if part.ImageURL != nil && part.ImageURL.URL != "" {
-						geminiPart := convertImageURLToGeminiPart(part.ImageURL.URL)
+						geminiPart := convertImageURLToGeminiPart(part.ImageURL)
 						if geminiPart != nil {
 							parts = append(parts, geminiPart)
 							lastPart = geminiPart
@@ -609,6 +648,12 @@ func convertLLMChoiceToGeminiCandidate(choice *llm.Choice, isStream bool) *Candi
 
 		content.Parts = parts
 		candidate.Content = content
+	}
+
+	if gm := xmap.GetPtr[GroundingMetadata](choice.TransformerMetadata, TransformerMetadataKeyGroundingMetadata); gm != nil {
+		candidate.GroundingMetadata = gm
+	} else if msg != nil && len(msg.Annotations) > 0 {
+		candidate.CitationMetadata = citationMetadataFromLLMAnnotations(msg.Annotations)
 	}
 
 	// Convert finish reason

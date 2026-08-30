@@ -115,6 +115,11 @@ func (r *Request) ToLLMRequest() *llm.Request {
 		}
 	}
 
+	// Convert Thinking to ReasoningEffort
+	if r.Thinking != nil && r.Thinking.Type == "disabled" {
+		req.ReasoningEffort = "none"
+	}
+
 	return req
 }
 
@@ -138,9 +143,13 @@ func (m Message) ToLLMMessage() llm.Message {
 		}
 	}
 
-	// Fallback: if ReasoningContent is empty but Reasoning has value, use Reasoning
+	// Sync reasoning fields: if one field has value and the other is nil, copy the value
 	if msg.ReasoningContent == nil && m.Reasoning != nil && *m.Reasoning != "" {
 		msg.ReasoningContent = m.Reasoning
+	}
+
+	if msg.Reasoning == nil && msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+		msg.Reasoning = msg.ReasoningContent
 	}
 
 	// Convert Content
@@ -175,7 +184,9 @@ func (m Message) ToLLMMessage() llm.Message {
 // ToLLMAnnotation converts OpenAI Annotation to unified llm.Annotation.
 func (a Annotation) ToLLMAnnotation() llm.Annotation {
 	annotation := llm.Annotation{
-		Type: a.Type,
+		Type:       a.Type,
+		StartIndex: a.StartIndex,
+		EndIndex:   a.EndIndex,
 	}
 
 	if a.URLCitation != nil {

@@ -7,7 +7,7 @@
 ## 先决条件
 
 - Docker 和 Docker Compose（推荐）
-- 或者 Go 1.24+ 和 Node.js 18+ 用于开发环境设置
+- 或者 Go 1.26+ 和 Node.js 18+ 用于开发环境设置
 - 来自 AI 提供商的有效 API 密钥（OpenAI、Anthropic 等）
 
 ## 快速设置方法
@@ -390,7 +390,7 @@ log:
 ### 获取帮助
 
 - 查看 [GitHub Issues](https://github.com/looplj/axonhub/issues)
-- 查看 [架构文档](../architecture/erd.md)
+- 查看 [架构文档](../development/erd.md)
 - 加入社区讨论
 
 ## 下一步是什么？

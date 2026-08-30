@@ -16,6 +16,7 @@ import (
 
 func (t *OutboundTransformer) TransformStream(
 	ctx context.Context,
+	req *httpclient.Request,
 	stream streams.Stream[*httpclient.StreamEvent],
 ) (streams.Stream[*llm.Response], error) {
 	// Filter out unnecessary stream events to optimize performance
@@ -24,9 +25,7 @@ func (t *OutboundTransformer) TransformStream(
 	// Append the DONE event to the filtered stream
 	streamWithDone := streams.AppendStream(filteredStream, lo.ToPtr(llm.DoneStreamEvent))
 
-	scope, _ := shared.GetTransportScope(ctx)
-
-	return streams.NoNil(newOutboundStream(streamWithDone, t.config.Type, scope)), nil
+	return streams.NoNil(newOutboundStream(streamWithDone, t.config.Type)), nil
 }
 
 // filterStreamEvent determines if a stream event should be processed
@@ -55,7 +54,6 @@ type streamState struct {
 	streamModel  string
 	streamUsage  *llm.Usage
 	platformType PlatformType
-	scope        shared.TransportScope
 	// Tool call tracking
 	toolIndex int
 	toolCalls map[int]*llm.ToolCall // index -> tool call
@@ -69,14 +67,13 @@ type outboundStream struct {
 	err     error
 }
 
-func newOutboundStream(stream streams.Stream[*httpclient.StreamEvent], platformType PlatformType, scope shared.TransportScope) *outboundStream {
+func newOutboundStream(stream streams.Stream[*httpclient.StreamEvent], platformType PlatformType) *outboundStream {
 	return &outboundStream{
 		stream: stream,
 		state: &streamState{
 			toolCalls:    make(map[int]*llm.ToolCall),
 			toolIndex:    -1,
 			platformType: platformType,
-			scope:        scope,
 		},
 	}
 }
@@ -166,18 +163,41 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 		}
 
 	case "content_block_start":
-		// Only process tool_use content blocks, skip text content blocks
-		if streamEvent.ContentBlock != nil && streamEvent.ContentBlock.Type == "tool_use" {
-			// Initialize a new tool call
+		if streamEvent.ContentBlock == nil {
+			//nolint:nilnil // It is expected.
+			return nil, nil
+		}
+
+		cb := streamEvent.ContentBlock
+
+		// Anthropic assigns a stable ordinal index to each content block;
+		// preserve it so non-streaming and interleaving consumers can
+		// reconstruct the original order.
+		blockIdx := -1
+		if streamEvent.Index != nil {
+			blockIdx = int(*streamEvent.Index)
+		}
+
+		switch {
+		case isAnthropicToolUseLike(cb.Type):
+			if cb.Name == nil {
+				//nolint:nilnil // Defensive; Anthropic always sends a name on *_tool_use.
+				return nil, nil
+			}
+
 			state.toolIndex++
 			toolCall := llm.ToolCall{
 				Index: state.toolIndex,
-				ID:    streamEvent.ContentBlock.ID,
+				ID:    cb.ID,
 				Type:  "function",
 				Function: llm.FunctionCall{
-					Name:      *streamEvent.ContentBlock.Name,
+					Name:      *cb.Name,
 					Arguments: "",
 				},
+			}
+			setAnthropicSpecialMeta(&toolCall.TransformerMetadata, cb.Type, cb.Caller)
+			if blockIdx >= 0 {
+				setAnthropicBlockIndex(&toolCall.TransformerMetadata, blockIdx)
 			}
 			state.toolCalls[state.toolIndex] = &toolCall
 
@@ -189,8 +209,27 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 				},
 			}
 			resp.Choices = []llm.Choice{choice}
-		} else {
-			//nolint:nilnil // It is expected.
+		case isAnthropicToolResultLike(cb.Type):
+			// Server-side tool results (web_search_tool_result,
+			// code_execution_tool_result, ...) arrive complete in
+			// content_block_start and carry no subsequent deltas. Emit them
+			// inline on the assistant message; inbound transformers that
+			// cannot represent inline results will drop them.
+			ir := inlineToolResultFromBlock(cb)
+			if blockIdx >= 0 {
+				setAnthropicBlockIndex(&ir.TransformerMetadata, blockIdx)
+			}
+
+			choice := llm.Choice{
+				Index: 0,
+				Delta: &llm.Message{
+					Role:              "assistant",
+					InlineToolResults: []llm.InlineToolResult{ir},
+				},
+			}
+			resp.Choices = []llm.Choice{choice}
+		default:
+			//nolint:nilnil // Ignore other content block starts (text, thinking, etc.).
 			return nil, nil
 		}
 
@@ -206,20 +245,33 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 			switch *streamEvent.Delta.Type {
 			case "input_json_delta":
 				if streamEvent.Delta.PartialJSON != nil {
+					tc, ok := state.toolCalls[state.toolIndex]
+					if !ok || tc == nil {
+						// A tool_use-style delta arrived without a preceding
+						// content_block_start we registered (e.g. a block type
+						// we do not handle). Drop the delta rather than
+						// dereference nil.
+						//nolint:nilnil // Intentional no-op.
+						return nil, nil
+					}
+
+					deltaTC := llm.ToolCall{
+						Index: state.toolIndex,
+						ID:    tc.ID,
+						Type:  "function",
+						Function: llm.FunctionCall{
+							Arguments: *streamEvent.Delta.PartialJSON,
+						},
+					}
+					if len(tc.TransformerMetadata) > 0 {
+						deltaTC.TransformerMetadata = tc.TransformerMetadata
+					}
+
 					choice := llm.Choice{
 						Index: 0,
 						Delta: &llm.Message{
-							Role: "assistant",
-							ToolCalls: []llm.ToolCall{
-								{
-									Index: state.toolIndex,
-									ID:    state.toolCalls[state.toolIndex].ID,
-									Type:  "function",
-									Function: llm.FunctionCall{
-										Arguments: *streamEvent.Delta.PartialJSON,
-									},
-								},
-							},
+							Role:      "assistant",
+							ToolCalls: []llm.ToolCall{deltaTC},
 						},
 					}
 					resp.Choices = []llm.Choice{choice}
@@ -230,12 +282,21 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 				choice.Delta.Content = llm.MessageContent{
 					Content: streamEvent.Delta.Text,
 				}
+			case "citations_delta":
+				if streamEvent.Delta.Citation == nil {
+					return nil, nil
+				}
+				annotation, ok := llmAnnotationFromCitation(*streamEvent.Delta.Citation)
+				if !ok {
+					return nil, nil
+				}
+				choice.Delta.Annotations = []llm.Annotation{annotation}
 			case "thinking":
 				return nil, nil
 			case "thinking_delta":
 				choice.Delta.ReasoningContent = streamEvent.Delta.Thinking
 			case "signature_delta":
-				choice.Delta.ReasoningSignature = shared.EncodeAnthropicSignatureInScope(streamEvent.Delta.Signature, s.state.scope)
+				choice.Delta.ReasoningSignature = shared.EncodeAnthropicSignature(streamEvent.Delta.Signature)
 			}
 
 			resp.Choices = []llm.Choice{choice}
@@ -249,6 +310,7 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 				if usage.PromptTokens == 0 && state.streamUsage.PromptTokens > 0 {
 					usage.PromptTokens = state.streamUsage.PromptTokens
 				}
+
 				if usage.PromptTokensDetails == nil && state.streamUsage.PromptTokensDetails != nil {
 					usage.PromptTokensDetails = state.streamUsage.PromptTokensDetails
 				}
@@ -336,6 +398,7 @@ func parseAnthropicStreamErrorEvent(event *httpclient.StreamEvent) *llm.Response
 	}
 
 	root := gjson.ParseBytes(event.Data)
+
 	candidate := root
 	if root.Get("event").String() == "error" {
 		if d := root.Get("data"); d.Exists() {
@@ -356,9 +419,11 @@ func parseAnthropicStreamErrorEvent(event *httpclient.StreamEvent) *llm.Response
 	if detail.Message == "" {
 		detail.Message = candidate.Get("message").String()
 	}
+
 	if detail.Message == "" && errObj.Exists() {
 		detail.Message = errObj.String()
 	}
+
 	if detail.Message == "" {
 		detail.Message = "stream error"
 	}

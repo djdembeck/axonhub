@@ -14,21 +14,33 @@ import {
 } from './schema';
 
 // Dynamic GraphQL query builder
-function buildRequestsQuery(permissions: { canViewApiKeys: boolean; canViewChannels: boolean }) {
+function buildRequestsQuery(permissions: { canViewApiKeys: boolean; canViewChannels: boolean; canViewCallerUser: boolean }) {
   const apiKeyFields = permissions.canViewApiKeys
     ? `
           apiKey {
             id
-            name
+            name${permissions.canViewCallerUser ? `
+            user {
+              firstName
+              lastName
+            }` : ''}
           }`
     : '';
 
-  const channelFields = permissions.canViewChannels
+  const requestChannelFields = permissions.canViewChannels
     ? `
                 channel {
                   id
                   name
                 }`
+    : '';
+
+  const executionChannelFields = permissions.canViewChannels
+    ? `
+                  channel {
+                    id
+                    name
+                  }`
     : '';
 
   return `
@@ -45,9 +57,11 @@ function buildRequestsQuery(permissions: { canViewApiKeys: boolean; canViewChann
           node {
             id
             createdAt
-            updatedAt${apiKeyFields}${channelFields}
+            updatedAt${apiKeyFields}${requestChannelFields}
             source
             modelID
+            format
+            reasoningEffort
             stream
             status
             clientIP
@@ -57,12 +71,12 @@ function buildRequestsQuery(permissions: { canViewApiKeys: boolean; canViewChann
             executions(first: 10, orderBy: { field: CREATED_AT, direction: DESC }) {
               edges {
                 node {
+                  id
+                  createdAt
                   modelID
                   status
-                  channel {
-                    id
-                    name
-                  }
+                  reasoningEffort
+                  passThroughApplied${executionChannelFields}
                 }
                 cursor
               }
@@ -80,6 +94,7 @@ function buildRequestsQuery(permissions: { canViewApiKeys: boolean; canViewChann
                   id
                   promptTokens
                   completionTokens
+                  completionReasoningTokens
                   totalTokens
                   promptCachedTokens
                   promptWriteCachedTokens
@@ -102,12 +117,16 @@ function buildRequestsQuery(permissions: { canViewApiKeys: boolean; canViewChann
   `;
 }
 
-function buildRequestDetailQuery(permissions: { canViewApiKeys: boolean; canViewChannels: boolean }) {
+function buildRequestDetailQuery(permissions: { canViewApiKeys: boolean; canViewChannels: boolean; canViewCallerUser: boolean }) {
   const apiKeyFields = permissions.canViewApiKeys
     ? `
           apiKey {
             id
-            name
+            name${permissions.canViewCallerUser ? `
+            user {
+              firstName
+              lastName
+            }` : ''}
         }`
     : '';
 
@@ -147,6 +166,7 @@ function buildRequestDetailQuery(permissions: { canViewApiKeys: boolean; canView
                   id
                   promptTokens
                   completionTokens
+                  completionReasoningTokens
                   totalTokens
                   promptCachedTokens
                   promptWriteCachedTokens
@@ -160,12 +180,16 @@ function buildRequestDetailQuery(permissions: { canViewApiKeys: boolean; canView
   `;
 }
 
-function buildRequestDetailPollingQuery(permissions: { canViewApiKeys: boolean; canViewChannels: boolean }) {
+function buildRequestDetailPollingQuery(permissions: { canViewApiKeys: boolean; canViewChannels: boolean; canViewCallerUser: boolean }) {
   const apiKeyFields = permissions.canViewApiKeys
     ? `
           apiKey {
             id
-            name
+            name${permissions.canViewCallerUser ? `
+            user {
+              firstName
+              lastName
+            }` : ''}
         }`
     : '';
 
@@ -240,7 +264,10 @@ function buildRequestExecutionsQuery(permissions: { canViewChannels: boolean }) 
                 responseStatusCode
                 status
                 format
+                reasoningEffort
                 stream
+                requestURL
+                passThroughApplied
                 metricsFirstTokenLatencyMs
                 metricsReasoningDurationMs
               }
@@ -310,6 +337,7 @@ export function useRequests(variables?: {
       }
     },
     enabled,
+    refetchOnWindowFocus: false,
   });
 }
 
@@ -397,7 +425,7 @@ export async function fetchAdjacentRequestPage(params: {
   direction: 'older' | 'newer';
   pageSize: number;
   where?: Record<string, any>;
-  permissions: { canViewApiKeys: boolean; canViewChannels: boolean };
+  permissions: { canViewApiKeys: boolean; canViewChannels: boolean; canViewCallerUser: boolean };
   projectId?: string | null;
 }): Promise<{ requests: Request[]; pageInfo: RequestConnection['pageInfo'] }> {
   const query = buildRequestsQuery(params.permissions);

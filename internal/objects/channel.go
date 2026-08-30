@@ -6,8 +6,24 @@ import (
 	"strings"
 	"time"
 
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/oauth"
+)
+
+// ChannelEndpoint represents an outbound API endpoint configuration within a Channel.
+// Each endpoint specifies the upstream API format and an optional custom path override.
+// Within a single channel, api_format must be unique.
+type ChannelEndpoint struct {
+	APIFormat string `json:"api_format"`
+	Path      string `json:"path,omitempty"`
+	BaseURL   string `json:"base_url,omitempty"`
+	Transport string `json:"transport,omitempty"`
+}
+
+const (
+	ChannelEndpointTransportHTTP      = "http"
+	ChannelEndpointTransportWebSocket = "websocket"
 )
 
 type (
@@ -30,11 +46,24 @@ type HeaderEntry struct {
 
 // Override operation types.
 const (
-	OverrideOpSet    = "set"
-	OverrideOpDelete = "delete"
-	OverrideOpRename = "rename"
-	OverrideOpCopy   = "copy"
+	OverrideOpSet          = "set"
+	OverrideOpSetIfAbsent  = "set_if_absent"
+	OverrideOpDelete       = "delete"
+	OverrideOpRename       = "rename"
+	OverrideOpCopy         = "copy"
+	OverrideOpArrayAppend  = "array_append"
+	OverrideOpArrayPrepend = "array_prepend"
+	OverrideOpArrayInsert  = "array_insert"
+	OverrideOpArrayRemove  = "array_remove"
 )
+
+// OverrideMatch defines a simple equality matcher for array_remove operations.
+type OverrideMatch struct {
+	// Path is resolved relative to each array item.
+	Path string `json:"path"`
+	// Eq is the value that removes the item when it matches.
+	Eq string `json:"eq"`
+}
 
 // OverrideOperation defines a structured override operation for request body/header manipulation.
 type OverrideOperation struct {
@@ -44,6 +73,15 @@ type OverrideOperation struct {
 	To        string `json:"to,omitempty"`
 	Value     string `json:"value,omitempty"`
 	Condition string `json:"condition,omitempty"`
+	// Match identifies array items removed by array_remove.
+	Match *OverrideMatch `json:"match,omitempty"`
+	// Index is the target position for array_insert. Only used by array_insert.
+	// Negative values count from the end (-1 = before last). Out-of-range values are clamped to [0, len].
+	Index *int `json:"index,omitempty"`
+	// Splat controls whether a JSON-array value is spread into the target array
+	// (true: each element inserted individually) or inserted as a single nested element (false).
+	// Only meaningful for array_append, array_prepend, and array_insert. Defaults to true.
+	Splat *bool `json:"splat,omitempty"`
 }
 
 func HeaderEntriesToOverrideOperations(headers []HeaderEntry) []OverrideOperation {
@@ -73,6 +111,15 @@ type TransformOptions struct {
 
 	// ReplaceDeveloperRoleWithSystem replaces developer role with system in messages for Bailian compatibility.
 	ReplaceDeveloperRoleWithSystem bool `json:"replaceDeveloperRoleWithSystem"`
+
+	// ReasoningEffortMapping maps inbound reasoning_effort values to outbound ones for
+	// non-standard OpenAI-compatible providers. The first entry whose From matches the
+	// effort value wins; values not in the list pass through unchanged.
+	// e.g. [{"from":"xhigh","to":"max"}] converts Anthropic's internal "xhigh" (mapped
+	// from "max") back to "max" for providers that only recognize "max".
+	// Consumed by the OpenAI-shared outbound transformer. Other transformers ignore it
+	// for now. Strong-typed to mirror ModelMapping; see llm.ReasoningEffortMapping.
+	ReasoningEffortMapping []llm.ReasoningEffortMapping `json:"reasoningEffortMapping,omitempty"`
 }
 
 type ChannelSettings struct {
@@ -102,6 +149,12 @@ type ChannelSettings struct {
 	// HideMappedModels hides the mapped models from the model list when model mappings are configured.
 	// When enabled, only the original model names (from field) will be exposed, not the mapped model names (to field).
 	HideMappedModels bool `json:"hideMappedModels"`
+
+	// LowercaseModelID converts model name matching keys to lowercase.
+	// When enabled, only RequestModel (used for matching) is lowercased; ActualModel
+	// (sent to provider) preserves original casing. This enables cross-channel load
+	// balancing where providers use different casing for the same model.
+	LowercaseModelID bool `json:"lowercaseModelId"`
 
 	// OverrideParameters sets the channel override the request body.
 	// A json string.
@@ -135,28 +188,64 @@ type ChannelSettings struct {
 	PassThroughUserAgent *bool `json:"passThroughUserAgent,omitempty"`
 
 	// PassThroughBody controls whether to forward the original request body directly
-	// to the upstream provider without re-serialization.
+	// to the upstream provider and the raw provider response/stream directly to the client
+	// without re-serialization through the transform pipelines.
 	// Only effective when the inbound and outbound API formats are identical.
-	PassThroughBody bool `json:"passThroughBody,omitempty"`
+	// When set to nil, it inherits from the global system setting.
+	// When set to true/false, it overrides the global setting.
+	PassThroughBody *bool `json:"passThroughBody,omitempty"`
 
 	// RateLimit configures the upstream rate limit for the channel.
 	// When configured, the load balancer will skip channels that have exceeded their rate limits.
 	RateLimit *ChannelRateLimit `json:"rateLimit,omitempty"`
+
+	// RetryableStatusCodes configures additional HTTP status codes that should
+	// trigger retry for this channel. Default retryable codes (429 and 5xx) are
+	// always handled by the retry policy even when this list is empty.
+	RetryableStatusCodes []int `json:"retryableStatusCodes,omitempty"`
+
+	// RetryableErrorPatterns configures additional error text patterns that should
+	// trigger retry for this channel. When Regex is false, Pattern is matched as a
+	// case-sensitive substring of the error text.
+	RetryableErrorPatterns []RetryableErrorPattern `json:"retryableErrorPatterns,omitempty"`
+}
+
+type RetryableErrorPattern struct {
+	Pattern string `json:"pattern"`
+	Regex   bool   `json:"regex,omitempty"`
 }
 
 type ChannelRateLimit struct {
 	RPM           *int64 `json:"rpm,omitempty"`           // Requests Per Minute, nil = unlimited
 	TPM           *int64 `json:"tpm,omitempty"`           // Tokens Per Minute, nil = unlimited
 	MaxConcurrent *int64 `json:"maxConcurrent,omitempty"` // Maximum concurrent requests, nil = unlimited
+
+	// QueueSize controls the limiter mode when MaxConcurrent is set:
+	//   nil / 0 = soft mode (count only, no blocking, no rejection — preserves PR #1322 scoring behaviour)
+	//   > 0     = hard mode (FIFO wait queue with bounded capacity; excess requests rejected)
+	// Has no effect when MaxConcurrent is unset or <= 0.
+	QueueSize *int64 `json:"queueSize,omitempty"`
+
+	// QueueTimeoutMs is the per-channel queue wait timeout in milliseconds.
+	//   nil / 0 = no per-channel timeout (only the request context bounds the wait)
+	//   > 0     = waiters that exceed this duration receive ErrChannelQueueTimeout
+	// Only meaningful in hard mode (QueueSize > 0).
+	QueueTimeoutMs *int64 `json:"queueTimeoutMs,omitempty"`
 }
 
 // DisabledAPIKey 记录被禁用的 API key 信息（敏感，按 credentials 同级保护）
 // 注意：禁用判断以 Key 明文为主键。
 type DisabledAPIKey struct {
-	Key        string    `json:"key"`
-	DisabledAt time.Time `json:"disabledAt"`
-	ErrorCode  int       `json:"errorCode"`
-	Reason     string    `json:"reason,omitempty"`
+	Key        string     `json:"key"`
+	DisabledAt time.Time  `json:"disabledAt"`
+	ErrorCode  int        `json:"errorCode"`
+	Reason     string     `json:"reason,omitempty"`
+	ExpiresAt  *time.Time `json:"expiresAt,omitempty"`
+}
+
+// IsExpired reports whether a temporary API key disable has elapsed.
+func (dk DisabledAPIKey) IsExpired() bool {
+	return dk.ExpiresAt != nil && time.Now().After(*dk.ExpiresAt)
 }
 
 type ChannelCredentials struct {
@@ -198,24 +287,61 @@ func (c *ChannelCredentials) GetAllAPIKeys() []string {
 	return keys
 }
 
+// OAuthCredentialRef identifies the OAuth credential of a channel in the
+// auto-disable bookkeeping. A channel holds at most one OAuth credential, and
+// its access token is replaced on every refresh, so a fixed sentinel is used as
+// the stable identity instead of the token itself.
+//
+//nolint:gosec // Not a credential: a fixed sentinel that never authenticates anything.
+const OAuthCredentialRef = "__oauth__"
+
+// GetAllCredentialRefs returns the identities of every credential the channel
+// can be disabled on. Key-based channels are identified by the API keys
+// themselves; an OAuth channel is represented by the single OAuthCredentialRef
+// so that auto-disable and scheduled recovery treat it as a one-key channel.
+//
+// This is deliberately separate from GetAllAPIKeys: the sentinel must never
+// reach outbound requests, credential management UI, the channel tester or
+// backups, all of which consume GetAllAPIKeys.
+func (c *ChannelCredentials) GetAllCredentialRefs() []string {
+	if c == nil {
+		return nil
+	}
+
+	if c.IsOAuth() {
+		return []string{OAuthCredentialRef}
+	}
+
+	return c.GetAllAPIKeys()
+}
+
+// GetEnabledCredentialRefs returns the credential refs that are not disabled.
+func (c *ChannelCredentials) GetEnabledCredentialRefs(disabledKeys []DisabledAPIKey) []string {
+	return filterDisabled(c.GetAllCredentialRefs(), disabledKeys)
+}
+
 // GetEnabledAPIKeys returns API keys that are not disabled.
 func (c *ChannelCredentials) GetEnabledAPIKeys(disabledKeys []DisabledAPIKey) []string {
-	allKeys := c.GetAllAPIKeys()
+	return filterDisabled(c.GetAllAPIKeys(), disabledKeys)
+}
+
+// filterDisabled drops every candidate that carries an active disable record.
+func filterDisabled(candidates []string, disabledKeys []DisabledAPIKey) []string {
 	if len(disabledKeys) == 0 {
-		return allKeys
+		return candidates
 	}
 
 	disabledSet := make(map[string]struct{}, len(disabledKeys))
 	for _, dk := range disabledKeys {
-		if dk.Key == "" {
+		if dk.Key == "" || dk.IsExpired() {
 			continue
 		}
 
 		disabledSet[dk.Key] = struct{}{}
 	}
 
-	enabled := make([]string, 0, len(allKeys))
-	for _, key := range allKeys {
+	enabled := make([]string, 0, len(candidates))
+	for _, key := range candidates {
 		if _, ok := disabledSet[key]; ok {
 			continue
 		}
@@ -240,6 +366,16 @@ func (c *ChannelCredentials) IsOAuth() bool {
 
 	// Backward compatibility: check if APIKey contains OAuth JSON
 	return isOAuthJSON(c.APIKey)
+}
+
+func (c *ChannelCredentials) ResolveOAuthCredentials() (*OAuthCredentials, error) {
+	if c != nil && c.OAuth != nil && strings.TrimSpace(c.OAuth.AccessToken) != "" {
+		return c.OAuth, nil
+	}
+	if c == nil {
+		return oauth.ParseCredentialsJSON("")
+	}
+	return oauth.ParseCredentialsJSON(c.APIKey)
 }
 
 // isOAuthJSON checks if a string is an OAuth JSON credential.
@@ -285,6 +421,56 @@ const (
 
 type ChannelPolicies struct {
 	Stream CapabilityPolicy `json:"stream,omitempty"`
+
+	// APIKeyAutoDisableRules are the channel's own auto-disable rules. They are
+	// evaluated before the global retry policy and, when one matches, own the
+	// failure outright. Channels without rules fall back to the global policy.
+	APIKeyAutoDisableRules []APIKeyAutoDisableRule `json:"apiKeyAutoDisableRules,omitempty"`
+}
+
+type APIKeyAutoDisableAction string
+
+const (
+	APIKeyAutoDisableActionTemporary APIKeyAutoDisableAction = "temporary_disable"
+
+	// APIKeyAutoDisableActionPermanentDelete disables the credential and then
+	// removes it from the channel's credentials entirely.
+	APIKeyAutoDisableActionPermanentDelete APIKeyAutoDisableAction = "permanent_disable_delete"
+
+	// APIKeyAutoDisableActionPermanent disables the credential with no expiry but
+	// keeps it on the channel, so an operator can inspect and re-enable it by hand.
+	APIKeyAutoDisableActionPermanent APIKeyAutoDisableAction = "permanent_disable"
+
+	// APIKeyAutoDisableActionUntilCron disables the credential until the first
+	// occurrence of DisableUntilCron after the failure. It exists because quota
+	// resets happen at fixed wall-clock times, which a relative duration cannot
+	// express: the delay needed to reach 03:00 depends on when the failure hit.
+	APIKeyAutoDisableActionUntilCron APIKeyAutoDisableAction = "disable_until_cron"
+)
+
+// APIKeyAutoDisableRule applies to one channel and matches status codes and/or
+// error-message patterns. Empty conditions match any upstream error.
+//
+// Rules act on a single credential. Channels holding several API keys disable
+// only the failing key and keep serving on the rest; the channel itself is
+// disabled once every credential is unavailable, and recovers as soon as one
+// becomes available again. An OAuth channel has exactly one credential
+// (OAuthCredentialRef), so for it the two levels coincide.
+type APIKeyAutoDisableRule struct {
+	StatusCodes     []int                   `json:"statusCodes,omitempty"`
+	KeywordPatterns []string                `json:"keywordPatterns,omitempty"`
+	Times           int                     `json:"times"`
+	Action          APIKeyAutoDisableAction `json:"action"`
+
+	// DisableDurationMinutes applies to APIKeyAutoDisableActionTemporary. A nil
+	// value disables the credential indefinitely.
+	DisableDurationMinutes *int `json:"disableDurationMinutes,omitempty"`
+
+	// DisableUntilCron and DisableUntilTimezone apply to
+	// APIKeyAutoDisableActionUntilCron. DisableUntilCron uses the standard
+	// 5-field crontab format; an empty timezone means UTC.
+	DisableUntilCron     string `json:"disableUntilCron,omitempty"`
+	DisableUntilTimezone string `json:"disableUntilTimezone,omitempty"`
 }
 
 // ParseOverrideOperations parses the override parameters string.

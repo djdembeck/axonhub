@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"entgo.io/ent/dialect"
-	"github.com/zhenzou/executors"
 	"go.uber.org/fx"
 
 	entsql "entgo.io/ent/dialect/sql"
@@ -21,6 +20,7 @@ import (
 	"github.com/looplj/axonhub/internal/pkg/xtime"
 	"github.com/looplj/axonhub/internal/scopes"
 	"github.com/looplj/axonhub/internal/server/gql/qb"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 )
 
 // ChannelProbePoint represents a single probe data point for a channel.
@@ -51,7 +51,6 @@ type ChannelProbeService struct {
 	*AbstractService
 
 	SystemService     *SystemService
-	Executor          executors.ScheduledExecutor
 	mu                sync.Mutex
 	lastExecutionTime time.Time
 }
@@ -63,26 +62,19 @@ func NewChannelProbeService(params ChannelProbeServiceParams) *ChannelProbeServi
 			db: params.Ent,
 		},
 		SystemService:     params.SystemService,
-		Executor:          executors.NewPoolScheduleExecutor(executors.WithMaxConcurrent(1)),
 		lastExecutionTime: time.Time{},
 	}
 
 	return svc
 }
 
-// Start starts the channel probe service with scheduled task.
-func (svc *ChannelProbeService) Start(ctx context.Context) error {
-	_, err := svc.Executor.ScheduleFuncAtCronRate(
-		svc.runProbePeriodically,
-		executors.CRONRule{Expr: "* * * * *"},
-	)
-
-	return err
-}
-
-// Stop stops the channel probe service.
-func (svc *ChannelProbeService) Stop(ctx context.Context) error {
-	return svc.Executor.Shutdown(ctx)
+func (svc *ChannelProbeService) RegisterScheduledTasks(ctx context.Context, s *scheduler.Scheduler) error {
+	return s.Register(ctx, scheduler.TaskSpec{
+		Name:        "channel-probe",
+		Description: "Collect channel performance metrics every minute",
+		CronExpr:    "* * * * *",
+		Timezone:    "UTC",
+	}, svc.runProbePeriodically)
 }
 
 // shouldRunProbe determines if a probe should be executed based on frequency, current time, and last execution time.
@@ -155,13 +147,20 @@ func (svc *ChannelProbeService) computeAllChannelProbeStats(
 	useDollarPlaceholders := dialectName == dialect.Postgres
 
 	// Build args slice for parameterized query
-	args := make([]interface{}, 0, len(channelIDs)+2)
-	args = append(args, startTime.UTC(), endTime.UTC())
+	startUTC := startTime.UTC()
+	endUTC := endTime.UTC()
+	args := make([]any, 0, len(channelIDs)+3)
+	if useDollarPlaceholders {
+		args = append(args, startUTC, endUTC)
+	} else {
+		// For ? placeholders, the usage_logs start bound appears before the
+		// outer request_executions time window in the SQL text.
+		args = append(args, startUTC, startUTC, endUTC)
+	}
 
 	// Build channel ID filter with dialect-aware parameterized placeholders
-	// Note: Placeholders start at $3 because $1 and $2 are reserved for startTime and endTime timestamps.
-	// The args slice is constructed with timestamps first (lines 155-156), then channel IDs appended,
-	// so placeholder numbering must match this ordering to bind values correctly.
+	// Note: PostgreSQL placeholders start at $3 because $1 and $2 are reserved
+	// for startTime and endTime timestamps.
 	channelIDFilter := ""
 	if len(channelIDs) > 0 {
 		placeholders := make([]string, len(channelIDs))

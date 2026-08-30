@@ -3,25 +3,41 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"hash"
+	"hash/fnv"
+	"io"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/samber/lo"
 
+	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/model"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/biz/provider_quota"
 	"github.com/looplj/axonhub/llm"
 )
 
 // ChannelModelsCandidate represents a resolved channel and its matched model entries.
 type ChannelModelsCandidate struct {
-	Channel  *biz.Channel
-	Priority int
-	Models   []biz.ChannelModelEntry
+	Channel            *biz.Channel
+	Priority           int
+	Models             []biz.ChannelModelEntry
+	APIFormat          string // selected endpoint API format for this candidate
+	TraceSticky        bool   // selected from the last successful trace or thread channel
+	ModelRoutingPolicy *ModelRoutingPolicy
+}
+
+// ModelRoutingPolicy contains model-level overrides carried from model
+// resolution into the load-balancing decorator without another database query.
+type ModelRoutingPolicy struct {
+	LoadBalancerStrategy string
+	TraceStickyMode      string
 }
 
 // resolvedAssociationCandidate keeps the association-level metadata produced by
@@ -39,9 +55,17 @@ type CandidateSelector interface {
 	Select(ctx context.Context, req *llm.Request) ([]*ChannelModelsCandidate, error)
 }
 
+// PreviousChannelProvider provides the most recently selected channel for
+// trace and thread routing scopes.
+type PreviousChannelProvider interface {
+	GetPreviousChannelID(ctx context.Context, traceID int) (int, error)
+	GetPreviousChannelIDByThread(ctx context.Context, threadID int) (int, error)
+}
+
 // associationCacheEntry stores cached association resolution results.
 type associationCacheEntry struct {
 	associations            []*objects.ModelAssociation
+	associationSignature    string
 	candidates              []*resolvedAssociationCandidate
 	channelCount            int
 	latestChannelUpdateTime time.Time
@@ -108,10 +132,17 @@ func (s *DefaultSelector) selectChannelCadidates(ctx context.Context, req *llm.R
 			continue
 		}
 
+		endpoints := ch.ResolveEndpoints()
+		apiFormat := SelectAPIFormat(endpoints, req)
+		if req.RequestType == llm.RequestTypeAlphaSearch && apiFormat == "" {
+			continue
+		}
+
 		candidates = append(candidates, &ChannelModelsCandidate{
-			Channel:  ch,
-			Priority: 0,
-			Models:   []biz.ChannelModelEntry{entry},
+			Channel:   ch,
+			Priority:  0,
+			Models:    []biz.ChannelModelEntry{entry},
+			APIFormat: apiFormat,
 		})
 	}
 
@@ -132,7 +163,20 @@ func (s *DefaultSelector) selectModelCandidates(ctx context.Context, req *llm.Re
 		return nil, fmt.Errorf("failed to query AxonHub Model: %w", err)
 	}
 
-	if model.Settings == nil || len(model.Settings.Associations) == 0 {
+	systemSettings := s.SystemService.ModelSettingsOrDefault(ctx)
+	developerAssociationCount, modelAssociationCount, developerInheritanceDisabled := effectiveAssociationSourceCounts(systemSettings, model)
+	associations := biz.EffectiveModelAssociations(systemSettings, model)
+	if log.DebugEnabled(ctx) {
+		log.Debug(ctx, "computed effective model associations",
+			log.String("model", model.ModelID),
+			log.String("developer", model.Developer),
+			log.Int("developer_association_count", developerAssociationCount),
+			log.Int("model_association_count", modelAssociationCount),
+			log.Bool("developer_inheritance_disabled", developerInheritanceDisabled),
+			log.Int("effective_association_count", len(associations)),
+		)
+	}
+	if len(associations) == 0 {
 		if log.DebugEnabled(ctx) {
 			log.Debug(ctx, "model has no associations", log.String("model", req.Model))
 		}
@@ -143,12 +187,12 @@ func (s *DefaultSelector) selectModelCandidates(ctx context.Context, req *llm.Re
 	if log.DebugEnabled(ctx) {
 		log.Debug(ctx, "model associations found",
 			log.String("model", req.Model),
-			log.Int("association_count", len(model.Settings.Associations)),
-			log.Any("associations", model.Settings.Associations),
+			log.Int("association_count", len(associations)),
+			log.Any("associations", associations),
 		)
 	}
 
-	resolvedCandidates, err := s.resolveAssociations(ctx, model, model.Settings.Associations)
+	resolvedCandidates, err := s.resolveAssociations(ctx, model, associations)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve associations: %w", err)
 	}
@@ -162,6 +206,20 @@ func (s *DefaultSelector) selectModelCandidates(ctx context.Context, req *llm.Re
 		}
 
 		return []*ChannelModelsCandidate{}, nil
+	}
+
+	strategy := objects.RoutingPolicyDefault
+	traceStickyMode := objects.RoutingPolicyDefault
+	if model.Settings != nil {
+		strategy = objects.NormalizeRoutingPolicyValue(model.Settings.LoadBalancerStrategy)
+		traceStickyMode = objects.NormalizeRoutingPolicyValue(model.Settings.TraceStickyMode)
+	}
+	modelRoutingPolicy := &ModelRoutingPolicy{
+		LoadBalancerStrategy: strategy,
+		TraceStickyMode:      traceStickyMode,
+	}
+	for _, candidate := range candidates {
+		candidate.ModelRoutingPolicy = modelRoutingPolicy
 	}
 
 	if log.DebugEnabled(ctx) {
@@ -204,6 +262,7 @@ func (s *DefaultSelector) resolveAssociations(
 
 	// Use model ID as cache key
 	modelID := model.ModelID
+	associationSignature := modelAssociationSignature(associations)
 	channelCount := len(channels)
 	latestChannelUpdateTime := s.getLatestChannelUpdateTime(channels)
 	latestModelUpdateTime := model.UpdatedAt
@@ -219,6 +278,7 @@ func (s *DefaultSelector) resolveAssociations(
 		// 4. Model hasn't been updated
 		// 5. Cache hasn't expired (5 minutes)
 		if entry.channelCacheVersion == channelCacheVersion &&
+			entry.associationSignature == associationSignature &&
 			entry.channelCount == channelCount &&
 			entry.latestChannelUpdateTime.Equal(latestChannelUpdateTime) &&
 			entry.latestModelUpdateTime.Equal(latestModelUpdateTime) &&
@@ -309,6 +369,7 @@ func (s *DefaultSelector) resolveAssociations(
 	s.cacheMu.Lock()
 	s.associationCache[modelID] = &associationCacheEntry{
 		associations:            append([]*objects.ModelAssociation(nil), associations...),
+		associationSignature:    associationSignature,
 		candidates:              resolvedCandidates,
 		channelCount:            channelCount,
 		latestChannelUpdateTime: latestChannelUpdateTime,
@@ -325,6 +386,157 @@ func (s *DefaultSelector) resolveAssociations(
 	}
 
 	return resolvedCandidates, nil
+}
+
+func modelAssociationSignature(associations []*objects.ModelAssociation) string {
+	h := fnv.New64a()
+	writeSignatureInt(h, len(associations))
+	for _, assoc := range associations {
+		writeAssociationSignature(h, assoc)
+	}
+
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+func writeAssociationSignature(h hash.Hash64, assoc *objects.ModelAssociation) {
+	if assoc == nil {
+		writeSignatureString(h, "<nil>")
+		return
+	}
+
+	writeSignatureString(h, assoc.Type)
+	writeSignatureInt(h, assoc.Priority)
+	writeSignatureBool(h, assoc.Disabled)
+	writeAssociationWhenSignature(h, assoc.When)
+	if assoc.ChannelModel != nil {
+		writeSignatureString(h, "channelModel")
+		writeSignatureInt(h, assoc.ChannelModel.ChannelID)
+		writeSignatureString(h, assoc.ChannelModel.ModelID)
+	}
+	if assoc.ChannelRegex != nil {
+		writeSignatureString(h, "channelRegex")
+		writeSignatureInt(h, assoc.ChannelRegex.ChannelID)
+		writeSignatureString(h, assoc.ChannelRegex.Pattern)
+	}
+	if assoc.Regex != nil {
+		writeSignatureString(h, "regex")
+		writeSignatureString(h, assoc.Regex.Pattern)
+		writeExcludeSignature(h, assoc.Regex.Exclude)
+	}
+	if assoc.ModelID != nil {
+		writeSignatureString(h, "modelId")
+		writeSignatureString(h, assoc.ModelID.ModelID)
+		writeExcludeSignature(h, assoc.ModelID.Exclude)
+	}
+	if assoc.ChannelTagsModel != nil {
+		writeSignatureString(h, "channelTagsModel")
+		writeStringSliceSignature(h, assoc.ChannelTagsModel.ChannelTags)
+		writeSignatureString(h, assoc.ChannelTagsModel.ModelID)
+	}
+	if assoc.ChannelTagsRegex != nil {
+		writeSignatureString(h, "channelTagsRegex")
+		writeStringSliceSignature(h, assoc.ChannelTagsRegex.ChannelTags)
+		writeSignatureString(h, assoc.ChannelTagsRegex.Pattern)
+	}
+}
+
+func writeAssociationWhenSignature(h hash.Hash64, when *objects.ModelAssociationWhen) {
+	if when == nil {
+		writeSignatureString(h, "when:nil")
+		return
+	}
+
+	writeSignatureString(h, "when")
+	writeSignatureBool(h, when.Enabled)
+	writeConditionSignature(h, when.Condition)
+}
+
+func writeConditionSignature(h hash.Hash64, condition *objects.Condition) {
+	if condition == nil {
+		writeSignatureString(h, "condition:nil")
+		return
+	}
+
+	writeSignatureString(h, string(condition.Type))
+	writeSignatureString(h, condition.Logic)
+	writeSignatureString(h, condition.Field)
+	writeSignatureString(h, condition.Operator)
+	writeSignatureString(h, fmt.Sprintf("%T:%v", condition.Value, condition.Value))
+	writeSignatureInt(h, len(condition.Conditions))
+	for i := range condition.Conditions {
+		writeConditionSignature(h, &condition.Conditions[i])
+	}
+}
+
+func writeExcludeSignature(h hash.Hash64, excludes []*objects.ExcludeAssociation) {
+	writeSignatureInt(h, len(excludes))
+	for _, exclude := range excludes {
+		if exclude == nil {
+			writeSignatureString(h, "<nil>")
+			continue
+		}
+
+		writeSignatureString(h, exclude.ChannelNamePattern)
+		writeSignatureIntSlice(h, exclude.ChannelIds)
+		writeStringSliceSignature(h, exclude.ChannelTags)
+	}
+}
+
+func writeStringSliceSignature(h hash.Hash64, values []string) {
+	writeSignatureInt(h, len(values))
+	for _, value := range values {
+		writeSignatureString(h, value)
+	}
+}
+
+func writeSignatureIntSlice(h hash.Hash64, values []int) {
+	writeSignatureInt(h, len(values))
+	for _, value := range values {
+		writeSignatureInt(h, value)
+	}
+}
+
+func writeSignatureString(h hash.Hash64, value string) {
+	_, _ = io.WriteString(h, value)
+	_, _ = h.Write([]byte{0})
+}
+
+func writeSignatureInt(h hash.Hash64, value int) {
+	writeSignatureString(h, strconv.Itoa(value))
+}
+
+func writeSignatureBool(h hash.Hash64, value bool) {
+	if value {
+		writeSignatureString(h, "1")
+		return
+	}
+
+	writeSignatureString(h, "0")
+}
+
+func effectiveAssociationSourceCounts(systemSettings *biz.SystemModelSettings, m *ent.Model) (developerCount int, modelCount int, developerInheritanceDisabled bool) {
+	if m == nil {
+		return 0, 0, false
+	}
+
+	if m.Settings != nil {
+		modelCount = len(m.Settings.Associations)
+		developerInheritanceDisabled = m.Settings.DisableDeveloperSettingsInheritance
+	}
+
+	if systemSettings == nil || m.Developer == "" {
+		return developerCount, modelCount, developerInheritanceDisabled
+	}
+
+	for _, developerSettings := range systemSettings.DeveloperSettings {
+		if developerSettings == nil || developerSettings.Developer != m.Developer {
+			continue
+		}
+
+		return len(developerSettings.Associations), modelCount, developerInheritanceDisabled
+	}
+
+	return developerCount, modelCount, developerInheritanceDisabled
 }
 
 func aggregateChannelModelCandidates(resolvedCandidates []*resolvedAssociationCandidate) []*ChannelModelsCandidate {
@@ -443,9 +655,13 @@ func (s *SelectedChannelsSelector) Select(ctx context.Context, req *llm.Request)
 
 // LoadBalancedSelector is a decorator that sorts candidates using load balancing strategies.
 type LoadBalancedSelector struct {
-	wrapped      CandidateSelector
-	loadBalancer *LoadBalancer
-	policy       RetryPolicyProvider
+	wrapped                 CandidateSelector
+	loadBalancer            *LoadBalancer
+	loadBalancers           map[string]*LoadBalancer
+	policy                  RetryPolicyProvider
+	previousChannelProvider PreviousChannelProvider
+	apiKey                  *ent.APIKey
+	effectiveRoutingPolicy  *EffectiveRoutingPolicy
 }
 
 // WithLoadBalancedSelector creates a selector that applies load balancing to sort candidates.
@@ -458,22 +674,197 @@ func WithLoadBalancedSelector(wrapped CandidateSelector, loadBalancer *LoadBalan
 	}
 }
 
+// WithTraceStickyLoadBalancedSelector creates a load-balanced selector that
+// can prioritize the last successful trace or thread channel before normal
+// load balancing.
+func WithTraceStickyLoadBalancedSelector(
+	wrapped CandidateSelector,
+	loadBalancer *LoadBalancer,
+	policy RetryPolicyProvider,
+	previousChannelProvider PreviousChannelProvider,
+) *LoadBalancedSelector {
+	return &LoadBalancedSelector{
+		wrapped:                 wrapped,
+		loadBalancer:            loadBalancer,
+		policy:                  policy,
+		previousChannelProvider: previousChannelProvider,
+	}
+}
+
+// WithRoutingPolicyLoadBalancedSelector applies the effective request routing
+// policy after the mapped model has been resolved.
+func WithRoutingPolicyLoadBalancedSelector(
+	wrapped CandidateSelector,
+	loadBalancers map[string]*LoadBalancer,
+	policy RetryPolicyProvider,
+	previousChannelProvider PreviousChannelProvider,
+	apiKey *ent.APIKey,
+	effectiveRoutingPolicy *EffectiveRoutingPolicy,
+) *LoadBalancedSelector {
+	return &LoadBalancedSelector{
+		wrapped:                 wrapped,
+		loadBalancers:           loadBalancers,
+		policy:                  policy,
+		previousChannelProvider: previousChannelProvider,
+		apiKey:                  apiKey,
+		effectiveRoutingPolicy:  effectiveRoutingPolicy,
+	}
+}
+
 func (s *LoadBalancedSelector) Select(ctx context.Context, req *llm.Request) ([]*ChannelModelsCandidate, error) {
 	candidates, err := s.wrapped.Select(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(candidates) <= 1 {
-		return candidates, nil
-	}
-
 	// Get retry policy to determine the required number of candidates
 	retryPolicy := s.policy.RetryPolicyOrDefault(ctx)
+	loadBalancer := s.loadBalancer
+	traceStickyMode := retryPolicy.TraceStickyMode
+	if s.effectiveRoutingPolicy != nil {
+		var modelRoutingPolicy *ModelRoutingPolicy
+		if len(candidates) > 0 && candidates[0] != nil {
+			modelRoutingPolicy = candidates[0].ModelRoutingPolicy
+		}
+
+		resolvedPolicy := deriveRoutingPolicy(retryPolicy, s.apiKey, modelRoutingPolicy)
+		var appliedStrategy string
+		loadBalancer, appliedStrategy = resolveLoadBalancer(s.loadBalancers, resolvedPolicy.LoadBalancerStrategy)
+		if appliedStrategy != resolvedPolicy.LoadBalancerStrategy {
+			log.Warn(ctx, "configured load balancer strategy is unavailable, falling back",
+				log.String("requested_strategy", resolvedPolicy.LoadBalancerStrategy),
+				log.String("applied_strategy", appliedStrategy),
+			)
+			resolvedPolicy.LoadBalancerStrategy = appliedStrategy
+		}
+		*s.effectiveRoutingPolicy = resolvedPolicy
+		traceStickyMode = resolvedPolicy.TraceStickyMode
+	}
 
 	requiredCount := 1
 	if retryPolicy.Enabled {
 		requiredCount = 1 + retryPolicy.MaxChannelRetries
+	}
+
+	if traceStickyMode == biz.TraceStickyPreferPreviousChannel {
+		if stickyCandidate, remainingCandidates := s.selectTraceStickyCandidate(ctx, candidates); stickyCandidate != nil {
+			stickyCandidate.TraceSticky = true
+
+			fallbackCount := max(requiredCount-1, 0)
+			fallbackCandidates := s.sortCandidates(ctx, loadBalancer, remainingCandidates, req, fallbackCount, false)
+			result := append([]*ChannelModelsCandidate{stickyCandidate}, fallbackCandidates...)
+
+			if loadBalancer != nil {
+				loadBalancer.TrackSelection(stickyCandidate)
+			}
+
+			return result, nil
+		}
+	}
+
+	return s.sortCandidates(ctx, loadBalancer, candidates, req, requiredCount, true), nil
+}
+
+func resolveLoadBalancer(loadBalancers map[string]*LoadBalancer, strategy string) (*LoadBalancer, string) {
+	if loadBalancer := loadBalancers[strategy]; loadBalancer != nil {
+		return loadBalancer, strategy
+	}
+
+	if loadBalancer := loadBalancers[biz.LoadBalancerStrategyAdaptive]; loadBalancer != nil {
+		return loadBalancer, biz.LoadBalancerStrategyAdaptive
+	}
+
+	return nil, strategy
+}
+
+// selectTraceStickyCandidate selects the previous trace channel first, then
+// the previous thread channel. A sticky channel must already be a
+// valid candidate after every request-level filter has run.
+func (s *LoadBalancedSelector) selectTraceStickyCandidate(
+	ctx context.Context,
+	candidates []*ChannelModelsCandidate,
+) (*ChannelModelsCandidate, []*ChannelModelsCandidate) {
+	if s.previousChannelProvider == nil || len(candidates) == 0 {
+		return nil, candidates
+	}
+
+	if trace, ok := contexts.GetTrace(ctx); ok && trace != nil {
+		channelID, err := s.previousChannelProvider.GetPreviousChannelID(ctx, trace.ID)
+		if err != nil {
+			log.Warn(ctx, "failed to get previous trace channel", log.Int("trace_id", trace.ID), log.Cause(err))
+		} else if stickyCandidate, remainingCandidates := extractStickyCandidate(candidates, channelID); stickyCandidate != nil {
+			return stickyCandidate, remainingCandidates
+		}
+	}
+
+	threadID := 0
+	if thread, ok := contexts.GetThread(ctx); ok && thread != nil {
+		threadID = thread.ID
+	} else if trace, ok := contexts.GetTrace(ctx); ok && trace != nil {
+		threadID = trace.ThreadID
+	}
+
+	if threadID == 0 {
+		return nil, candidates
+	}
+
+	channelID, err := s.previousChannelProvider.GetPreviousChannelIDByThread(ctx, threadID)
+	if err != nil {
+		log.Warn(ctx, "failed to get previous thread channel", log.Int("thread_id", threadID), log.Cause(err))
+		return nil, candidates
+	}
+
+	return extractStickyCandidate(candidates, channelID)
+}
+
+// extractStickyCandidate returns the highest-priority candidate for channelID
+// and removes every candidate for that channel from the fallback set. This
+// prevents a failed sticky channel from being retried through another
+// association entry.
+func extractStickyCandidate(
+	candidates []*ChannelModelsCandidate,
+	channelID int,
+) (*ChannelModelsCandidate, []*ChannelModelsCandidate) {
+	if channelID == 0 {
+		return nil, candidates
+	}
+
+	var stickyCandidate *ChannelModelsCandidate
+	remainingCandidates := make([]*ChannelModelsCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.Channel == nil || candidate.Channel.ID != channelID {
+			remainingCandidates = append(remainingCandidates, candidate)
+			continue
+		}
+
+		if stickyCandidate == nil || candidate.Priority < stickyCandidate.Priority {
+			stickyCandidate = candidate
+		}
+	}
+
+	if stickyCandidate == nil {
+		return nil, candidates
+	}
+
+	stickyClone := *stickyCandidate
+
+	return &stickyClone, remainingCandidates
+}
+
+func (s *LoadBalancedSelector) sortCandidates(
+	ctx context.Context,
+	loadBalancer *LoadBalancer,
+	candidates []*ChannelModelsCandidate,
+	req *llm.Request,
+	requiredCount int,
+	trackSelection bool,
+) []*ChannelModelsCandidate {
+	if requiredCount <= 0 {
+		return nil
+	}
+
+	if len(candidates) <= 1 {
+		return candidates
 	}
 
 	// Group candidates by priority first (lower priority value = higher priority)
@@ -497,7 +888,15 @@ func (s *LoadBalancedSelector) Select(ctx context.Context, req *llm.Request) ([]
 
 		// Apply load balancing to sort candidates within this priority group.
 		useStream := req.Stream != nil && *req.Stream
-		sortedCandidates := s.loadBalancer.Sort(ctx, group, req.Model, useStream)
+		ctx = contextWithQuotaLimitType(ctx, string(provider_quota.RequestModality(req.Image != nil)))
+		var sortedCandidates []*ChannelModelsCandidate
+		if loadBalancer == nil {
+			sortedCandidates = group
+		} else if trackSelection {
+			sortedCandidates = loadBalancer.Sort(ctx, group, req.Model, useStream)
+		} else {
+			sortedCandidates = loadBalancer.SortWithoutTracking(ctx, group, req.Model, useStream)
+		}
 
 		// Add candidates, but stop if we have enough
 		remaining := requiredCount - len(result)
@@ -521,7 +920,7 @@ func (s *LoadBalancedSelector) Select(ctx context.Context, req *llm.Request) ([]
 			log.Int("required_count", requiredCount))
 	}
 
-	return result, nil
+	return result
 }
 
 // TagsFilterSelector is a decorator that filters candidates by allowed channel tags.
@@ -566,6 +965,9 @@ func matchChannelTagsFilter(allowedTags []string, matchMode objects.ChannelTagsM
 type SpecifiedChannelSelector struct {
 	ChannelService *biz.ChannelService
 	ChannelID      objects.GUID
+	// SelectedAPIKey, if non-empty, forces the outbound to use this specific API key.
+	// Used by the channel key test flow to test a single key.
+	SelectedAPIKey string
 }
 
 func NewSpecifiedChannelSelector(channelService *biz.ChannelService, channelID objects.GUID) *SpecifiedChannelSelector {
@@ -576,7 +978,13 @@ func NewSpecifiedChannelSelector(channelService *biz.ChannelService, channelID o
 }
 
 func (s *SpecifiedChannelSelector) Select(ctx context.Context, req *llm.Request) ([]*ChannelModelsCandidate, error) {
-	channel, err := s.ChannelService.GetChannel(ctx, s.ChannelID.ID)
+	var channel *biz.Channel
+	var err error
+	if s.SelectedAPIKey != "" {
+		channel, err = s.ChannelService.GetChannelWithKey(ctx, s.ChannelID.ID, s.SelectedAPIKey)
+	} else {
+		channel, err = s.ChannelService.GetChannel(ctx, s.ChannelID.ID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get channel for test: %w", err)
 	}
@@ -588,10 +996,14 @@ func (s *SpecifiedChannelSelector) Select(ctx context.Context, req *llm.Request)
 		return nil, fmt.Errorf("model %s not supported in channel %s", req.Model, channel.Name)
 	}
 
+	endpoints := channel.ResolveEndpoints()
+	apiFormat := SelectAPIFormat(endpoints, req)
+
 	candidate := &ChannelModelsCandidate{
-		Channel:  channel,
-		Priority: 0,
-		Models:   []biz.ChannelModelEntry{entry},
+		Channel:   channel,
+		Priority:  0,
+		Models:    []biz.ChannelModelEntry{entry},
+		APIFormat: apiFormat,
 	}
 
 	return []*ChannelModelsCandidate{candidate}, nil

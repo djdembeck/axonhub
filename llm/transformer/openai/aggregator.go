@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/samber/lo"
@@ -15,25 +16,90 @@ import (
 
 // choiceAggregator is a helper struct to aggregate data for each choice.
 type choiceAggregator struct {
-	index            int
-	content          strings.Builder
-	reasoningContent strings.Builder
-	toolCalls        map[int]*llm.ToolCall // Map to track tool calls by their index within the choice
-	finishReason     *string
-	role             string
-	annotations      map[string]llm.Annotation // Map to track unique annotations by URL
+	index               int
+	content             strings.Builder
+	reasoningContent    strings.Builder
+	hasReasoningContent bool                  // Tracks whether any delta carried reasoning_content (even an empty string).
+	toolCalls           map[int]*llm.ToolCall // Map to track tool calls by their index within the choice
+	finishReason        *string
+	role                string
+	annotations         map[string]llm.Annotation // Map to track unique annotations by stable annotation key
+}
+
+func buildAnnotationKey(annotation Annotation) string {
+	url := ""
+	if annotation.URLCitation != nil {
+		url = annotation.URLCitation.URL
+	}
+
+	start := "nil"
+	if annotation.StartIndex != nil {
+		start = strconv.FormatInt(*annotation.StartIndex, 10)
+	}
+
+	end := "nil"
+	if annotation.EndIndex != nil {
+		end = strconv.FormatInt(*annotation.EndIndex, 10)
+	}
+
+	return strings.Join([]string{annotation.Type, url, start, end}, "\x00")
+}
+
+func shouldPreferIncomingAnnotationTitle(existing, incoming llm.Annotation) bool {
+	if existing.URLCitation == nil || incoming.URLCitation == nil || incoming.URLCitation.Title == "" {
+		return false
+	}
+
+	return existing.URLCitation.Title == "" || len(incoming.URLCitation.Title) > len(existing.URLCitation.Title)
+}
+
+func compareOptionalAnnotationIndex(left, right *int64) (bool, bool) {
+	switch {
+	case left == nil && right == nil:
+		return false, false
+	case left == nil:
+		return false, true
+	case right == nil:
+		return true, true
+	case *left != *right:
+		return *left < *right, true
+	default:
+		return false, false
+	}
+}
+
+func annotationURL(annotation llm.Annotation) string {
+	if annotation.URLCitation == nil {
+		return ""
+	}
+
+	return annotation.URLCitation.URL
 }
 
 // addAnnotations adds annotations from a message to the choice aggregator,
-// deduplicating by URL.
+// deduplicating by stable annotation key.
 func (ca *choiceAggregator) addAnnotations(msg *Message) {
 	if msg == nil || len(msg.Annotations) == 0 {
 		return
 	}
+
 	for _, annotation := range msg.Annotations {
-		if annotation.URLCitation != nil && annotation.URLCitation.URL != "" {
-			ca.annotations[annotation.URLCitation.URL] = annotation.ToLLMAnnotation()
+		if annotation.URLCitation == nil || annotation.URLCitation.URL == "" {
+			continue
 		}
+
+		key := buildAnnotationKey(annotation)
+		incoming := annotation.ToLLMAnnotation()
+
+		if existing, ok := ca.annotations[key]; ok {
+			if shouldPreferIncomingAnnotationTitle(existing, incoming) {
+				existing.URLCitation.Title = incoming.URLCitation.Title
+				ca.annotations[key] = existing
+			}
+			continue
+		}
+
+		ca.annotations[key] = incoming
 	}
 }
 
@@ -49,6 +115,8 @@ func DefaultTransformChunk(ctx context.Context, chunk *httpclient.StreamEvent) (
 }
 
 // AggregateStreamChunks aggregates OpenAI streaming response chunks into a complete response.
+//
+//nolint:maintidx // Stream aggregation is inherently complex.
 func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent, chunkTransformer ChunkTransformFunc) ([]byte, llm.ResponseMeta, error) {
 	if len(chunks) == 0 {
 		data, err := json.Marshal(&llm.Response{})
@@ -103,8 +171,12 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 					choiceAgg.content.WriteString(*choice.Delta.Content.Content)
 				}
 
-				// Handle reasoning content
+				// Handle reasoning content. Track presence of the field separately from its
+				// content length so that a semantically meaningful empty string (e.g. DeepSeek
+				// thinking mode emitting reasoning_content: "") is preserved on the aggregated
+				// message rather than being silently dropped.
 				if choice.Delta.ReasoningContent != nil {
+					choiceAgg.hasReasoningContent = true
 					choiceAgg.reasoningContent.WriteString(*choice.Delta.ReasoningContent)
 				}
 
@@ -174,8 +246,12 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			systemFingerprint = chunk.SystemFingerprint
 		}
 
-		// Keep the last chunk for metadata
-		lastChunkResponse = chunk
+		// Keep the last chunk with valid choices for metadata.
+		// Skip non-standard events (e.g. inference-cost) that have empty
+		// choices and would overwrite the real last chunk's ID/Model/Created.
+		if len(chunk.Choices) > 0 {
+			lastChunkResponse = chunk
+		}
 	}
 
 	// Create a complete ChatCompletionResponse based on the last chunk structure
@@ -184,16 +260,29 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 		return data, llm.ResponseMeta{}, err
 	}
 
-	choices := make([]llm.Choice, len(choicesAggs))
+	choiceIndexes := make([]int, 0, len(choicesAggs))
+	for choiceIndex := range choicesAggs {
+		choiceIndexes = append(choiceIndexes, choiceIndex)
+	}
+	sort.Ints(choiceIndexes)
 
-	for choiceIndex := range choices {
+	choices := make([]llm.Choice, len(choiceIndexes))
+
+	for i, choiceIndex := range choiceIndexes {
 		choiceAgg := choicesAggs[choiceIndex]
 
 		var finalToolCalls []llm.ToolCall
 		if len(choiceAgg.toolCalls) > 0 {
-			finalToolCalls = make([]llm.ToolCall, len(choiceAgg.toolCalls))
-			for index := range finalToolCalls {
-				finalToolCalls[index] = *choiceAgg.toolCalls[index]
+			toolCallIndexes := make([]int, 0, len(choiceAgg.toolCalls))
+			for toolCallIndex := range choiceAgg.toolCalls {
+				toolCallIndexes = append(toolCallIndexes, toolCallIndex)
+			}
+			sort.Ints(toolCallIndexes)
+
+			finalToolCalls = make([]llm.ToolCall, 0, len(toolCallIndexes))
+			for _, toolCallIndex := range toolCallIndexes {
+				toolCall := choiceAgg.toolCalls[toolCallIndex]
+				finalToolCalls = append(finalToolCalls, *toolCall)
 			}
 		}
 
@@ -202,8 +291,10 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			Role: choiceAgg.role,
 		}
 
-		// Set reasoning content if available
-		if choiceAgg.reasoningContent.Len() > 0 {
+		// Set reasoning content if any delta carried the field, preserving an empty
+		// string when present (required for round-tripping providers like DeepSeek
+		// thinking mode that may emit reasoning_content: "").
+		if choiceAgg.hasReasoningContent {
 			reasoningContent := choiceAgg.reasoningContent.String()
 			message.ReasoningContent = &reasoningContent
 		}
@@ -225,6 +316,19 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			for _, annotation := range choiceAgg.annotations {
 				message.Annotations = append(message.Annotations, annotation)
 			}
+			sort.Slice(message.Annotations, func(i, j int) bool {
+				if less, decided := compareOptionalAnnotationIndex(message.Annotations[i].StartIndex, message.Annotations[j].StartIndex); decided {
+					return less
+				}
+				if less, decided := compareOptionalAnnotationIndex(message.Annotations[i].EndIndex, message.Annotations[j].EndIndex); decided {
+					return less
+				}
+				if message.Annotations[i].Type != message.Annotations[j].Type {
+					return message.Annotations[i].Type < message.Annotations[j].Type
+				}
+
+				return annotationURL(message.Annotations[i]) < annotationURL(message.Annotations[j])
+			})
 		}
 
 		// Determine finish reason
@@ -237,7 +341,7 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			}
 		}
 
-		choices[choiceIndex] = llm.Choice{
+		choices[i] = llm.Choice{
 			Index:        choiceIndex,
 			Message:      message,
 			FinishReason: finishReason,
@@ -245,6 +349,11 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 	}
 
 	// Build the final response using llm.Response struct
+	var responseUsage *llm.Usage
+	if usage != nil {
+		responseUsage = usage.ToLLMUsage()
+	}
+
 	response := &llm.Response{
 		ID:                lastChunkResponse.ID,
 		Model:             lastChunkResponse.Model,
@@ -252,7 +361,7 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 		Created:           lastChunkResponse.Created,
 		SystemFingerprint: systemFingerprint,
 		Choices:           choices,
-		Usage:             usage.ToLLMUsage(),
+		Usage:             responseUsage,
 	}
 
 	// Add citations to response if any were collected
@@ -261,11 +370,13 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 		for citation := range citationsMap {
 			citations = append(citations, citation)
 		}
+
 		sort.Strings(citations)
 
 		if response.TransformerMetadata == nil {
 			response.TransformerMetadata = make(map[string]any)
 		}
+
 		response.TransformerMetadata[TransformerMetadataKeyCitations] = citations
 	}
 
@@ -276,6 +387,6 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 
 	return data, llm.ResponseMeta{
 		ID:    response.ID,
-		Usage: usage.ToLLMUsage(),
+		Usage: responseUsage,
 	}, nil
 }

@@ -15,7 +15,6 @@ import (
 	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
-	"github.com/zhenzou/executors"
 )
 
 func setupTestRequestService(t *testing.T) (*RequestService, *ent.Client, context.Context) {
@@ -34,11 +33,10 @@ func setupTestRequestService(t *testing.T) (*RequestService, *ent.Client, contex
 	dataStorageService := NewDataStorageService(DataStorageServiceParams{
 		SystemService: systemService,
 		CacheConfig:   xcache.Config{},
-		Executor:      executors.NewPoolScheduleExecutor(),
 		Client:        client,
 	})
 
-	requestService := NewRequestService(client, systemService, usageLogService, dataStorageService, NewLiveStreamRegistry())
+	requestService := NewRequestService(client, systemService.CacheConfig, systemService, usageLogService, dataStorageService, NewLiveStreamRegistry())
 
 	return requestService, client, ctx
 }

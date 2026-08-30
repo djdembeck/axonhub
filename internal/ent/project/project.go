@@ -35,6 +35,8 @@ const (
 	FieldProfiles = "profiles"
 	// EdgeUsers holds the string denoting the users edge name in mutations.
 	EdgeUsers = "users"
+	// EdgeInvitations holds the string denoting the invitations edge name in mutations.
+	EdgeInvitations = "invitations"
 	// EdgeRoles holds the string denoting the roles edge name in mutations.
 	EdgeRoles = "roles"
 	// EdgeAPIKeys holds the string denoting the api_keys edge name in mutations.
@@ -49,6 +51,8 @@ const (
 	EdgeTraces = "traces"
 	// EdgePrompts holds the string denoting the prompts edge name in mutations.
 	EdgePrompts = "prompts"
+	// EdgeAPIKeyProfileTemplates holds the string denoting the api_key_profile_templates edge name in mutations.
+	EdgeAPIKeyProfileTemplates = "api_key_profile_templates"
 	// EdgeProjectUsers holds the string denoting the project_users edge name in mutations.
 	EdgeProjectUsers = "project_users"
 	// Table holds the table name of the project in the database.
@@ -58,6 +62,13 @@ const (
 	// UsersInverseTable is the table name for the User entity.
 	// It exists in this package in order to avoid circular dependency with the "user" package.
 	UsersInverseTable = "users"
+	// InvitationsTable is the table that holds the invitations relation/edge.
+	InvitationsTable = "invitations"
+	// InvitationsInverseTable is the table name for the Invitation entity.
+	// It exists in this package in order to avoid circular dependency with the "invitation" package.
+	InvitationsInverseTable = "invitations"
+	// InvitationsColumn is the table column denoting the invitations relation/edge.
+	InvitationsColumn = "project_id"
 	// RolesTable is the table that holds the roles relation/edge.
 	RolesTable = "roles"
 	// RolesInverseTable is the table name for the Role entity.
@@ -100,11 +111,20 @@ const (
 	TracesInverseTable = "traces"
 	// TracesColumn is the table column denoting the traces relation/edge.
 	TracesColumn = "project_id"
-	// PromptsTable is the table that holds the prompts relation/edge. The primary key declared below.
-	PromptsTable = "project_prompts"
+	// PromptsTable is the table that holds the prompts relation/edge.
+	PromptsTable = "prompts"
 	// PromptsInverseTable is the table name for the Prompt entity.
 	// It exists in this package in order to avoid circular dependency with the "prompt" package.
 	PromptsInverseTable = "prompts"
+	// PromptsColumn is the table column denoting the prompts relation/edge.
+	PromptsColumn = "project_id"
+	// APIKeyProfileTemplatesTable is the table that holds the api_key_profile_templates relation/edge.
+	APIKeyProfileTemplatesTable = "api_key_profile_templates"
+	// APIKeyProfileTemplatesInverseTable is the table name for the APIKeyProfileTemplate entity.
+	// It exists in this package in order to avoid circular dependency with the "apikeyprofiletemplate" package.
+	APIKeyProfileTemplatesInverseTable = "api_key_profile_templates"
+	// APIKeyProfileTemplatesColumn is the table column denoting the api_key_profile_templates relation/edge.
+	APIKeyProfileTemplatesColumn = "project_id"
 	// ProjectUsersTable is the table that holds the project_users relation/edge.
 	ProjectUsersTable = "user_projects"
 	// ProjectUsersInverseTable is the table name for the UserProject entity.
@@ -130,9 +150,6 @@ var (
 	// UsersPrimaryKey and UsersColumn2 are the table columns denoting the
 	// primary key for the users relation (M2M).
 	UsersPrimaryKey = []string{"project_id", "user_id"}
-	// PromptsPrimaryKey and PromptsColumn2 are the table columns denoting the
-	// primary key for the prompts relation (M2M).
-	PromptsPrimaryKey = []string{"project_id", "prompt_id"}
 )
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -246,6 +263,20 @@ func ByUsers(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 	}
 }
 
+// ByInvitationsCount orders the results by invitations count.
+func ByInvitationsCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newInvitationsStep(), opts...)
+	}
+}
+
+// ByInvitations orders the results by invitations terms.
+func ByInvitations(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newInvitationsStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+
 // ByRolesCount orders the results by roles count.
 func ByRolesCount(opts ...sql.OrderTermOption) OrderOption {
 	return func(s *sql.Selector) {
@@ -344,6 +375,20 @@ func ByPrompts(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 	}
 }
 
+// ByAPIKeyProfileTemplatesCount orders the results by api_key_profile_templates count.
+func ByAPIKeyProfileTemplatesCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newAPIKeyProfileTemplatesStep(), opts...)
+	}
+}
+
+// ByAPIKeyProfileTemplates orders the results by api_key_profile_templates terms.
+func ByAPIKeyProfileTemplates(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newAPIKeyProfileTemplatesStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+
 // ByProjectUsersCount orders the results by project_users count.
 func ByProjectUsersCount(opts ...sql.OrderTermOption) OrderOption {
 	return func(s *sql.Selector) {
@@ -362,6 +407,13 @@ func newUsersStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(UsersInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.M2M, false, UsersTable, UsersPrimaryKey...),
+	)
+}
+func newInvitationsStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(InvitationsInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, InvitationsTable, InvitationsColumn),
 	)
 }
 func newRolesStep() *sqlgraph.Step {
@@ -410,7 +462,14 @@ func newPromptsStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(PromptsInverseTable, FieldID),
-		sqlgraph.Edge(sqlgraph.M2M, false, PromptsTable, PromptsPrimaryKey...),
+		sqlgraph.Edge(sqlgraph.O2M, false, PromptsTable, PromptsColumn),
+	)
+}
+func newAPIKeyProfileTemplatesStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(APIKeyProfileTemplatesInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, APIKeyProfileTemplatesTable, APIKeyProfileTemplatesColumn),
 	)
 }
 func newProjectUsersStep() *sqlgraph.Step {

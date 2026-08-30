@@ -53,6 +53,9 @@ const MODELS_QUERY = `
             lastUpdated
           }
           settings {
+            disableDeveloperSettingsInheritance
+            loadBalancerStrategy
+            traceStickyMode
             associations {
               type
               priority
@@ -171,6 +174,9 @@ const CREATE_MODEL_MUTATION = `
         lastUpdated
       }
       settings {
+        disableDeveloperSettingsInheritance
+        loadBalancerStrategy
+        traceStickyMode
         associations {
           type
           priority
@@ -271,6 +277,9 @@ const BULK_CREATE_MODELS_MUTATION = `
         lastUpdated
       }
       settings {
+        disableDeveloperSettingsInheritance
+        loadBalancerStrategy
+        traceStickyMode
         associations {
           type
           priority
@@ -371,6 +380,9 @@ const UPDATE_MODEL_MUTATION = `
         lastUpdated
       }
       settings {
+        disableDeveloperSettingsInheritance
+        loadBalancerStrategy
+        traceStickyMode
         associations {
           type
           priority
@@ -471,13 +483,14 @@ interface QueryModelsArgs {
   before?: string;
   where?: Record<string, any>;
   orderBy?: {
-    field: 'CREATED_AT' | 'UPDATED_AT' | 'NAME' | 'MODEL_ID';
+    field: 'CREATED_AT' | 'UPDATED_AT' | 'NAME';
     direction: 'ASC' | 'DESC';
   };
 }
 
-export function useQueryModels(args: QueryModelsArgs) {
+export function useQueryModels(args: QueryModelsArgs, options?: { enabled?: boolean }) {
   return useQuery({
+    enabled: options?.enabled ?? true,
     queryKey: ['models', args],
     queryFn: async () => {
       const data = await graphqlRequest<{ models: ModelConnection }>(MODELS_QUERY, args);
@@ -582,6 +595,34 @@ export function useDeleteModel() {
   });
 }
 
+const UPDATE_MODEL_STATUS_MUTATION = `
+  mutation UpdateModelStatus($id: ID!, $status: ModelStatus!) {
+    updateModelStatus(id: $id, status: $status)
+  }
+`;
+
+export function useUpdateModelStatus() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async ({ id, status }: { id: string; status: 'enabled' | 'archived' }) => {
+      const data = await graphqlRequest<{ updateModelStatus: boolean }>(UPDATE_MODEL_STATUS_MUTATION, { id, status });
+      return data.updateModelStatus;
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['models'] });
+      const statusKey = variables.status === 'archived' ? 'archiveSuccess' : 'restoreSuccess';
+      toast.success(t(`models.messages.${statusKey}`));
+    },
+    onError: (error, variables) => {
+      const contextKey = variables.status === 'archived' ? 'archiveTitle' : 'restoreTitle';
+      handleError(error, { context: t(`models.dialogs.status.${contextKey}`) });
+    },
+  });
+}
+
 export function useBulkDisableModels() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -654,11 +695,11 @@ export interface ModelAssociationInput {
   };
   regex?: {
     pattern: string;
-    exclude?: ExcludeAssociationInput[];
+    exclude?: ExcludeAssociationInput[] | null;
   };
   modelId?: {
     modelId: string;
-    exclude?: ExcludeAssociationInput[];
+    exclude?: ExcludeAssociationInput[] | null;
   };
   channelTagsModel?: {
     channelTags: string[];
@@ -671,9 +712,9 @@ export interface ModelAssociationInput {
 }
 
 export interface ExcludeAssociationInput {
-  channelNamePattern?: string;
-  channelIds?: number[];
-  channelTags?: string[];
+  channelNamePattern?: string | null;
+  channelIds?: number[] | null;
+  channelTags?: string[] | null;
 }
 
 export interface FilterConditionInput {
@@ -682,7 +723,7 @@ export interface FilterConditionInput {
   conditions?: FilterConditionInput[];
   field?: string;
   operator?: string;
-  value?: unknown;
+  value?: string | number | boolean;
 }
 
 export interface ChannelModelEntry {

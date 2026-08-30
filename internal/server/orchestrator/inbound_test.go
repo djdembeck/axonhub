@@ -8,8 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/enttest"
+	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
@@ -100,7 +102,7 @@ func createTestRequestService(t *testing.T, client *ent.Client) *biz.RequestServ
 	channelService := biz.NewChannelServiceForTest(client)
 	usageLogService := biz.NewUsageLogService(client, systemService, channelService)
 
-	return biz.NewRequestService(client, systemService, usageLogService, dataStorageService, liveStreamRegistry)
+	return biz.NewRequestService(client, systemService.CacheConfig, systemService, usageLogService, dataStorageService, liveStreamRegistry)
 }
 
 // newInboundPersistentStreamHelper creates a configured InboundPersistentStream for testing.
@@ -138,8 +140,8 @@ func newInboundPersistentStreamHelper(
 	return stream, client, ctx, state
 }
 
-// TestInboundPersistentStream_Close_WithCompleteResponse tests the NEW behavior:
-// complete response without terminal event (e.g., Codex executor that aggregates internally)
+// TestInboundPersistentStream_Close_WithCompleteResponse verifies that a complete
+// response carrying finish_reason is recognized before Close persists it.
 func TestInboundPersistentStream_Close_WithCompleteResponse(t *testing.T) {
 	completeResponseChunk := &httpclient.StreamEvent{
 		Type: "chunk",
@@ -170,7 +172,7 @@ func TestInboundPersistentStream_Close_WithCompleteResponse(t *testing.T) {
 	event := stream.Current()
 	require.NotNil(t, event, "Expected current event to not be nil")
 
-	assert.False(t, state.StreamCompleted, "StreamCompleted should be false before Close()")
+	assert.True(t, state.StreamCompleted, "StreamCompleted should be true after consuming finish_reason")
 
 	err := stream.Close()
 	require.NoError(t, err, "Close() should not return an error")
@@ -258,4 +260,144 @@ func TestInboundPersistentStream_Close_WithAggregationError(t *testing.T) {
 
 	assert.False(t, state.StreamCompleted, "StreamCompleted should remain false after Close() with aggregation error")
 	assert.True(t, mockStream.closed, "Stream should be closed")
+}
+
+func TestIsTerminalStreamEvent_AudioDoneEvents(t *testing.T) {
+	// OpenAI audio SSE streams have no [DONE] sentinel; terminal completion is
+	// signaled by typed *.done events surfaced via StreamEvent.Type.
+	require.True(t, IsTerminalStreamEvent(&httpclient.StreamEvent{Type: "speech.audio.done"}))
+	require.True(t, IsTerminalStreamEvent(&httpclient.StreamEvent{Type: "transcript.text.done"}))
+	require.True(t, IsTerminalStreamEvent(&httpclient.StreamEvent{Type: httpclient.BinaryStreamDoneEventType}))
+
+	// Other events must not be treated as terminal.
+	require.False(t, IsTerminalStreamEvent(&httpclient.StreamEvent{Type: "speech.audio.delta"}))
+	require.False(t, IsTerminalStreamEvent(&httpclient.StreamEvent{Type: "transcript.text.delta"}))
+	require.False(t, IsTerminalStreamEvent(&httpclient.StreamEvent{Type: "audio/mpeg"}))
+}
+
+// TestInboundPersistentStream_Close_IncompleteStillPersistsChunks ensures a clean
+// upstream EOF without terminal/completion still saves buffered chunks when
+// store_chunks is on — without marking the request completed.
+func TestInboundPersistentStream_Close_IncompleteStillPersistsChunks(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(context.Background(), client))
+	project := createTestProject(t, ctx, client)
+	ch := createTestChannel(t, ctx, client)
+	_, requestService, systemService, _ := setupTestServices(t, client)
+	require.NoError(t, systemService.SetStoragePolicy(ctx, &biz.StoragePolicy{
+		StoreChunks:       true,
+		StoreRequestBody:  true,
+		StoreResponseBody: true,
+	}))
+
+	req, err := client.Request.Create().
+		SetProjectID(project.ID).
+		SetChannelID(ch.ID).
+		SetModelID("gpt-4").
+		SetStatus(request.StatusProcessing).
+		SetRequestBody([]byte(`{"stream":true}`)).
+		SetStream(true).
+		Save(ctx)
+	require.NoError(t, err)
+
+	partial := &httpclient.StreamEvent{
+		Type: "chunk",
+		Data: []byte(`{"id":"chatcmpl-partial","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`),
+	}
+	mockStream := &mockStream{events: []*httpclient.StreamEvent{partial}}
+	mockTransformer := &mockInboundTransformer{
+		aggregateErr: errors.New("incomplete aggregation"),
+	}
+	state := &PersistenceState{}
+
+	stream := NewInboundPersistentStream(
+		ctx,
+		mockStream,
+		req,
+		&ent.RequestExecution{ID: 1},
+		requestService,
+		mockTransformer,
+		nil,
+		state,
+	)
+	require.True(t, stream.Next())
+	_ = stream.Current()
+	require.NoError(t, stream.Close())
+
+	require.False(t, state.StreamCompleted)
+
+	dbReq, err := client.Request.Get(ctx, req.ID)
+	require.NoError(t, err)
+	require.Equal(t, request.StatusFailed, dbReq.Status)
+	require.NotEmpty(t, dbReq.ResponseChunks, "failed request should keep response_chunks in DB")
+
+	chunks, err := requestService.LoadResponseChunks(ctx, dbReq)
+	require.NoError(t, err)
+	require.Len(t, chunks, 1)
+}
+
+func TestIsTerminalStreamEvent_SemanticCompletionInData(t *testing.T) {
+	tests := []struct {
+		name  string
+		event *httpclient.StreamEvent
+		want  bool
+	}{
+		{
+			name:  "responses completion without SSE event field",
+			event: &httpclient.StreamEvent{Data: []byte(`{"type":"response.completed","response":{"status":"completed"}}`)},
+			want:  true,
+		},
+		{
+			name:  "anthropic message stop without SSE event field",
+			event: &httpclient.StreamEvent{Data: []byte(`{"type":"message_stop"}`)},
+			want:  true,
+		},
+		{
+			name:  "chat completion finish reason",
+			event: &httpclient.StreamEvent{Data: []byte(`{"choices":[{"index":0,"finish_reason":"stop"}]}`)},
+			want:  true,
+		},
+		{
+			name:  "chat completion without finish reason",
+			event: &httpclient.StreamEvent{Data: []byte(`{"choices":[{"index":0,"finish_reason":null}]}`)},
+			want:  false,
+		},
+		{
+			name:  "gemini finish reason stop",
+			event: &httpclient.StreamEvent{Data: []byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"world!"}]},"finishReason":"STOP"}]}`)},
+			want:  true,
+		},
+		{
+			name:  "gemini finish reason max tokens",
+			event: &httpclient.StreamEvent{Data: []byte(`{"candidates":[{"index":0,"finishReason":"MAX_TOKENS"}]}`)},
+			want:  true,
+		},
+		{
+			name:  "gemini chunk without finish reason",
+			event: &httpclient.StreamEvent{Data: []byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"hello"}]}}]}`)},
+			want:  false,
+		},
+		{
+			name:  "gemini empty finish reason",
+			event: &httpclient.StreamEvent{Data: []byte(`{"candidates":[{"index":0,"finishReason":""}]}`)},
+			want:  false,
+		},
+		{
+			name:  "non-terminal responses event",
+			event: &httpclient.StreamEvent{Data: []byte(`{"type":"response.output_text.delta","delta":"done"}`)},
+			want:  false,
+		},
+		{
+			name: "nil event",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, IsTerminalStreamEvent(tt.event))
+		})
+	}
 }

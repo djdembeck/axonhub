@@ -3,7 +3,7 @@ import { pageInfoSchema } from '@/gql/pagination';
 import { userSchema } from '@/features/users/data/schema';
 
 // API Key Type
-export const apiKeyTypeSchema = z.enum(['user', 'service_account', 'noauth']);
+export const apiKeyTypeSchema = z.enum(['user', 'service_account', 'noauth', 'personal']);
 export type ApiKeyType = z.infer<typeof apiKeyTypeSchema>;
 
 // API Key Status
@@ -21,6 +21,25 @@ const channelTagsMatchModeFieldSchema = z.preprocess((value) => {
   return value;
 }, channelTagsMatchModeSchema);
 
+/** Normalize legacy/empty routing policy values to the canonical "default". */
+export function normalizeRoutingPolicyValue(value?: string | null): string {
+  if (!value || value === 'system_default') {
+    return 'default';
+  }
+
+  return value;
+}
+
+export function normalizeApiKeyProfileRoutingPolicy<T extends { loadBalanceStrategy?: string | null; traceStickyMode?: string | null }>(
+  profile: T
+): T {
+  return {
+    ...profile,
+    loadBalanceStrategy: normalizeRoutingPolicyValue(profile.loadBalanceStrategy),
+    traceStickyMode: normalizeRoutingPolicyValue(profile.traceStickyMode),
+  };
+}
+
 // API Key schema based on GraphQL schema
 export const apiKeySchema = z.object({
   id: z.string(),
@@ -32,6 +51,7 @@ export const apiKeySchema = z.object({
   type: apiKeyTypeSchema,
   status: apiKeyStatusSchema,
   scopes: z.array(z.string()).optional().nullable(),
+  allowedIps: z.array(z.string()).optional().nullable(),
   // Optional profiles for detailed view (may be omitted in list queries)
   profiles: z
     .object({
@@ -40,17 +60,22 @@ export const apiKeySchema = z.object({
         .array(
           z.object({
             name: z.string(),
-            modelMappings: z.array(
-              z.object({
-                from: z.string(),
-                to: z.string(),
-              })
-            ),
+            templateID: z.number().optional().nullable(),
+            templateName: z.string().optional().nullable(),
+            modelMappings: z
+              .array(
+                z.object({
+                  from: z.string(),
+                  to: z.string(),
+                })
+              )
+              .default([]),
             channelIDs: z.array(z.number()).optional().nullable(),
             channelTags: z.array(z.string()).optional().nullable(),
             channelTagsMatchMode: channelTagsMatchModeFieldSchema,
             modelIDs: z.array(z.string()).optional().nullable(),
             loadBalanceStrategy: z.string().optional().nullable(),
+            traceStickyMode: z.string().optional().nullable(),
             quota: z
               .object({
                 requests: z.number().optional().nullable(),
@@ -77,6 +102,7 @@ export const apiKeySchema = z.object({
               .nullable(),
           })
         )
+        .optional()
         .nullable(),
     })
     .optional()
@@ -103,6 +129,7 @@ export const createApiKeyInputSchemaFactory = (t: (key: string) => string) =>
     name: z.string().min(1, t('apikeys.validation.nameRequired')),
     type: apiKeyTypeSchema.optional(),
     scopes: z.array(z.string()).optional(),
+    allowedIps: z.array(z.string()).optional(),
     projectID: z.number().optional(),
   });
 
@@ -111,6 +138,7 @@ export const createApiKeyInputSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   type: apiKeyTypeSchema.optional(),
   scopes: z.array(z.string()).optional(),
+  allowedIps: z.array(z.string()).optional(),
   projectID: z.number().optional(),
 });
 export type CreateApiKeyInput = z.infer<typeof createApiKeyInputSchema>;
@@ -120,12 +148,14 @@ export const updateApiKeyInputSchemaFactory = (t: (key: string) => string) =>
   z.object({
     name: z.string().min(1, t('apikeys.validation.nameRequired')).optional(),
     scopes: z.array(z.string()).optional(),
+    allowedIps: z.array(z.string()).optional(),
   });
 
 // Default schema for backward compatibility
 export const updateApiKeyInputSchema = z.object({
   name: z.string().min(1, 'Name is required').optional(),
   scopes: z.array(z.string()).optional(),
+  allowedIps: z.array(z.string()).optional(),
 });
 export type UpdateApiKeyInput = z.infer<typeof updateApiKeyInputSchema>;
 
@@ -139,12 +169,15 @@ export type ModelMapping = z.infer<typeof modelMappingSchema>;
 // API Key Profile schema
 export const apiKeyProfileSchema = z.object({
   name: z.string(),
+  templateID: z.number().optional().nullable(),
+  templateName: z.string().optional().nullable(),
   modelMappings: z.array(modelMappingSchema),
   channelIDs: z.array(z.number()).optional().nullable(),
   channelTags: z.array(z.string()).optional().nullable(),
   channelTagsMatchMode: channelTagsMatchModeFieldSchema,
   modelIDs: z.array(z.string()).optional().nullable(),
   loadBalanceStrategy: z.string().optional().nullable(),
+  traceStickyMode: z.string().optional().nullable(),
   quota: z
     .object({
       requests: z.number().optional().nullable(),
@@ -179,6 +212,36 @@ export const apiKeyProfilesSchema = z.object({
 });
 export type ApiKeyProfiles = z.infer<typeof apiKeyProfilesSchema>;
 
+// API Key Profile Template schema
+export const apiKeyProfileTemplateSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().default(''),
+  profile: apiKeyProfileSchema,
+  projectID: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  linkedProfilesCount: z.number().int().nonnegative().default(0),
+});
+export type ApiKeyProfileTemplate = z.infer<typeof apiKeyProfileTemplateSchema>;
+
+// Create API Key Profile Template Input schema
+export const createApiKeyProfileTemplateInputSchema = z.object({
+  name: z.string().min(1, 'Name is required'),
+  description: z.string().optional(),
+  projectID: z.string(),
+  profile: apiKeyProfileSchema,
+});
+export type CreateApiKeyProfileTemplateInput = z.infer<typeof createApiKeyProfileTemplateInputSchema>;
+
+// Update API Key Profile Template Input schema
+export const updateApiKeyProfileTemplateInputSchema = z.object({
+  name: z.string().min(1, 'Name is required').optional(),
+  description: z.string().optional(),
+  profile: apiKeyProfileSchema.optional(),
+});
+export type UpdateApiKeyProfileTemplateInput = z.infer<typeof updateApiKeyProfileTemplateInputSchema>;
+
 // Update API Key Profiles Input schema - factory function for i18n support
 export const updateApiKeyProfilesInputSchemaFactory = (t: (key: string) => string) =>
   z
@@ -188,6 +251,8 @@ export const updateApiKeyProfilesInputSchemaFactory = (t: (key: string) => strin
         .array(
           z.object({
             name: z.string().min(1, t('apikeys.validation.profileNameRequired')),
+            templateID: z.number().optional().nullable(),
+            templateName: z.string().optional().nullable(),
             modelMappings: z.array(
               z.object({
                 from: z.string().min(1, t('apikeys.validation.sourceModelRequired')),
@@ -199,6 +264,7 @@ export const updateApiKeyProfilesInputSchemaFactory = (t: (key: string) => strin
             channelTagsMatchMode: channelTagsMatchModeFieldSchema,
             modelIDs: z.array(z.string()).optional().nullable(),
             loadBalanceStrategy: z.string().optional().nullable(),
+            traceStickyMode: z.string().optional().nullable(),
             quota: z
               .object({
                 requests: z.number().int().positive().optional().nullable(),
@@ -299,6 +365,7 @@ export const updateApiKeyProfilesInputSchema = z.object({
       channelTagsMatchMode: channelTagsMatchModeFieldSchema,
       modelIDs: z.array(z.string()).optional().nullable(),
       loadBalanceStrategy: z.string().optional().nullable(),
+      traceStickyMode: z.string().optional().nullable(),
       quota: z
         .object({
           requests: z.number().int().positive().optional().nullable(),

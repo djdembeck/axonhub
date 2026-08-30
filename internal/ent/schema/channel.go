@@ -38,6 +38,8 @@ func (Channel) Fields() []ent.Field {
 			Values(
 				"openai",
 				"openai_responses",
+				"atlascloud",
+				"cline",
 				"codex",
 				"vercel",
 				"anthropic",
@@ -49,6 +51,7 @@ func (Channel) Fields() []ent.Field {
 				"deepseek",
 				"deepseek_anthropic",
 				"deepinfra",
+				"qiniu",
 				"fireworks",
 				"doubao",
 				"doubao_anthropic",
@@ -62,18 +65,25 @@ func (Channel) Fields() []ent.Field {
 				"openai_fake",
 				"openrouter",
 				"xiaomi",
+				"xiaomi_anthropic",
 				"xai",
+				"xai_responses",
+				"xai_subscription",
 				"ppio",
 				"siliconflow",
 				"volcengine",
+				"volcengine_anthropic",
 				"longcat",
 				"longcat_anthropic",
 				"minimax",
 				"minimax_anthropic",
 				"aihubmix",
+				"aihubmix_anthropic",
 				"burncloud",
 				"modelscope",
 				"bailian",
+				"bailian_anthropic",
+				"moonshot_coding",
 				"jina",
 				"github",
 				"github_copilot",
@@ -82,6 +92,15 @@ func (Channel) Fields() []ent.Field {
 				"antigravity",
 				"nanogpt",
 				"nanogpt_responses",
+				"opencode_go",
+				"opencode_go_anthropic",
+				"ollama",
+				"ollama_anthropic",
+				"evolink",
+				"evolink_anthropic",
+				"groq",
+				"qiniu_anthropic",
+				"fenno",
 			).
 			Annotations(
 				entgql.OrderField("TYPE"),
@@ -133,9 +152,19 @@ func (Channel) Fields() []ent.Field {
 			Annotations(
 				entgql.Skip(entgql.SkipMutationCreateInput),
 			),
+		field.Time("auto_disabled_at").
+			Optional().Nillable().
+			Comment("Set when the channel was disabled automatically, and cleared when it recovers; distinguishes an automatic disable from an operator one.").
+			Annotations(
+				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
+			),
 		field.String("remark").
 			Optional().Nillable().
 			Comment("User-defined remark or note for the channel"),
+		field.JSON("endpoints", []objects.ChannelEndpoint{}).
+			Default([]objects.ChannelEndpoint{}).
+			Optional().
+			Comment("Outbound API endpoints for this channel. Each endpoint specifies api_format and optional path. When empty, defaults are derived from channel type."),
 	}
 }
 

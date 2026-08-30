@@ -160,7 +160,7 @@ Adjust the quota check interval in `config.yml`:
 
 ```yaml
 provider_quota:
-  check_interval: "20m"          # Check every 20 minutes (default)
+  check_interval: "5m"           # Check every 5 minutes (default)
 ```
 
 Or via environment variable:
@@ -173,7 +173,7 @@ Supported intervals: `1m`, `2m`, `3m`, `4m`, `5m`, `6m`, `10m`, `12m`, `15m`, `2
 
 **Recommendations:**
 - **Development**: Use shorter intervals (e.g., `5m`) for quick feedback
-- **Production**: Use `20m` or longer to reduce API calls
+- **Production**: Use `5m` (default) for timely quota detection; increase to `10m` or `20m` to reduce API calls
 
 ### Refreshing Quota Data
 
@@ -194,4 +194,4 @@ You can manually trigger a quota refresh by clicking the refresh icon in the quo
 - [OpenAI API](../api-reference/openai-api.md)
 - [Codex Integration Guide](codex-integration.md)
 - [Channel Management Guide](channel-management.md)
-- README sections on [Usage Guide](../../../README.md#usage-guide)
+- README sections on [Usage Guide](../../../README.en-US.md#usage-guide)

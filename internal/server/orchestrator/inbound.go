@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/looplj/axonhub/internal/dumper"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/log"
@@ -14,6 +16,11 @@ import (
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
 )
+
+// ErrStreamIncomplete reports an upstream stream that ended without a terminal
+// event and without an aggregated complete response. The same value is persisted
+// on the request and delivered to the client, so both sides agree on the reason.
+var ErrStreamIncomplete = errors.New("stream ended without terminal event or completed response")
 
 // InboundPersistentStream wraps a stream and tracks all responses for final saving to database.
 // It implements the streams.Stream interface and handles persistence in the Close method.
@@ -67,8 +74,10 @@ func (ts *InboundPersistentStream) Next() bool {
 func (ts *InboundPersistentStream) Current() *httpclient.StreamEvent {
 	event := ts.stream.Current()
 	if event != nil {
-		ts.responseChunks = append(ts.responseChunks, event)
-		if isTerminalStreamEvent(event) {
+		// For raw binary audio chunks (TTS stream_format=audio), persist only a size
+		// summary to avoid buffering the full audio payload in memory.
+		ts.responseChunks = append(ts.responseChunks, httpclient.SummarizeBinaryChunk(event))
+		if IsTerminalStreamEvent(event) {
 			ts.state.StreamCompleted = true
 		}
 	}
@@ -76,15 +85,65 @@ func (ts *InboundPersistentStream) Current() *httpclient.StreamEvent {
 	return event
 }
 
-// isTerminalStreamEvent checks if the event represents the end of a successfully completed stream.
-// For Chat Completions API this is the raw [DONE] event; for Responses API this is response.completed.
-func isTerminalStreamEvent(event *httpclient.StreamEvent) bool {
+// IsTerminalStreamEvent checks both SSE metadata and JSON data for a successful
+// protocol-level or semantic completion marker. The SSE writers use it to decide
+// whether the client actually received a completion marker, so this must stay the
+// single source of truth for "the stream ended properly".
+func IsTerminalStreamEvent(event *httpclient.StreamEvent) bool {
+	if event == nil {
+		return false
+	}
+
 	// For chat completions, check for [DONE] event
-	return bytes.Equal(event.Data, llm.DoneStreamEvent.Data) ||
+	if bytes.Equal(event.Data, llm.DoneStreamEvent.Data) ||
 		// For Responses API, check for response.completed event
 		event.Type == "response.completed" ||
 		// For Anthropic Messages API, check for message_stop event
-		event.Type == "message_stop"
+		event.Type == "message_stop" ||
+		// For OpenAI audio APIs (TTS sse / STT stream) which have no [DONE] sentinel:
+		// rely on the terminal *.done event surfaced as StreamEvent.Type.
+		event.Type == "speech.audio.done" ||
+		event.Type == "transcript.text.done" ||
+		event.Type == httpclient.BinaryStreamDoneEventType {
+		return true
+	}
+
+	// Compatible SSE providers do not always populate the SSE `event` field and
+	// instead carry the event type only in the JSON data. Also recognize a chat
+	// completion's finish_reason as semantic completion: clients commonly close
+	// the connection immediately after consuming that final useful chunk, before
+	// the trailing [DONE] marker is read by the server.
+	eventType := gjson.GetBytes(event.Data, "type").String()
+	switch eventType {
+	case "response.completed", "message_stop", "speech.audio.done", "transcript.text.done":
+		return true
+	}
+
+	// OpenAI chat completions: choices[].finish_reason
+	if hasNonEmptyJSONStringField(event.Data, "choices", "finish_reason") {
+		return true
+	}
+
+	// Gemini generateContent streams have no [DONE] sentinel. Completion is
+	// signaled by candidates[].finishReason (e.g. STOP, MAX_TOKENS, SAFETY).
+	return hasNonEmptyJSONStringField(event.Data, "candidates", "finishReason")
+}
+
+func hasNonEmptyJSONStringField(data []byte, arrayPath, field string) bool {
+	arr := gjson.GetBytes(data, arrayPath)
+	if !arr.IsArray() {
+		return false
+	}
+
+	completed := false
+	arr.ForEach(func(_, item gjson.Result) bool {
+		value := item.Get(field)
+		completed = value.Type == gjson.String && value.String() != ""
+
+		return !completed
+	})
+
+	return completed
 }
 
 func (ts *InboundPersistentStream) Err() error {
@@ -119,9 +178,10 @@ func (ts *InboundPersistentStream) Close() error {
 	// regardless of what chunks we have. Stream errors indicate the upstream response
 	// was incomplete or corrupted.
 	if streamErr != nil && !errors.Is(streamErr, context.Canceled) && !errors.Is(streamErr, context.DeadlineExceeded) {
-		if ts.request != nil {
-			persistCtx := context.WithoutCancel(ctx)
+		persistCtx := context.WithoutCancel(ctx)
+		ts.persistFailureChunks(persistCtx)
 
+		if ts.request != nil {
 			if err := ts.requestService.UpdateRequestStatusFromError(persistCtx, ts.request.ID, streamErr); err != nil {
 				log.Warn(persistCtx, "Failed to update request status from error", log.Cause(err))
 			}
@@ -139,7 +199,7 @@ func (ts *InboundPersistentStream) Close() error {
 
 	if len(ts.responseChunks) > 0 && !ts.state.StreamCompleted {
 		responseBody, meta, aggErr = ts.transformer.AggregateStreamChunks(context.WithoutCancel(ctx), ts.responseChunks)
-		if aggErr == nil && meta.ID != "" && len(responseBody) > 0 {
+		if aggErr == nil && meta.ID != "" && len(responseBody) > 0 && isCompletedAggregated(meta) {
 			log.Debug(ctx, "Stream has valid complete response without terminal event, treating as completed")
 			ts.state.StreamCompleted = true
 		}
@@ -148,13 +208,36 @@ func (ts *InboundPersistentStream) Close() error {
 	// Check if context was canceled (client disconnected before [DONE]).
 	// Skip the error path if we determined the stream actually completed successfully above.
 	if (ctxErr != nil || streamErr != nil) && !ts.state.StreamCompleted {
-		if ts.request != nil {
-			persistCtx := context.WithoutCancel(ctx)
+		persistCtx := context.WithoutCancel(ctx)
+		ts.persistFailureChunks(persistCtx)
 
+		if ts.request != nil {
 			errToReport := ctxErr
 			if errToReport == nil {
 				errToReport = streamErr
 			}
+
+			if err := ts.requestService.UpdateRequestStatusFromError(persistCtx, ts.request.ID, errToReport); err != nil {
+				log.Warn(persistCtx, "Failed to update request status from error", log.Cause(err))
+			}
+		}
+
+		return ts.stream.Close()
+	}
+
+	// If the stream ended without a terminal event and we couldn't determine it was
+	// completed through aggregation, mark it as incomplete/failed. This handles the case
+	// where the upstream connection drops silently (EOF) without sending a terminal event,
+	// which would otherwise fall through and incorrectly mark the request as "completed".
+	if !ts.state.StreamCompleted {
+		log.Debug(ctx, "Stream ended without terminal event or completed response, treating as incomplete")
+
+		persistCtx := context.WithoutCancel(ctx)
+		// Persist partial chunks for debugging; do not mark the request completed.
+		ts.persistFailureChunks(persistCtx)
+
+		if ts.request != nil {
+			errToReport := ErrStreamIncomplete
 
 			if err := ts.requestService.UpdateRequestStatusFromError(persistCtx, ts.request.ID, errToReport); err != nil {
 				log.Warn(persistCtx, "Failed to update request status from error", log.Cause(err))
@@ -195,6 +278,19 @@ func (ts *InboundPersistentStream) persistResponseChunks(ctx context.Context) {
 	}
 
 	ts._persistResponse(persistCtx, responseBody, meta)
+}
+
+// persistFailureChunks stores buffered SSE chunks for a failed/incomplete stream
+// without marking the request completed. Used so truncated upstream responses remain
+// inspectable when store_chunks is enabled.
+func (ts *InboundPersistentStream) persistFailureChunks(ctx context.Context) {
+	if ts.request == nil || len(ts.responseChunks) == 0 {
+		return
+	}
+
+	if err := ts.requestService.SaveRequestChunks(ctx, ts.request.ID, ts.responseChunks); err != nil {
+		log.Warn(ctx, "Failed to save request chunks after stream failure", log.Cause(err))
+	}
 }
 
 // _persistResponse performs the actual persistence with pre-aggregated data.
@@ -248,6 +344,7 @@ func (p *PersistentInboundTransformer) TransformRequest(ctx context.Context, req
 	llmRequest.RawRequest = request
 	p.state.RawRequest = request
 	p.state.LlmRequest = llmRequest
+	p.state.OriginalRequestStream = llmRequest.Stream
 
 	return llmRequest, nil
 }

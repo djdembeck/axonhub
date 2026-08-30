@@ -26,7 +26,10 @@ func (RequestExecution) Indexes() []ent.Index {
 		// Index for window function: find latest execution per request
 		index.Fields("request_id", "status", "created_at").
 			StorageKey("request_executions_by_request_id_status_created_at"),
-		index.Fields("channel_id").
+		// Index for ordering executions by created_at per request
+		index.Fields("request_id", "created_at").
+			StorageKey("request_executions_by_request_id_created_at"),
+		index.Fields("channel_id", "created_at").
 			StorageKey("request_executions_by_channel_id_created_at"),
 	}
 }
@@ -41,10 +44,17 @@ func (RequestExecution) Fields() []ent.Field {
 			Immutable().
 			Comment("Data Storage ID that this request belongs to"),
 		// External ID for tracking requests in external systems
-		field.String("external_id").Optional(),
+		field.String("external_id").
+			Optional().
+			MaxLen(512),
 		field.String("model_id").Immutable(),
 		//  The format of the request, e.g: openai/chat_completions, claude/messages, openai/response.
 		field.String("format").Immutable().Default("openai/chat_completions"),
+		field.String("reasoning_effort").
+			Optional().
+			Nillable().
+			Immutable().
+			Comment("Final reasoning effort sent to the upstream provider"),
 		// The original request to the provider.
 		// e.g: the user request via OpenAI request format, but the actual request to the provider with Claude format, the request_body is the Claude request format.
 		field.JSON("request_body", objects.JSONRawMessage{}).Immutable().Annotations(
@@ -77,6 +87,14 @@ func (RequestExecution) Fields() []ent.Field {
 		field.JSON("request_headers", objects.JSONRawMessage{}).
 			Optional().
 			Comment("Request headers"),
+		// The actual upstream request URL sent to the provider.
+		field.String("request_url").
+			Optional().
+			Comment("Actual upstream request URL sent to the provider"),
+		// Whether the inbound request body was substituted during pass-through.
+		field.Bool("pass_through_applied").
+			Default(false).
+			Comment("Whether pass-through was active for this execution attempt"),
 	}
 }
 

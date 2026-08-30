@@ -58,6 +58,66 @@ type AddUserToProjectInput struct {
 	RoleIDs   []*objects.GUID `json:"roleIDs,omitempty"`
 }
 
+// Daily aggregated statistics for the combined trend chart
+type AnalyticsDailyStat struct {
+	Date                string  `json:"date"`
+	InputTokens         int     `json:"inputTokens"`
+	CachedInputTokens   int     `json:"cachedInputTokens"`
+	UncachedInputTokens int     `json:"uncachedInputTokens"`
+	OutputTokens        int     `json:"outputTokens"`
+	TotalTokens         int     `json:"totalTokens"`
+	RequestCount        int     `json:"requestCount"`
+	Cost                float64 `json:"cost"`
+}
+
+// Statistics for a single item in a dimension breakdown (channel/model/apiKey/user)
+type AnalyticsDimensionStat struct {
+	ID                string  `json:"id"`
+	Name              string  `json:"name"`
+	RequestCount      int     `json:"requestCount"`
+	InputTokens       int     `json:"inputTokens"`
+	CachedInputTokens int     `json:"cachedInputTokens"`
+	OutputTokens      int     `json:"outputTokens"`
+	TotalTokens       int     `json:"totalTokens"`
+	Cost              float64 `json:"cost"`
+}
+
+// Filter input for analytics queries. All fields are optional and support multi-select.
+// When multiple dimensions are specified, they are combined with AND logic.
+type AnalyticsFilter struct {
+	// Start date (inclusive, YYYY-MM-DD, parsed in system timezone)
+	StartTime *string `json:"startTime,omitempty"`
+	// End date (inclusive, YYYY-MM-DD, parsed in system timezone)
+	EndTime *string `json:"endTime,omitempty"`
+	// Filter by project IDs
+	ProjectIDs []*objects.GUID `json:"projectIDs,omitempty"`
+	// Filter by channel IDs
+	ChannelIDs []*objects.GUID `json:"channelIDs,omitempty"`
+	// Filter by model IDs (model identifier strings)
+	ModelIDs []string `json:"modelIDs,omitempty"`
+	// Filter by API key IDs
+	APIKeyIDs []*objects.GUID `json:"apiKeyIDs,omitempty"`
+	// Filter by user IDs (will match through api_keys.user_id)
+	UserIDs []*objects.GUID `json:"userIDs,omitempty"`
+}
+
+// Metadata for the analytics page (independent of filters)
+type AnalyticsMetadata struct {
+	// Earliest usage log date (YYYY-MM-DD), null if no data
+	EarliestDate *string `json:"earliestDate,omitempty"`
+}
+
+// Overview statistics for the analytics page
+type AnalyticsOverview struct {
+	TotalTokens              int     `json:"totalTokens"`
+	TotalInputTokens         int     `json:"totalInputTokens"`
+	TotalCachedInputTokens   int     `json:"totalCachedInputTokens"`
+	TotalUncachedInputTokens int     `json:"totalUncachedInputTokens"`
+	TotalOutputTokens        int     `json:"totalOutputTokens"`
+	TotalRequests            int     `json:"totalRequests"`
+	TotalCost                float64 `json:"totalCost"`
+}
+
 type ApplyChannelOverrideTemplateInput struct {
 	TemplateID objects.GUID       `json:"templateID"`
 	ChannelIDs []*objects.GUID    `json:"channelIDs"`
@@ -94,6 +154,7 @@ type BackupPayload struct {
 type BrandSettings struct {
 	BrandName *string `json:"brandName,omitempty"`
 	BrandLogo *string `json:"brandLogo,omitempty"`
+	Title     *string `json:"title,omitempty"`
 }
 
 type BulkImportChannelsInput struct {
@@ -110,6 +171,18 @@ type BulkUpdateChannelOrderingResult struct {
 	Channels []*ent.Channel `json:"channels"`
 }
 
+// ChannelLimiterStats is a point-in-time snapshot of the per-channel concurrency limiter.
+type ChannelLimiterStats struct {
+	// Number of requests currently holding a capacity slot.
+	InFlight int `json:"inFlight"`
+	// Number of requests currently waiting in the FIFO queue.
+	Waiting int `json:"waiting"`
+	// Configured MaxConcurrent (capacity ceiling).
+	Capacity int `json:"capacity"`
+	// Configured QueueSize (0 means soft mode — no waiting queue, only counts).
+	QueueSize int `json:"queueSize"`
+}
+
 // Performance statistics for a specific channel on a given date
 type ChannelPerformanceStat struct {
 	Date         string   `json:"date"`
@@ -121,13 +194,14 @@ type ChannelPerformanceStat struct {
 }
 
 type ChannelSuccessRate struct {
-	ChannelID    objects.GUID `json:"channelId"`
-	ChannelName  string       `json:"channelName"`
-	ChannelType  string       `json:"channelType"`
-	SuccessCount int          `json:"successCount"`
-	FailedCount  int          `json:"failedCount"`
-	TotalCount   int          `json:"totalCount"`
-	SuccessRate  float64      `json:"successRate"`
+	ChannelID       objects.GUID `json:"channelId"`
+	ChannelName     string       `json:"channelName"`
+	ChannelType     string       `json:"channelType"`
+	ChannelDisabled bool         `json:"channelDisabled"`
+	SuccessCount    int          `json:"successCount"`
+	FailedCount     int          `json:"failedCount"`
+	TotalCount      int          `json:"totalCount"`
+	SuccessRate     float64      `json:"successRate"`
 }
 
 type ChannelTypeCount struct {
@@ -143,6 +217,16 @@ type ClearCachePayload struct {
 	Success bool                `json:"success"`
 	Message string              `json:"message"`
 	Targets []DiagnosticsTarget `json:"targets"`
+}
+
+type ClearChannelOverrideTemplatesInput struct {
+	ChannelIDs []*objects.GUID `json:"channelIDs"`
+}
+
+type ClearChannelOverrideTemplatesPayload struct {
+	Success  bool           `json:"success"`
+	Updated  int            `json:"updated"`
+	Channels []*ent.Channel `json:"channels"`
 }
 
 type CompleteAutoDisableChannelOnboardingInput struct {
@@ -256,6 +340,11 @@ type InitializeSystemPayload struct {
 	Token   *string   `json:"token,omitempty"`
 }
 
+type LoadAPIKeyProfileTemplateInput struct {
+	TemplateID objects.GUID `json:"templateID"`
+	APIKeyID   objects.GUID `json:"apiKeyID"`
+}
+
 // Performance statistics for a specific model on a given date
 type ModelPerformanceStat struct {
 	Date         string   `json:"date"`
@@ -273,11 +362,46 @@ type ModelTokenUsageStats struct {
 	ReasoningTokens int    `json:"reasoningTokens"`
 }
 
+type OIDCIdentityInfo struct {
+	ID      objects.GUID `json:"id"`
+	IdpName string       `json:"idpName"`
+	Issuer  string       `json:"issuer"`
+	Subject string       `json:"subject"`
+	Email   string       `json:"email"`
+}
+
 type OnboardingInfo struct {
 	Onboarded          bool                          `json:"onboarded"`
 	CompletedAt        *time.Time                    `json:"completedAt,omitempty"`
 	SystemModelSetting *SystemModelSettingOnboarding `json:"systemModelSetting,omitempty"`
 	AutoDisableChannel *AutoDisableChannelOnboarding `json:"autoDisableChannel,omitempty"`
+}
+
+type PassThroughSettings struct {
+	Enabled bool `json:"enabled"`
+}
+
+type PromptProtectionRulePreviewInput struct {
+	Pattern  string                            `json:"pattern"`
+	TestText string                            `json:"testText"`
+	Settings *objects.PromptProtectionSettings `json:"settings"`
+}
+
+type PromptProtectionRulePreviewResult struct {
+	Result   string `json:"result"`
+	HasMatch bool   `json:"hasMatch"`
+}
+
+type ProviderQuotaCollectionProviderInput struct {
+	Provider string `json:"provider"`
+	Enabled  bool   `json:"enabled"`
+}
+
+type ProvidersCatalog struct {
+	Data      objects.JSONRawMessage `json:"data"`
+	FetchedAt *time.Time             `json:"fetchedAt,omitempty"`
+	Source    string                 `json:"source"`
+	Filtered  bool                   `json:"filtered"`
 }
 
 type QueryModelsInput struct {
@@ -407,12 +531,13 @@ type TokenStatsByAPIKey struct {
 
 // Token usage statistics grouped by channel
 type TokenStatsByChannel struct {
-	ChannelName     string `json:"channelName"`
-	InputTokens     int    `json:"inputTokens"`
-	OutputTokens    int    `json:"outputTokens"`
-	CachedTokens    int    `json:"cachedTokens"`
-	ReasoningTokens int    `json:"reasoningTokens"`
-	TotalTokens     int    `json:"totalTokens"`
+	ChannelID       objects.GUID `json:"channelId"`
+	ChannelName     string       `json:"channelName"`
+	InputTokens     int          `json:"inputTokens"`
+	OutputTokens    int          `json:"outputTokens"`
+	CachedTokens    int          `json:"cachedTokens"`
+	ReasoningTokens int          `json:"reasoningTokens"`
+	TotalTokens     int          `json:"totalTokens"`
 }
 
 // Token usage statistics grouped by model
@@ -442,19 +567,28 @@ type UpdateAPIKeyScopesInput struct {
 }
 
 type UpdateAutoBackupSettingsInput struct {
-	Enabled            *bool                `json:"enabled,omitempty"`
-	Frequency          *biz.BackupFrequency `json:"frequency,omitempty"`
-	DataStorageID      *int                 `json:"dataStorageID,omitempty"`
-	IncludeChannels    *bool                `json:"includeChannels,omitempty"`
-	IncludeModels      *bool                `json:"includeModels,omitempty"`
-	IncludeAPIKeys     *bool                `json:"includeAPIKeys,omitempty"`
-	IncludeModelPrices *bool                `json:"includeModelPrices,omitempty"`
-	RetentionDays      *int                 `json:"retentionDays,omitempty"`
+	IncludeSystemConfigs *bool                `json:"includeSystemConfigs,omitempty"`
+	Enabled              *bool                `json:"enabled,omitempty"`
+	Frequency            *biz.BackupFrequency `json:"frequency,omitempty"`
+	DataStorageID        *int                 `json:"dataStorageID,omitempty"`
+	IncludeChannels      *bool                `json:"includeChannels,omitempty"`
+	IncludeModels        *bool                `json:"includeModels,omitempty"`
+	IncludeAPIKeys       *bool                `json:"includeAPIKeys,omitempty"`
+	IncludeModelPrices   *bool                `json:"includeModelPrices,omitempty"`
+	IncludeUsageStats    *bool                `json:"includeUsageStats,omitempty"`
+	IncludeRequestLogs   *bool                `json:"includeRequestLogs,omitempty"`
+	RetentionDays        *int                 `json:"retentionDays,omitempty"`
 }
 
 type UpdateBrandSettingsInput struct {
 	BrandName *string `json:"brandName,omitempty"`
 	BrandLogo *string `json:"brandLogo,omitempty"`
+	Title     *string `json:"title,omitempty"`
+}
+
+type UpdateCatalogSettingsInput struct {
+	UpstreamURL    *string `json:"upstreamURL,omitempty"`
+	RefreshSeconds *int    `json:"refreshSeconds,omitempty"`
 }
 
 type UpdateDefaultDataStorageInput struct {
@@ -468,6 +602,15 @@ type UpdateMeInput struct {
 	Avatar         *string `json:"avatar,omitempty"`
 }
 
+type UpdateMyPasswordInput struct {
+	OldPassword *string `json:"oldPassword,omitempty"`
+	NewPassword string  `json:"newPassword"`
+}
+
+type UpdatePassThroughSettingsInput struct {
+	Enabled bool `json:"enabled"`
+}
+
 type UpdateProjectUserInput struct {
 	ProjectID     objects.GUID    `json:"projectId"`
 	UserID        objects.GUID    `json:"userId"`
@@ -477,8 +620,33 @@ type UpdateProjectUserInput struct {
 	RemoveRoleIDs []*objects.GUID `json:"removeRoleIDs,omitempty"`
 }
 
+type UpdateProviderQuotaCollectionSettingsInput struct {
+	Enabled   *bool                                   `json:"enabled,omitempty"`
+	Providers []*ProviderQuotaCollectionProviderInput `json:"providers,omitempty"`
+}
+
+type UpdateQuotaEnforcementSettingsInput struct {
+	Enabled           *bool                     `json:"enabled,omitempty"`
+	Mode              *biz.QuotaEnforcementMode `json:"mode,omitempty"`
+	AllowedChannelIDs []*objects.GUID           `json:"allowedChannelIDs,omitempty"`
+}
+
+type UpdateSecuritySettingsInput struct {
+	BlockedIPs              []string `json:"blockedIPs,omitempty"`
+	ShowRequestLogIPBanIcon *bool    `json:"showRequestLogIPBanIcon,omitempty"`
+}
+
 type UpdateUserAgentPassThroughSettingsInput struct {
 	Enabled bool `json:"enabled"`
+}
+
+// Usage statistics grouped by user
+type UsageStatsByUser struct {
+	UserID       objects.GUID `json:"userId"`
+	UserName     string       `json:"userName"`
+	RequestCount int          `json:"requestCount"`
+	TotalTokens  int          `json:"totalTokens"`
+	TotalCost    float64      `json:"totalCost"`
 }
 
 type UserAgentPassThroughSettings struct {
@@ -548,16 +716,18 @@ func (e DiagnosticsTarget) MarshalJSON() ([]byte, error) {
 type OverrideApplyMode string
 
 const (
-	OverrideApplyModeMerge OverrideApplyMode = "MERGE"
+	OverrideApplyModeMerge   OverrideApplyMode = "MERGE"
+	OverrideApplyModeReplace OverrideApplyMode = "REPLACE"
 )
 
 var AllOverrideApplyMode = []OverrideApplyMode{
 	OverrideApplyModeMerge,
+	OverrideApplyModeReplace,
 }
 
 func (e OverrideApplyMode) IsValid() bool {
 	switch e {
-	case OverrideApplyModeMerge:
+	case OverrideApplyModeMerge, OverrideApplyModeReplace:
 		return true
 	}
 	return false

@@ -9,15 +9,18 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/looplj/axonhub/internal/authz"
+	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/apikey"
 	"github.com/looplj/axonhub/internal/ent/channel"
+	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
@@ -342,35 +345,32 @@ func (r *queryResolver) TokenStatsByAPIKey(ctx context.Context, timeWindow *stri
 
 	var results []tokenStats
 
-	// Database-level aggregation with JOIN
+	// Aggregate directly on usage_logs.api_key_id. Joining to requests is unnecessary
+	// (the column is already on usage_logs) and breaks once the requests table is
+	// pruned by GC retention while usage_logs are still kept.
 	err := r.client.UsageLog.Query().
+		Where(usagelog.APIKeyIDNotNil()).
 		Modify(func(s *sql.Selector) {
-			// Join to requests table to get api_key_id
-			requestTable := sql.Table(request.Table)
-			s.Join(requestTable).On(
-				s.C(usagelog.FieldRequestID),
-				requestTable.C(request.FieldID),
-			)
-
-			// Filter: only requests with non-null api_key_id
-			s.Where(sql.NotNull(requestTable.C(request.FieldAPIKeyID)))
-
-			// Apply time window filter when provided
 			if applyFilter {
 				s.Where(sql.GTE(s.C(usagelog.FieldCreatedAt), since))
 			}
 
-			// Group by api_key_id
-			s.GroupBy(requestTable.C(request.FieldAPIKeyID))
+			s.GroupBy(s.C(usagelog.FieldAPIKeyID))
 
-			// Select aggregations
 			s.Select(
-				sql.As(requestTable.C(request.FieldAPIKeyID), "api_key_id"),
-				sql.As(sql.Sum(s.C(usagelog.FieldPromptTokens)), "input_tokens"),
-				sql.As(sql.Sum(s.C(usagelog.FieldCompletionTokens)), "output_tokens"),
+				sql.As(s.C(usagelog.FieldAPIKeyID), "api_key_id"),
+				sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldPromptTokens)), "input_tokens"),
+				sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldCompletionTokens)), "output_tokens"),
 				sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldPromptCachedTokens)), "cached_tokens"),
 				sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldCompletionReasoningTokens)), "reasoning_tokens"),
 			)
+
+			// Order by billable total (input + output). Reasoning is already inside
+			// completion_tokens, so adding it would double-count.
+			s.OrderBy(sql.Desc(fmt.Sprintf("COALESCE(SUM(%s), 0) + COALESCE(SUM(%s), 0)",
+				s.C(usagelog.FieldPromptTokens),
+				s.C(usagelog.FieldCompletionTokens))))
+			s.Limit(10)
 		}).
 		Scan(ctx, &results)
 	if err != nil {
@@ -379,20 +379,6 @@ func (r *queryResolver) TokenStatsByAPIKey(ctx context.Context, timeWindow *stri
 
 	if len(results) == 0 {
 		return []*TokenStatsByAPIKey{}, nil
-	}
-
-	// Sort by total tokens (descending) and limit to top 3
-	sort.Slice(results, func(i, j int) bool {
-		totalI := results[i].InputTokens + results[i].OutputTokens +
-			results[i].CachedTokens + results[i].ReasoningTokens
-		totalJ := results[j].InputTokens + results[j].OutputTokens +
-			results[j].CachedTokens + results[j].ReasoningTokens
-
-		return totalI > totalJ
-	})
-
-	if len(results) > 3 {
-		results = results[:3]
 	}
 
 	// Extract API key IDs
@@ -418,8 +404,7 @@ func (r *queryResolver) TokenStatsByAPIKey(ctx context.Context, timeWindow *stri
 
 	for _, result := range results {
 		if ak, exists := apiKeyMap[result.APIKeyID]; exists {
-			totalTokens := result.InputTokens + result.OutputTokens +
-				result.CachedTokens + result.ReasoningTokens
+			totalTokens := result.InputTokens + result.OutputTokens
 
 			response = append(response, &TokenStatsByAPIKey{
 				APIKeyID:        objects.GUID{Type: "APIKey", ID: result.APIKeyID},
@@ -462,8 +447,28 @@ func (r *queryResolver) APIKeyTokenUsageStats(ctx context.Context, input *APIKey
 		apiKeyIDs = append(apiKeyIDs, guid.ID)
 	}
 
+	// Query API keys through the privacy-enforced client to validate read_api_keys
+	// scope (both system-level and project-level) and filter to only API keys
+	// the caller can access in their project. Cross-project key IDs are dropped.
+	accessibleIDs, err := r.client.APIKey.Query().
+		Where(apikey.IDIn(apiKeyIDs...)).
+		IDs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate API key access: %w", err)
+	}
+
+	if len(accessibleIDs) == 0 {
+		return []*APIKeyTokenUsageStats{}, nil
+	}
+
+	// Use a scope-gated decision context for the UsageLog aggregation query.
+	// Access has already been validated through the APIKey privacy policy
+	// (read_api_keys + project filter), so we bypass UsageLog's read_requests
+	// privacy rule for this internal stats query.
+	statsCtx := authz.WithScopeDecision(ctx, scopes.ScopeReadAPIKeys)
+
 	query := r.client.UsageLog.Query().
-		Where(usagelog.APIKeyIDIn(apiKeyIDs...))
+		Where(usagelog.APIKeyIDIn(accessibleIDs...))
 
 	if input.CreatedAtGTE != nil {
 		query = query.Where(usagelog.CreatedAtGTE(*input.CreatedAtGTE))
@@ -482,7 +487,7 @@ func (r *queryResolver) APIKeyTokenUsageStats(ctx context.Context, input *APIKey
 
 	var results []usageStats
 
-	err := query.Modify(func(s *sql.Selector) {
+	err = query.Modify(func(s *sql.Selector) {
 		s.Select(
 			s.C(usagelog.FieldAPIKeyID),
 			sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldPromptTokens)), "input_tokens"),
@@ -490,13 +495,13 @@ func (r *queryResolver) APIKeyTokenUsageStats(ctx context.Context, input *APIKey
 			sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldPromptCachedTokens)), "cached_tokens"),
 			sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldCompletionReasoningTokens)), "reasoning_tokens"),
 		).GroupBy(s.C(usagelog.FieldAPIKeyID))
-	}).Scan(ctx, &results)
+	}).Scan(statsCtx, &results)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get API key token usage stats: %w", err)
 	}
 
 	// Get top 3 models for all API keys in a single query
-	topModelsMap := r.getTopModelsForAPIKeys(ctx, apiKeyIDs, input)
+	topModelsMap := r.getTopModelsForAPIKeys(statsCtx, accessibleIDs, input)
 
 	return lo.Map(results, func(item usageStats, _ int) *APIKeyTokenUsageStats {
 		return &APIKeyTokenUsageStats{
@@ -883,10 +888,21 @@ func (r *queryResolver) TokenStats(ctx context.Context) (*TokenStats, error) {
 // Note: Uses request_execution table for channel-level process tracking.
 // This provides success/failure rates per channel, suitable for monitoring channel health.
 // For result-only channel statistics, use RequestStatsByChannel instead.
-func (r *queryResolver) ChannelSuccessRates(ctx context.Context) ([]*ChannelSuccessRate, error) {
+func (r *queryResolver) ChannelSuccessRates(ctx context.Context, timeWindow *string, limit *int) ([]*ChannelSuccessRate, error) {
 	ctx = authz.WithScopeDecision(ctx, scopes.ScopeReadDashboard)
 
-	limitCount := 5
+	// Parse time window, default to "day"
+	if timeWindow == nil || *timeWindow == "" {
+		defaultWindow := "day"
+		timeWindow = &defaultWindow
+	}
+	since, applyFilter := r.parseTimeWindow(ctx, timeWindow)
+
+	// Handle limit parameter (0 means no limit)
+	limitCount := 0
+	if limit != nil && *limit > 0 {
+		limitCount = *limit
+	}
 
 	type channelExecutionStats struct {
 		ChannelID    int `json:"channel_id"`
@@ -896,7 +912,7 @@ func (r *queryResolver) ChannelSuccessRates(ctx context.Context) ([]*ChannelSucc
 
 	var results []channelExecutionStats
 
-	// Use raw SQL to aggregate execution stats by channel
+	// Step 1: Get success/failure counts from request_execution
 	err := r.client.RequestExecution.Query().
 		Modify(func(s *sql.Selector) {
 			s.Select(
@@ -904,8 +920,14 @@ func (r *queryResolver) ChannelSuccessRates(ctx context.Context) ([]*ChannelSucc
 				sql.As("SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)", "success_count"),
 				sql.As("SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)", "failed_count"),
 			).
-				Where(sql.NotNull(requestexecution.FieldChannelID)).
-				GroupBy(requestexecution.FieldChannelID)
+				Where(sql.NotNull(requestexecution.FieldChannelID))
+
+			// Apply time filter
+			if applyFilter {
+				s.Where(sql.GTE(s.C(requestexecution.FieldCreatedAt), since))
+			}
+
+			s.GroupBy(requestexecution.FieldChannelID)
 		}).
 		Scan(ctx, &results)
 	if err != nil {
@@ -928,13 +950,14 @@ func (r *queryResolver) ChannelSuccessRates(ctx context.Context) ([]*ChannelSucc
 		}
 
 		response = append(response, &ChannelSuccessRate{
-			ChannelID:    objects.GUID{Type: "Channel", ID: result.ChannelID},
-			ChannelName:  "",
-			ChannelType:  "",
-			SuccessCount: result.SuccessCount,
-			FailedCount:  result.FailedCount,
-			TotalCount:   totalCount,
-			SuccessRate:  successRate,
+			ChannelID:       objects.GUID{Type: "Channel", ID: result.ChannelID},
+			ChannelName:     "",
+			ChannelType:     "",
+			ChannelDisabled: false,
+			SuccessCount:    result.SuccessCount,
+			FailedCount:     result.FailedCount,
+			TotalCount:      totalCount,
+			SuccessRate:     successRate,
 		})
 	}
 
@@ -944,11 +967,11 @@ func (r *queryResolver) ChannelSuccessRates(ctx context.Context) ([]*ChannelSucc
 	})
 
 	// Apply limit
-	if len(response) > limitCount {
+	if limitCount > 0 && len(response) > limitCount {
 		response = response[:limitCount]
 	}
 
-	// Get channel details for the top channels
+	// Get channel details for the top channels (including soft-deleted channels)
 	channelIDs := lo.Map(response, func(item *ChannelSuccessRate, _ int) int {
 		return item.ChannelID.ID
 	})
@@ -971,6 +994,7 @@ func (r *queryResolver) ChannelSuccessRates(ctx context.Context) ([]*ChannelSucc
 		if ch, exists := channelMap[item.ChannelID.ID]; exists {
 			item.ChannelName = ch.Name
 			item.ChannelType = string(ch.Type)
+			item.ChannelDisabled = ch.Status != "enabled"
 		}
 	}
 
@@ -1450,6 +1474,7 @@ func (r *queryResolver) TokenStatsByChannel(ctx context.Context, timeWindow *str
 	since, applyFilter := r.parseTimeWindow(ctx, timeWindow)
 
 	type channelTokenStats struct {
+		ChannelID       int    `json:"channel_id"`
 		ChannelName     string `json:"channel_name"`
 		InputTokens     int64  `json:"input_tokens"`
 		OutputTokens    int64  `json:"output_tokens"`
@@ -1474,9 +1499,10 @@ func (r *queryResolver) TokenStatsByChannel(ctx context.Context, timeWindow *str
 				s.Where(sql.GTE(s.C(usagelog.FieldCreatedAt), since))
 			}
 
-			s.GroupBy(channelTable.C(channel.FieldName))
+			s.GroupBy(channelTable.C(channel.FieldID), channelTable.C(channel.FieldName))
 
 			s.Select(
+				sql.As(channelTable.C(channel.FieldID), "channel_id"),
 				sql.As(channelTable.C(channel.FieldName), "channel_name"),
 				sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldPromptTokens)), "input_tokens"),
 				sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldCompletionTokens)), "output_tokens"),
@@ -1484,7 +1510,11 @@ func (r *queryResolver) TokenStatsByChannel(ctx context.Context, timeWindow *str
 				sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldCompletionReasoningTokens)), "reasoning_tokens"),
 			)
 
-			s.OrderBy(sql.Desc(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldTotalTokens))))
+			// Order by billable total (input + output). Reasoning is already inside
+			// completion_tokens, so adding it would double-count.
+			s.OrderBy(sql.Desc(fmt.Sprintf("COALESCE(SUM(%s), 0) + COALESCE(SUM(%s), 0)",
+				s.C(usagelog.FieldPromptTokens),
+				s.C(usagelog.FieldCompletionTokens))))
 			s.Limit(10)
 		}).
 		Scan(ctx, &results)
@@ -1493,9 +1523,10 @@ func (r *queryResolver) TokenStatsByChannel(ctx context.Context, timeWindow *str
 	}
 
 	return lo.Map(results, func(item channelTokenStats, _ int) *TokenStatsByChannel {
-		totalTokens := item.InputTokens + item.OutputTokens + item.CachedTokens + item.ReasoningTokens
+		totalTokens := item.InputTokens + item.OutputTokens
 
 		return &TokenStatsByChannel{
+			ChannelID:       objects.GUID{Type: "Channel", ID: item.ChannelID},
 			ChannelName:     item.ChannelName,
 			InputTokens:     int(item.InputTokens),
 			OutputTokens:    int(item.OutputTokens),
@@ -1539,7 +1570,11 @@ func (r *queryResolver) TokenStatsByModel(ctx context.Context, timeWindow *strin
 				sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldCompletionReasoningTokens)), "reasoning_tokens"),
 			)
 
-			s.OrderBy(sql.Desc(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldTotalTokens))))
+			// Order by billable total (input + output). Reasoning is already inside
+			// completion_tokens, so adding it would double-count.
+			s.OrderBy(sql.Desc(fmt.Sprintf("COALESCE(SUM(%s), 0) + COALESCE(SUM(%s), 0)",
+				s.C(usagelog.FieldPromptTokens),
+				s.C(usagelog.FieldCompletionTokens))))
 			s.Limit(10)
 		}).
 		Scan(ctx, &results)
@@ -1548,7 +1583,7 @@ func (r *queryResolver) TokenStatsByModel(ctx context.Context, timeWindow *strin
 	}
 
 	return lo.Map(results, func(item modelTokenStats, _ int) *TokenStatsByModel {
-		totalTokens := item.InputTokens + item.OutputTokens + item.CachedTokens + item.ReasoningTokens
+		totalTokens := item.InputTokens + item.OutputTokens
 
 		return &TokenStatsByModel{
 			ModelID:         item.ModelID,
@@ -1723,4 +1758,136 @@ func (r *queryResolver) CostStatsByAPIKey(ctx context.Context, timeWindow *strin
 	}
 
 	return response, nil
+}
+
+// UsageStatsByUser is the resolver for the usageStatsByUser field.
+func (r *queryResolver) UsageStatsByUser(ctx context.Context, timeWindow *string) ([]*UsageStatsByUser, error) {
+	currentUser, ok := contexts.GetUser(ctx)
+	if !ok || currentUser == nil {
+		return nil, fmt.Errorf("user not found in context")
+	}
+
+	projectID, ok := contexts.GetProjectID(ctx)
+	if !ok {
+		return nil, fmt.Errorf("project ID not found in context")
+	}
+
+	// Only allow project owners or system owners to view usage stats by user
+	isProjectOwner := false
+	if currentUser.IsOwner {
+		isProjectOwner = true
+	} else {
+		for _, up := range currentUser.Edges.ProjectUsers {
+			if up.ProjectID == projectID && up.IsOwner {
+				isProjectOwner = true
+				break
+			}
+		}
+	}
+
+	if !isProjectOwner {
+		return nil, fmt.Errorf("permission denied: only project owners can view usage statistics")
+	}
+
+	// For owners/system owners, we allow querying all logs within the project
+	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+
+	var since time.Time
+	var until time.Time
+	applyGTE := false
+	applyLTE := false
+
+	if timeWindow != nil && *timeWindow != "" {
+		if val, cut := strings.CutPrefix(*timeWindow, "custom:"); cut {
+			parts := strings.Split(val, ",")
+			if len(parts) == 2 {
+				if t1, err := time.Parse(time.RFC3339, parts[0]); err == nil {
+					since = t1
+					applyGTE = true
+				}
+				if t2, err := time.Parse(time.RFC3339, parts[1]); err == nil {
+					until = t2
+					applyLTE = true
+				}
+			}
+		} else {
+			var applyFilter bool
+			since, applyFilter = r.parseTimeWindow(ctx, timeWindow)
+			applyGTE = applyFilter
+		}
+	}
+
+	type userUsageStats struct {
+		UserID      int     `json:"user_id"`
+		FirstName   string  `json:"first_name"`
+		LastName    string  `json:"last_name"`
+		Email       string  `json:"email"`
+		Count       int     `json:"request_count"`
+		TotalTokens int64   `json:"total_tokens"`
+		TotalCost   float64 `json:"total_cost"`
+	}
+
+	var results []userUsageStats
+
+	query := r.client.UsageLog.Query().
+		Where(usagelog.APIKeyIDNotNil()).
+		Where(usagelog.ProjectIDEQ(projectID))
+
+	if applyGTE {
+		query = query.Where(usagelog.CreatedAtGTE(since))
+	}
+	if applyLTE {
+		query = query.Where(usagelog.CreatedAtLTE(until))
+	}
+
+	err := query.Modify(func(s *sql.Selector) {
+		apiKeyTable := sql.Table(apikey.Table)
+		userTable := sql.Table("users")
+
+		s.Join(apiKeyTable).On(
+			s.C(usagelog.FieldAPIKeyID),
+			apiKeyTable.C(apikey.FieldID),
+		)
+		s.Join(userTable).On(
+			apiKeyTable.C(apikey.FieldUserID),
+			userTable.C("id"),
+		)
+
+		s.Where(sql.EQ(apiKeyTable.C(apikey.FieldDeletedAt), 0))
+
+		s.Select(
+			sql.As(userTable.C("id"), "user_id"),
+			sql.As(userTable.C("first_name"), "first_name"),
+			sql.As(userTable.C("last_name"), "last_name"),
+			sql.As(userTable.C("email"), "email"),
+			sql.As(sql.Count(s.C(usagelog.FieldID)), "request_count"),
+			sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldTotalTokens)), "total_tokens"),
+			sql.As(fmt.Sprintf("COALESCE(SUM(%s), 0)", s.C(usagelog.FieldTotalCost)), "total_cost"),
+		).
+			GroupBy(
+				userTable.C("id"),
+				userTable.C("first_name"),
+				userTable.C("last_name"),
+				userTable.C("email"),
+			).
+			OrderBy(sql.Desc("request_count"))
+	}).Scan(ctx, &results)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get usage stats by user: %w", err)
+	}
+
+	return lo.Map(results, func(item userUsageStats, _ int) *UsageStatsByUser {
+		userName := fmt.Sprintf("%s %s", item.FirstName, item.LastName)
+		userName = strings.TrimSpace(userName)
+		if userName == "" {
+			userName = item.Email
+		}
+		return &UsageStatsByUser{
+			UserID:       objects.GUID{Type: ent.TypeUser, ID: item.UserID},
+			UserName:     userName,
+			RequestCount: item.Count,
+			TotalTokens:  int(item.TotalTokens),
+			TotalCost:    item.TotalCost,
+		}
+	}), nil
 }

@@ -19,10 +19,16 @@ func DefaultModels() []string {
 		"gpt-5.3-codex-spark",
 		"gpt-5.4",
 		"gpt-5.4-mini",
+		"gpt-5.5",
+		"gpt-5.6-sol",
+		"gpt-5.6-terra",
+		"gpt-5.6-luna",
 	}
 }
 
 const (
+	defaultImageMainModel = "gpt-5.4-mini"
+
 	AxonHubOriginator = "axonhub"
 	AuthorizeURL      = "https://auth.openai.com/oauth/authorize"
 	//nolint:gosec // false alert.
@@ -30,4 +36,10 @@ const (
 	ClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
 	RedirectURI = "http://localhost:1455/auth/callback"
 	Scopes      = "openid profile email offline_access"
+
+	codexDefaultVersion = "0.144.1"
+
+	// fabricatedBetaFeatures mirrors the X-Codex-Beta-Features value the current
+	// Codex CLI sends, used when a non-Codex inbound client omits the header.
+	fabricatedBetaFeatures = "remote_compaction_v2"
 )
