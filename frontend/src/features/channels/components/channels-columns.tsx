@@ -19,9 +19,12 @@ import {
   IconCopy,
   IconCoin,
   IconLoader2,
+  IconKey,
   IconKeyOff,
   IconGauge,
   IconHistory,
+  IconPlugConnected,
+  IconClockPlay,
 } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
@@ -45,6 +48,7 @@ import { useTestChannel, useUpdateChannel } from '../data/channels';
 import { CHANNEL_CONFIGS, getProvider } from '../data/config_channels';
 import { Channel } from '../data/schema';
 import { ChannelHealthCell } from './channel-health-cell';
+import { ChannelLimiterCell } from './channel-limiter-cell';
 import { ChannelsStatusDialog } from './channels-status-dialog';
 
 const WEIGHT_PRECISION = 4;
@@ -58,6 +62,7 @@ const clampWeight = (value: number) => formatWeight(Math.min(MAX_WEIGHT, Math.ma
 const StatusSwitchCell = memo(({ row }: { row: Row<Channel> }) => {
   const channel = row.original;
   const [dialogOpen, setDialogOpen] = useState(false);
+  const { channelPermissions } = usePermissions();
 
   const isEnabled = channel.status === 'enabled';
   const isArchived = channel.status === 'archived';
@@ -67,6 +72,10 @@ const StatusSwitchCell = memo(({ row }: { row: Row<Channel> }) => {
       setDialogOpen(true);
     }
   }, [isArchived]);
+
+  if (!channelPermissions.canWrite) {
+    return <Badge variant='outline'>{channel.status}</Badge>;
+  }
 
   return (
     <div className='flex justify-center'>
@@ -88,8 +97,6 @@ const ActionCell = memo(({ row }: { row: Row<Channel> }) => {
   const isArchived = channel.status === 'archived';
   const hasError = !!channel.errorMessage;
   const hasDisabledAPIKeys = channelPermissions.canWrite && (channel.disabledAPIKeys?.length ?? 0) > 0;
-  const apiKeysCount = channel.credentials?.apiKeys?.filter((key) => key.trim().length > 0).length ?? 0;
-  const hasMultipleAPIKeys = channelPermissions.canWrite && apiKeysCount > 1;
 
   const handleDefaultTest = async () => {
     try {
@@ -204,15 +211,37 @@ const ActionCell = memo(({ row }: { row: Row<Channel> }) => {
             <IconGauge size={16} className='mr-2' />
             {t('channels.dialogs.rateLimit.action')}
           </DropdownMenuItem>
-          {hasMultipleAPIKeys && (
+          {channel.type !== 'xai_subscription' && (
             <DropdownMenuItem
               onClick={() => {
                 setCurrentRow(channel);
-                setOpen('testAPIKeys');
+                setOpen('endpoints');
               }}
             >
-              <IconPlayerPlay size={16} className='mr-2' />
-              {t('channels.actions.testAPIKeys', { count: apiKeysCount })}
+              <IconPlugConnected size={16} className='mr-2' />
+              {t('channels.endpoints.title')}
+            </DropdownMenuItem>
+          )}
+          {channelPermissions.canWrite && (
+            <DropdownMenuItem
+              onClick={() => {
+                setCurrentRow(channel);
+                setOpen('keyManagement');
+              }}
+            >
+              <IconKey size={16} className='mr-2' />
+              {t('channels.actions.keyManagement')}
+            </DropdownMenuItem>
+          )}
+          {channelPermissions.canWrite && (
+            <DropdownMenuItem
+              onClick={() => {
+                setCurrentRow(channel);
+                setOpen('availability');
+              }}
+            >
+              <IconClockPlay size={16} className='mr-2' />
+              {t('channels.dialogs.availability.action')}
             </DropdownMenuItem>
           )}
           {hasDisabledAPIKeys && (
@@ -331,47 +360,42 @@ const NameCell = memo(({ row }: { row: Row<Channel> }) => {
     <div className={cn('truncate font-medium', hasError && 'text-destructive')}>{row.getValue('name')}</div>
   );
 
+  // Both indicators are shown independently: a channel disabled because every
+  // credential is unavailable carries an error *and* disabled credentials, and
+  // hiding the key icon behind the error would lose the reason it went down.
   const content = (
     <div className='flex justify-center'>
       <div className='flex max-w-56 items-center gap-2'>
         {hasError && <IconAlertTriangle className='text-destructive h-4 w-4 shrink-0' />}
-        {!hasError && hasDisabledKeys && <IconKeyOff className='h-4 w-4 shrink-0 text-amber-500' />}
+        {hasDisabledKeys && <IconKeyOff className='h-4 w-4 shrink-0 text-amber-500' />}
         {nameElement}
       </div>
     </div>
   );
 
-  if (hasError) {
-    return (
-      <Tooltip>
-        <TooltipTrigger asChild>{content}</TooltipTrigger>
-        <TooltipContent>
-          <div className='space-y-1'>
+  if (!hasError && !hasDisabledKeys) {
+    return content;
+  }
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{content}</TooltipTrigger>
+      <TooltipContent>
+        <div className='space-y-1'>
+          {hasError && (
             <p className='text-destructive text-sm'>
               {t(`channels.messages.${channel.errorMessage}`, {
                 defaultValue: channel.errorMessage,
               })}
             </p>
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    );
-  }
-
-  if (hasDisabledKeys) {
-    return (
-      <Tooltip>
-        <TooltipTrigger asChild>{content}</TooltipTrigger>
-        <TooltipContent>
-          <p className='text-sm text-amber-500'>
-            {t('channels.actions.disabledAPIKeys', { count: disabledKeysCount })}
-          </p>
-        </TooltipContent>
-      </Tooltip>
-    );
-  }
-
-  return content;
+          )}
+          {hasDisabledKeys && (
+            <p className='text-sm text-amber-500'>{t('channels.actions.disabledAPIKeys', { count: disabledKeysCount })}</p>
+          )}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
 });
 
 NameCell.displayName = 'NameCell';
@@ -515,6 +539,7 @@ const OrderingWeightCell = memo(({ row }: { row: Row<Channel> }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [weight, setWeight] = useState<string>(initialWeight?.toString() || '1');
   const updateChannel = useUpdateChannel();
+  const { channelPermissions } = usePermissions();
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -558,6 +583,10 @@ const OrderingWeightCell = memo(({ row }: { row: Row<Channel> }) => {
     },
     [handleSave, initialWeight]
   );
+
+  if (!channelPermissions.canWrite) {
+    return <span className={cn('font-mono text-sm', initialWeight == null && 'text-muted-foreground')}>{initialWeight ?? '-'}</span>;
+  }
 
   if (isEditing) {
     return (
@@ -751,9 +780,11 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('channels.columns.health')} className='justify-center' />,
       cell: ({ row }: { row: Row<Channel> }) => {
         const probePoints = (row.original as any).probePoints || [];
+        const limiterStats = row.original.liveLimiterStats;
         return (
-          <div className='flex justify-center'>
+          <div className='flex flex-col items-center gap-1'>
             <ChannelHealthCell points={probePoints} />
+            {limiterStats ? <ChannelLimiterCell stats={limiterStats} /> : null}
           </div>
         );
       },

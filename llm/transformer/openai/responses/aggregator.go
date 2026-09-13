@@ -12,6 +12,10 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 )
 
+// maxAggregatedContentParts bounds provider-controlled content indexes before
+// the aggregator expands its dense content-part storage.
+const maxAggregatedContentParts = 1024
+
 // streamAggregator holds the state for aggregating stream chunks.
 type streamAggregator struct {
 	// Response metadata
@@ -29,6 +33,10 @@ type streamAggregator struct {
 
 	// Usage
 	usage *Usage
+
+	// Terminal response details
+	responseError     *Error
+	incompleteDetails *ResponseIncompleteDetails
 }
 
 // aggregatedItem holds the accumulated state for an output item.
@@ -39,11 +47,15 @@ type aggregatedItem struct {
 	Role             string
 	CallID           string
 	Name             string
+	Namespace        string
 	Arguments        *strings.Builder
 	EncryptedContent *string
 
 	// For custom_tool_call type
 	Input *string
+
+	// For image_generation_call type
+	Result *string
 
 	// For message type
 	Content []*aggregatedContentPart
@@ -60,8 +72,9 @@ type aggregatedSummaryPart struct {
 
 // aggregatedContentPart holds the accumulated state for a content part.
 type aggregatedContentPart struct {
-	Type string
-	Text *strings.Builder
+	Type        string
+	Text        *strings.Builder
+	Annotations []Annotation
 }
 
 func newAggregatedItem() *aggregatedItem {
@@ -77,6 +90,29 @@ func newAggregatedContentPart() *aggregatedContentPart {
 	}
 }
 
+// validAggregatedContentIndex reports whether an upstream content index is safe
+// to store in the aggregator's bounded dense representation.
+func validAggregatedContentIndex(contentIndex int) bool {
+	return contentIndex >= 0 && contentIndex < maxAggregatedContentParts
+}
+
+// ensureContentPart returns the content part at a validated bounded index.
+func ensureContentPart(item *aggregatedItem, contentIndex int) *aggregatedContentPart {
+	if item == nil || !validAggregatedContentIndex(contentIndex) {
+		return nil
+	}
+
+	for len(item.Content) <= contentIndex {
+		item.Content = append(item.Content, newAggregatedContentPart())
+	}
+
+	if item.Content[contentIndex] == nil {
+		item.Content[contentIndex] = newAggregatedContentPart()
+	}
+
+	return item.Content[contentIndex]
+}
+
 func ensureSummaryPart(item *aggregatedItem, summaryIndex int) *aggregatedSummaryPart {
 	if item == nil {
 		return nil
@@ -90,9 +126,11 @@ func ensureSummaryPart(item *aggregatedItem, summaryIndex int) *aggregatedSummar
 		if part.Text == nil {
 			part.Text = &strings.Builder{}
 		}
+
 		if part.Type == "" {
 			part.Type = "summary_text"
 		}
+
 		return part
 	}
 
@@ -101,6 +139,7 @@ func ensureSummaryPart(item *aggregatedItem, summaryIndex int) *aggregatedSummar
 		Text: &strings.Builder{},
 	}
 	item.SummaryParts[summaryIndex] = part
+
 	return part
 }
 
@@ -199,7 +238,7 @@ func AggregateStreamChunks(_ context.Context, chunks []*httpclient.StreamEvent) 
 	return body, meta, nil
 }
 
-//nolint:gocognit // Event processing is inherently complex.
+//nolint:gocognit,maintidx // Event processing is inherently complex.
 func (a *streamAggregator) processEvent(ev *StreamEvent) {
 	//nolint:exhaustive //Only process events we care about.
 	switch ev.Type {
@@ -221,6 +260,7 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 		if ev.Item != nil && ev.Item.ID != "" {
 			item = a.outputItemsByID[ev.Item.ID]
 		}
+
 		if item == nil {
 			item = newAggregatedItem()
 			item.Status = "in_progress"
@@ -233,6 +273,7 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 			item.Role = ev.Item.Role
 			item.CallID = ev.Item.CallID
 			item.Name = ev.Item.Name
+			item.Namespace = ev.Item.Namespace
 			item.Arguments.WriteString(ev.Item.Arguments)
 			item.EncryptedContent = ev.Item.EncryptedContent
 			item.Input = ev.Item.Input
@@ -258,9 +299,10 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 
 			if ev.Part != nil {
 				contentPart.Type = ev.Part.Type
-				if ev.Part.Text != nil {
-					contentPart.Text.WriteString(*ev.Part.Text)
+				if ev.Part.Text != "" {
+					contentPart.Text.WriteString(ev.Part.Text)
 				}
+				contentPart.Annotations = append([]Annotation(nil), ev.Part.Annotations...)
 			}
 
 			item.Content = append(item.Content, contentPart)
@@ -298,6 +340,10 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 					item.Name = ev.Name
 				}
 
+				if ev.Namespace != "" {
+					item.Namespace = ev.Namespace
+				}
+
 				if ev.Arguments != "" {
 					// Replace accumulated arguments with final version
 					item.Arguments.Reset()
@@ -330,22 +376,26 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 		if item == nil {
 			item = newAggregatedItem()
 			item.Type = "reasoning"
+
 			item.Status = "in_progress"
 			if ev.ItemID != nil && *ev.ItemID != "" {
 				item.ID = *ev.ItemID
 				a.outputItemsByID[item.ID] = item
 			}
+
 			a.outputItems[ev.OutputIndex] = append(a.outputItems[ev.OutputIndex], item)
 		}
 
 		summaryIndex := lo.FromPtr(ev.SummaryIndex)
 		part := ensureSummaryPart(item, summaryIndex)
+
 		if ev.Part != nil {
 			if ev.Part.Type != "" {
 				part.Type = ev.Part.Type
 			}
-			if ev.Part.Text != nil {
-				part.Text.WriteString(*ev.Part.Text)
+
+			if ev.Part.Text != "" {
+				part.Text.WriteString(ev.Part.Text)
 			}
 		}
 
@@ -354,24 +404,29 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 		if item == nil {
 			item = newAggregatedItem()
 			item.Type = "reasoning"
+
 			item.Status = "in_progress"
 			if ev.ItemID != nil && *ev.ItemID != "" {
 				item.ID = *ev.ItemID
 				a.outputItemsByID[item.ID] = item
 			}
+
 			a.outputItems[ev.OutputIndex] = append(a.outputItems[ev.OutputIndex], item)
 		}
 
 		summaryIndex := lo.FromPtr(ev.SummaryIndex)
 		part := ensureSummaryPart(item, summaryIndex)
+
 		if ev.Part != nil {
 			if ev.Part.Type != "" {
 				part.Type = ev.Part.Type
 			}
-			if ev.Part.Text != nil {
-				applyDoneText(part.Text, *ev.Part.Text)
+
+			if ev.Part.Text != "" {
+				applyDoneText(part.Text, ev.Part.Text)
 			}
 		}
+
 		part.Final = true
 
 	case StreamEventTypeReasoningSummaryTextDelta:
@@ -379,13 +434,16 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 		if item == nil {
 			item = newAggregatedItem()
 			item.Type = "reasoning"
+
 			item.Status = "in_progress"
 			if ev.ItemID != nil && *ev.ItemID != "" {
 				item.ID = *ev.ItemID
 				a.outputItemsByID[item.ID] = item
 			}
+
 			a.outputItems[ev.OutputIndex] = append(a.outputItems[ev.OutputIndex], item)
 		}
+
 		summaryIndex := lo.FromPtr(ev.SummaryIndex)
 		part := ensureSummaryPart(item, summaryIndex)
 		part.Text.WriteString(ev.Delta)
@@ -395,6 +453,31 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 		if item == nil {
 			item = newAggregatedItem()
 			item.Type = "reasoning"
+
+			item.Status = "in_progress"
+			if ev.ItemID != nil && *ev.ItemID != "" {
+				item.ID = *ev.ItemID
+				a.outputItemsByID[item.ID] = item
+			}
+
+			a.outputItems[ev.OutputIndex] = append(a.outputItems[ev.OutputIndex], item)
+		}
+
+		summaryIndex := lo.FromPtr(ev.SummaryIndex)
+		part := ensureSummaryPart(item, summaryIndex)
+		applyDoneText(part.Text, ev.Text)
+		part.Final = true
+
+	case StreamEventTypeReasoningTextDelta:
+		contentIndex := lo.FromPtr(ev.ContentIndex)
+		if !validAggregatedContentIndex(contentIndex) {
+			return
+		}
+
+		item := a.getItemForEvent(ev.OutputIndex, ev.ItemID)
+		if item == nil {
+			item = newAggregatedItem()
+			item.Type = "reasoning"
 			item.Status = "in_progress"
 			if ev.ItemID != nil && *ev.ItemID != "" {
 				item.ID = *ev.ItemID
@@ -402,10 +485,38 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 			}
 			a.outputItems[ev.OutputIndex] = append(a.outputItems[ev.OutputIndex], item)
 		}
-		summaryIndex := lo.FromPtr(ev.SummaryIndex)
-		part := ensureSummaryPart(item, summaryIndex)
+
+		part := ensureContentPart(item, contentIndex)
+		if part == nil {
+			return
+		}
+		part.Type = "reasoning_text"
+		part.Text.WriteString(ev.Delta)
+
+	case StreamEventTypeReasoningTextDone:
+		contentIndex := lo.FromPtr(ev.ContentIndex)
+		if !validAggregatedContentIndex(contentIndex) {
+			return
+		}
+
+		item := a.getItemForEvent(ev.OutputIndex, ev.ItemID)
+		if item == nil {
+			item = newAggregatedItem()
+			item.Type = "reasoning"
+			item.Status = "in_progress"
+			if ev.ItemID != nil && *ev.ItemID != "" {
+				item.ID = *ev.ItemID
+				a.outputItemsByID[item.ID] = item
+			}
+			a.outputItems[ev.OutputIndex] = append(a.outputItems[ev.OutputIndex], item)
+		}
+
+		part := ensureContentPart(item, contentIndex)
+		if part == nil {
+			return
+		}
+		part.Type = "reasoning_text"
 		applyDoneText(part.Text, ev.Text)
-		part.Final = true
 
 	case StreamEventTypeOutputItemDone:
 		// Mark item as completed and update with final data
@@ -414,6 +525,7 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 			if item == nil {
 				item = a.lastItemByOutputIndex(ev.OutputIndex)
 			}
+
 			if item != nil {
 				if ev.Item.Status != nil {
 					item.Status = *ev.Item.Status
@@ -429,6 +541,24 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 					item.Arguments.WriteString(ev.Item.Arguments)
 				}
 
+				if ev.Item.Content != nil {
+					for idx, contentItem := range ev.Item.Content.Items {
+						part := ensureContentPart(item, idx)
+						if part == nil {
+							continue
+						}
+						if contentItem.Type != "" {
+							part.Type = contentItem.Type
+						}
+						if contentItem.Text != nil {
+							applyDoneText(part.Text, *contentItem.Text)
+						}
+						if contentItem.Annotations != nil {
+							part.Annotations = append([]Annotation(nil), contentItem.Annotations...)
+						}
+					}
+				}
+
 				if len(ev.Item.Summary) > 0 {
 					for idx, s := range ev.Item.Summary {
 						part := ensureSummaryPart(item, idx)
@@ -440,6 +570,10 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 
 				if ev.Item.EncryptedContent != nil {
 					item.EncryptedContent = ev.Item.EncryptedContent
+				}
+
+				if ev.Item.Result != nil {
+					item.Result = ev.Item.Result
 				}
 			}
 		}
@@ -454,10 +588,53 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 		}
 
 	case StreamEventTypeResponseFailed:
-		a.status = "failed"
+		a.applyResponseSnapshot(ev.Response)
+		if ev.Response == nil || ev.Response.Status == nil {
+			a.status = "failed"
+		}
+
+	case StreamEventTypeResponseCancelled:
+		a.applyResponseSnapshot(ev.Response)
+		if ev.Response == nil || ev.Response.Status == nil {
+			a.status = "canceled"
+		}
 
 	case StreamEventTypeResponseIncomplete:
-		a.status = "incomplete"
+		a.applyResponseSnapshot(ev.Response)
+		if ev.Response == nil || ev.Response.Status == nil {
+			a.status = "incomplete"
+		}
+	}
+}
+
+func (a *streamAggregator) applyResponseSnapshot(response *Response) {
+	if response == nil {
+		return
+	}
+
+	if response.ID != "" {
+		a.responseID = response.ID
+	}
+	if response.Model != "" {
+		a.model = response.Model
+	}
+	if response.CreatedAt != 0 {
+		a.createdAt = response.CreatedAt
+	}
+	if response.PreviousResponseID != nil {
+		a.previousResponseID = response.PreviousResponseID
+	}
+	if response.Status != nil {
+		a.status = *response.Status
+	}
+	if response.Usage != nil {
+		a.usage = response.Usage
+	}
+	if response.Error != nil {
+		a.responseError = response.Error
+	}
+	if response.IncompleteDetails != nil {
+		a.incompleteDetails = response.IncompleteDetails
 	}
 }
 
@@ -489,8 +666,9 @@ func (a *streamAggregator) buildResponse() *Response {
 				for _, cp := range item.Content {
 					text := cp.Text.String()
 					contentItems = append(contentItems, Item{
-						Type: cp.Type,
-						Text: &text,
+						Type:        cp.Type,
+						Text:        &text,
+						Annotations: append([]Annotation(nil), cp.Annotations...),
 					})
 				}
 
@@ -511,6 +689,7 @@ func (a *streamAggregator) buildResponse() *Response {
 					Status:    lo.ToPtr(item.Status),
 					CallID:    item.CallID,
 					Name:      item.Name,
+					Namespace: item.Namespace,
 					Arguments: item.Arguments.String(),
 				})
 
@@ -525,41 +704,76 @@ func (a *streamAggregator) buildResponse() *Response {
 				})
 
 			case "reasoning":
-				var summary []ReasoningSummary
-				if len(item.SummaryParts) > 0 {
-					maxSummaryIndex := -1
-					for idx := range item.SummaryParts {
-						if idx > maxSummaryIndex {
-							maxSummaryIndex = idx
+				{
+					var summary []ReasoningSummary
+					var content *Input
+
+					if len(item.SummaryParts) > 0 {
+						maxSummaryIndex := -1
+						for idx := range item.SummaryParts {
+							if idx > maxSummaryIndex {
+								maxSummaryIndex = idx
+							}
+						}
+
+						summary = make([]ReasoningSummary, 0, maxSummaryIndex+1)
+						for idx := 0; idx <= maxSummaryIndex; idx++ {
+							sp, ok := item.SummaryParts[idx]
+							if !ok || sp == nil {
+								summary = append(summary, ReasoningSummary{Type: "summary_text", Text: ""})
+								continue
+							}
+
+							summaryType := sp.Type
+							if summaryType == "" {
+								summaryType = "summary_text"
+							}
+
+							var text string
+							if sp.Text != nil {
+								text = sp.Text.String()
+							}
+
+							summary = append(summary, ReasoningSummary{Type: summaryType, Text: text})
 						}
 					}
 
-					summary = make([]ReasoningSummary, 0, maxSummaryIndex+1)
-					for idx := 0; idx <= maxSummaryIndex; idx++ {
-						sp, ok := item.SummaryParts[idx]
-						if !ok || sp == nil {
-							summary = append(summary, ReasoningSummary{Type: "summary_text", Text: ""})
-							continue
+					if len(item.Content) > 0 {
+						contentItems := make([]Item, 0, len(item.Content))
+						for _, part := range item.Content {
+							text := part.Text.String()
+							contentType := part.Type
+							if contentType == "" {
+								contentType = "reasoning_text"
+							}
+							contentItems = append(contentItems, Item{Type: contentType, Text: &text})
 						}
-
-						summaryType := sp.Type
-						if summaryType == "" {
-							summaryType = "summary_text"
-						}
-
-						var text string
-						if sp.Text != nil {
-							text = sp.Text.String()
-						}
-						summary = append(summary, ReasoningSummary{Type: summaryType, Text: text})
+						content = &Input{Items: contentItems}
 					}
+
+					output = append(output, Item{
+						ID:               item.ID,
+						Type:             item.Type,
+						Status:           lo.ToPtr(item.Status),
+						Summary:          summary,
+						Content:          content,
+						EncryptedContent: item.EncryptedContent,
+					})
 				}
 
+			case "image_generation_call":
+				output = append(output, Item{
+					ID:     item.ID,
+					Type:   item.Type,
+					Status: lo.ToPtr(item.Status),
+					CallID: item.CallID,
+					Result: item.Result,
+				})
+
+			case "compaction", "compaction_summary":
 				output = append(output, Item{
 					ID:               item.ID,
 					Type:             item.Type,
-					Status:           lo.ToPtr(item.Status),
-					Summary:          summary,
 					EncryptedContent: item.EncryptedContent,
 				})
 
@@ -584,5 +798,7 @@ func (a *streamAggregator) buildResponse() *Response {
 		Output:             output,
 		Usage:              a.usage,
 		PreviousResponseID: a.previousResponseID,
+		Error:              a.responseError,
+		IncompleteDetails:  a.incompleteDetails,
 	}
 }

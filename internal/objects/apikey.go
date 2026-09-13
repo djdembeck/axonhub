@@ -12,10 +12,16 @@ type APIKeyProfiles struct {
 }
 
 type APIKeyProfile struct {
-	Name                string         `json:"name"`
+	Name string `json:"name"`
+	// TemplateID links this profile to the template it was loaded from. A nil
+	// value means the profile is independently managed. The pointer keeps old
+	// serialized profiles fully backward compatible.
+	TemplateID          *int           `json:"templateID,omitempty"`
+	TemplateName        string         `json:"templateName,omitempty"`
 	ModelMappings       []ModelMapping `json:"modelMappings"`
 	Quota               *APIKeyQuota   `json:"quota,omitempty"`
 	LoadBalanceStrategy *string        `json:"loadBalanceStrategy,omitempty"`
+	TraceStickyMode     *string        `json:"traceStickyMode,omitempty"`
 
 	ChannelIDs           []int                `json:"channelIDs,omitempty"`
 	ChannelTags          []string             `json:"channelTags,omitempty"`
@@ -85,6 +91,75 @@ func MatchChannelTags(allowedTags []string, matchMode ChannelTagsMatchMode, chan
 
 		return false
 	}
+}
+
+func (p *APIKeyProfile) Clone() *APIKeyProfile {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	if p.TemplateID != nil {
+		id := *p.TemplateID
+		cp.TemplateID = &id
+	}
+	if len(p.ModelMappings) > 0 {
+		cp.ModelMappings = make([]ModelMapping, len(p.ModelMappings))
+		copy(cp.ModelMappings, p.ModelMappings)
+	}
+	if p.Quota != nil {
+		q := *p.Quota
+		if q.Requests != nil {
+			r := *q.Requests
+			q.Requests = &r
+		}
+		if q.TotalTokens != nil {
+			tt := *q.TotalTokens
+			q.TotalTokens = &tt
+		}
+		if q.Cost != nil {
+			c := *q.Cost
+			q.Cost = &c
+		}
+		q.Period = p.Quota.Period.clone()
+		cp.Quota = &q
+	}
+	if len(p.ChannelIDs) > 0 {
+		cp.ChannelIDs = make([]int, len(p.ChannelIDs))
+		copy(cp.ChannelIDs, p.ChannelIDs)
+	}
+	if len(p.ChannelTags) > 0 {
+		cp.ChannelTags = make([]string, len(p.ChannelTags))
+		copy(cp.ChannelTags, p.ChannelTags)
+	}
+	if len(p.ModelIDs) > 0 {
+		cp.ModelIDs = make([]string, len(p.ModelIDs))
+		copy(cp.ModelIDs, p.ModelIDs)
+	}
+	if p.LoadBalanceStrategy != nil {
+		s := *p.LoadBalanceStrategy
+		cp.LoadBalanceStrategy = &s
+	}
+	if p.TraceStickyMode != nil {
+		s := *p.TraceStickyMode
+		cp.TraceStickyMode = &s
+	}
+	return &cp
+}
+
+func (p *APIKeyQuotaPeriod) clone() APIKeyQuotaPeriod {
+	if p == nil {
+		return APIKeyQuotaPeriod{}
+	}
+	cp := *p
+	if p.PastDuration != nil {
+		pd := *p.PastDuration
+		cp.PastDuration = &pd
+	}
+	if p.CalendarDuration != nil {
+		cd := *p.CalendarDuration
+		cp.CalendarDuration = &cd
+	}
+	return cp
 }
 
 type APIKeyQuota struct {

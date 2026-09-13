@@ -1,19 +1,156 @@
 package httpclient
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/tmaxmax/go-sse"
 )
+
+func TestHttpClientImpl_Do_DoesNotLogSecrets(t *testing.T) {
+	// Given
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"access_token":"response-secret"}`))
+	}))
+	t.Cleanup(target.Close)
+	var proxied atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		proxied.Store(true)
+		require.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("proxy-user:proxy-secret")), request.Header.Get("Proxy-Authorization"))
+		forward, err := http.NewRequestWithContext(request.Context(), request.Method, target.URL+request.URL.RequestURI(), request.Body)
+		if err != nil {
+			writer.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		forward.Header = request.Header.Clone()
+		forward.Header.Del("Proxy-Authorization")
+		response, err := http.DefaultClient.Do(forward)
+		if err != nil {
+			writer.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer response.Body.Close()
+		for name, values := range response.Header {
+			for _, value := range values {
+				writer.Header().Add(name, value)
+			}
+		}
+		writer.WriteHeader(response.StatusCode)
+		body, _ := io.ReadAll(response.Body)
+		_, _ = writer.Write(body)
+	}))
+	t.Cleanup(proxy.Close)
+	client := NewHttpClientWithClient(&http.Client{Transport: &http.Transport{
+		Proxy: getProxyFunc(&ProxyConfig{Type: ProxyTypeURL, URL: proxy.URL + "?key=proxy-query-secret", Username: "proxy-user", Password: "proxy-secret"}),
+	}})
+	request := &Request{
+		Method:      http.MethodPost,
+		URL:         target.URL + "/oauth/token?key=query-secret",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        []byte("refresh_token=request-secret"),
+		JSONBody:    []byte(`{"access_token":"json-secret"}`),
+		Auth:        &AuthConfig{Type: AuthTypeBearer, APIKey: "auth-secret"},
+	}
+
+	// When
+	_, err := client.Do(t.Context(), request)
+
+	// Then
+	require.NoError(t, err)
+	require.True(t, proxied.Load(), "request should have traversed the proxy")
+	output := logs.String()
+	for _, secret := range []string{"request-secret", "json-secret", "auth-secret", "proxy-user", "proxy-secret", "proxy-query-secret", "response-secret", "query-secret"} {
+		require.NotContains(t, output, secret)
+	}
+	require.Contains(t, output, "use custom proxy")
+	require.Contains(t, output, "execute http request")
+	require.Contains(t, output, "body_size")
+	require.Contains(t, output, "/oauth/token")
+	require.NotContains(t, output, "key=query-secret")
+}
+
+func TestHttpClientImpl_DoFailed_DoesNotLogSecrets(t *testing.T) {
+	// Given
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusBadRequest)
+		_, _ = writer.Write([]byte(`{"error":"auth-secret rejected"}`))
+	}))
+	t.Cleanup(server.Close)
+	client := NewHttpClientWithClient(server.Client())
+	request := &Request{
+		Method:      http.MethodPost,
+		URL:         server.URL + "/fail?key=fail-query-secret",
+		ContentType: "application/json",
+		Body:        []byte(`{"refresh_token":"fail-request-secret"}`),
+	}
+
+	// When
+	_, err := client.Do(t.Context(), request)
+
+	// Then
+	require.Error(t, err)
+	output := logs.String()
+	for _, secret := range []string{"fail-request-secret", "auth-secret", "fail-query-secret"} {
+		require.NotContains(t, output, secret)
+	}
+	require.Contains(t, output, "/fail")
+}
+
+func TestHttpClientImpl_DoStream_DoesNotLogSecrets(t *testing.T) {
+	// Given
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte(`data: {"access_token":"stream-secret"}\n\n`))
+	}))
+	t.Cleanup(server.Close)
+	client := NewHttpClientWithClient(server.Client())
+	request := &Request{
+		Method: http.MethodPost,
+		URL:    server.URL + "/stream?key=stream-query-secret",
+		Body:   []byte(`{"refresh_token":"stream-request-secret"}`),
+	}
+
+	// When
+	stream, err := client.DoStream(t.Context(), request)
+
+	// Then
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = stream.Close() })
+	output := logs.String()
+	for _, secret := range []string{"stream-request-secret", "stream-secret", "stream-query-secret"} {
+		require.NotContains(t, output, secret)
+	}
+	require.Contains(t, output, "/stream")
+}
 
 func TestHttpClientImpl_Do(t *testing.T) {
 	tests := []struct {
@@ -279,6 +416,97 @@ func TestNewHttpClient_WithInsecureSkipVerify_PreservesDefaultTransportSettings(
 	require.NotNil(t, tr.Proxy)
 	require.NotNil(t, tr.TLSClientConfig)
 	require.True(t, tr.TLSClientConfig.InsecureSkipVerify)
+}
+
+type proxyConnectionIDContextKey struct{}
+
+func TestNewHttpClientWithProxy_ConnectionReuse(t *testing.T) {
+	tests := []struct {
+		name                    string
+		disableConnectionReuse  bool
+		wantDistinctConnections int
+	}{
+		{
+			name:                    "reuses proxy connection by default",
+			wantDistinctConnections: 1,
+		},
+		{
+			name:                    "uses a new proxy connection for every request when disabled",
+			disableConnectionReuse:  true,
+			wantDistinctConnections: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var nextConnectionID atomic.Int64
+			var connectionIDsMu sync.Mutex
+			connectionIDs := make([]int64, 0, 2)
+
+			proxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				connectionID, ok := r.Context().Value(proxyConnectionIDContextKey{}).(int64)
+				require.True(t, ok)
+
+				connectionIDsMu.Lock()
+				connectionIDs = append(connectionIDs, connectionID)
+				connectionIDsMu.Unlock()
+
+				w.Header().Set("Content-Type", "application/json")
+				_, err := w.Write([]byte(`{"ok":true}`))
+				require.NoError(t, err)
+			}))
+			proxy.Config.ConnContext = func(ctx context.Context, _ net.Conn) context.Context {
+				return context.WithValue(ctx, proxyConnectionIDContextKey{}, nextConnectionID.Add(1))
+			}
+			proxy.Start()
+			defer proxy.Close()
+
+			client := NewHttpClientWithProxy(&ProxyConfig{
+				Type:                   ProxyTypeURL,
+				URL:                    proxy.URL,
+				DisableConnectionReuse: tt.disableConnectionReuse,
+			})
+			defer client.GetNativeClient().CloseIdleConnections()
+			transport, ok := client.GetNativeClient().Transport.(*http.Transport)
+			require.True(t, ok)
+			require.Equal(t, tt.disableConnectionReuse, transport.DisableKeepAlives)
+			require.Equal(t, !tt.disableConnectionReuse, transport.ForceAttemptHTTP2)
+
+			for range 2 {
+				_, err := client.Do(t.Context(), &Request{
+					Method: http.MethodGet,
+					URL:    "http://upstream.example/test",
+				})
+				require.NoError(t, err)
+			}
+
+			connectionIDsMu.Lock()
+			defer connectionIDsMu.Unlock()
+
+			require.Len(t, connectionIDs, 2)
+			require.Len(t, map[int64]struct{}{
+				connectionIDs[0]: {},
+				connectionIDs[1]: {},
+			}, tt.wantDistinctConnections)
+		})
+	}
+}
+
+func TestNewHttpClientWithProxy_DisableConnectionReuseOnlyAppliesToURLProxy(t *testing.T) {
+	for _, proxyType := range []ProxyType{ProxyTypeDisabled, ProxyTypeEnvironment} {
+		t.Run(string(proxyType), func(t *testing.T) {
+			client := NewHttpClientWithProxy(&ProxyConfig{
+				Type:                   proxyType,
+				DisableConnectionReuse: true,
+			})
+			defer client.CloseIdleConnections()
+
+			transport, ok := client.GetNativeClient().Transport.(*http.Transport)
+			require.True(t, ok)
+			require.False(t, transport.DisableKeepAlives)
+			require.True(t, transport.ForceAttemptHTTP2)
+		})
+	}
 }
 
 func TestHttpClientImpl_buildHttpRequest(t *testing.T) {

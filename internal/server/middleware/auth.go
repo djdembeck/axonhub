@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // WithAPIKeyAuth 中间件用于验证 API key.
@@ -49,11 +51,21 @@ func WithAPIKeyConfig(auth *biz.AuthService, config *APIKeyConfig) gin.HandlerFu
 			return
 		}
 
+		if len(apiKey.AllowedIps) > 0 {
+			clientIPs := clientIPCandidates(c)
+			if !isAnyAllowedIP(clientIPs, apiKey.AllowedIps) {
+				AbortWithError(c, http.StatusForbidden, errors.New("IP address is not allowed for this API key"))
+				return
+			}
+		}
+
 		ctx := contexts.WithAPIKey(c.Request.Context(), apiKey)
 
 		if apiKey.Edges.Project != nil {
 			ctx = contexts.WithProjectID(ctx, apiKey.Edges.Project.ID)
 		}
+
+		ctx = withSessionScopeForAPIKey(ctx, apiKey)
 
 		ctx, err = withAPIKeyPrincipal(ctx, apiKey)
 		if err != nil {
@@ -91,6 +103,8 @@ func WithJWTAuth(auth *biz.AuthService) gin.HandlerFunc {
 
 		ctx := contexts.WithUser(c.Request.Context(), user)
 
+		ctx = shared.WithSessionScope(ctx, "user:"+strconv.Itoa(user.ID))
+
 		ctx, err = withUserPrincipal(ctx, user)
 		if err != nil {
 			AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid authentication context"))
@@ -108,7 +122,10 @@ var apiKeyAuthConfig = &APIKeyConfig{
 	RequireBearer: true,
 }
 
-// WithOpenAPIAuth allows API key auth for createLLMAPIKey only.
+// WithOpenAPIAuth gates the OpenAPI GraphQL surface (/openapi/v1/graphql).
+// It accepts only service_account API keys and injects the API key principal,
+// project, and session scope so the ent privacy layer can enforce per-project,
+// scope-gated access for every query and mutation.
 func WithOpenAPIAuth(auth *biz.AuthService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key, err := ExtractAPIKeyFromRequest(c.Request, apiKeyAuthConfig)
@@ -133,10 +150,20 @@ func WithOpenAPIAuth(auth *biz.AuthService) gin.HandlerFunc {
 			return
 		}
 
+		if len(apiKey.AllowedIps) > 0 {
+			clientIPs := clientIPCandidates(c)
+			if !isAnyAllowedIP(clientIPs, apiKey.AllowedIps) {
+				AbortWithError(c, http.StatusForbidden, errors.New("IP address is not allowed for this API key"))
+				return
+			}
+		}
+
 		ctx := contexts.WithAPIKey(c.Request.Context(), apiKey)
 		if apiKey.Edges.Project != nil {
 			ctx = contexts.WithProjectID(ctx, apiKey.Edges.Project.ID)
 		}
+
+		ctx = withSessionScopeForAPIKey(ctx, apiKey)
 
 		ctx, err = withAPIKeyPrincipal(ctx, apiKey)
 		if err != nil {
@@ -175,12 +202,22 @@ func WithGeminiKeyAuth(auth *biz.AuthService) gin.HandlerFunc {
 			return
 		}
 
+		if len(apiKey.AllowedIps) > 0 {
+			clientIPs := clientIPCandidates(c)
+			if !isAnyAllowedIP(clientIPs, apiKey.AllowedIps) {
+				AbortWithError(c, http.StatusForbidden, errors.New("IP address is not allowed for this API key"))
+				return
+			}
+		}
+
 		// 将 API key entity 保存到 context 中
 		ctx := contexts.WithAPIKey(c.Request.Context(), apiKey)
 
 		if apiKey.Edges.Project != nil {
 			ctx = contexts.WithProjectID(ctx, apiKey.Edges.Project.ID)
 		}
+
+		ctx = withSessionScopeForAPIKey(ctx, apiKey)
 
 		ctx, err = withAPIKeyPrincipal(ctx, apiKey)
 		if err != nil {
@@ -201,6 +238,14 @@ func WithSource(source request.Source) gin.HandlerFunc {
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
+}
+
+func withSessionScopeForAPIKey(ctx context.Context, key *ent.APIKey) context.Context {
+	scope := "api_key:" + strconv.Itoa(key.ID)
+	if key.Edges.Project != nil {
+		scope += ":project:" + strconv.Itoa(key.Edges.Project.ID)
+	}
+	return shared.WithSessionScope(ctx, scope)
 }
 
 func withUserPrincipal(ctx context.Context, user *ent.User) (context.Context, error) {

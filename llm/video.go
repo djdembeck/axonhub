@@ -2,6 +2,7 @@ package llm
 
 // VideoRequest is the unified video generation request model (async task).
 // It is designed based on Seedance's content[] structure for extensibility.
+// Note: Common fields like Model are in the parent Request struct, not here.
 type VideoRequest struct {
 	// Model is the model ID.
 	Model string `json:"model"`
@@ -9,8 +10,9 @@ type VideoRequest struct {
 	// Content is the input list (text prompt and image inputs).
 	Content []VideoContent `json:"content"`
 
-	// Duration is the video duration in seconds.
-	Duration *int64 `json:"duration,omitempty"`
+	// Duration is the video duration in seconds, represented as a string to
+	// preserve fractional values (e.g. "3.4") returned by some providers.
+	Duration *string `json:"duration,omitempty"`
 
 	// Ratio is the aspect ratio, e.g. "16:9", "9:16".
 	Ratio string `json:"ratio,omitempty"`
@@ -64,7 +66,8 @@ type VideoImageURL struct {
 	URL string `json:"url"`
 }
 
-// VideoResponse is the unified video task response (create/get).
+// VideoResponse represents the unified video response model.
+// Note: Common fields like Usage are in the parent Response struct, not here.
 type VideoResponse struct {
 	ID string `json:"id"`
 
@@ -80,10 +83,12 @@ type VideoResponse struct {
 	// Prompt is a human-readable prompt for convenience.
 	Prompt string `json:"prompt,omitempty"`
 
-	Duration *int64 `json:"duration,omitempty"`
-	Size     string `json:"size,omitempty"`
-	Ratio    string `json:"ratio,omitempty"`
-	Resolution string `json:"resolution,omitempty"`
+	// Duration is the video duration in seconds, represented as a string to
+	// preserve fractional values (e.g. "3.4") returned by some providers.
+	Duration   *string `json:"duration,omitempty"`
+	Size       string  `json:"size,omitempty"`
+	Ratio      string  `json:"ratio,omitempty"`
+	Resolution string  `json:"resolution,omitempty"`
 
 	FPS  *int64 `json:"fps,omitempty"`
 	Seed *int64 `json:"seed,omitempty"`
@@ -95,9 +100,7 @@ type VideoResponse struct {
 	ExpiresAt   int64 `json:"expires_at,omitempty"`
 }
 
-
 type VideoError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
-

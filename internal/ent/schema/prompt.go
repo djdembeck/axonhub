@@ -3,6 +3,7 @@ package schema
 import (
 	"entgo.io/contrib/entgql"
 	"entgo.io/ent"
+	"entgo.io/ent/dialect"
 	"entgo.io/ent/schema"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -50,7 +51,10 @@ func (Prompt) Fields() []ent.Field {
 		field.String("role").
 			Comment("prompt role"),
 		field.String("content").
-			Comment("prompt content"),
+			Comment("prompt content").
+			SchemaType(map[string]string{
+				dialect.MySQL: "longtext",
+			}),
 		field.Enum("status").
 			Values("enabled", "disabled").
 			Default("disabled"),
@@ -66,10 +70,14 @@ func (Prompt) Fields() []ent.Field {
 // Edges of the Prompt.
 func (Prompt) Edges() []ent.Edge {
 	return []ent.Edge{
-		edge.From("projects", Project.Type).
+		edge.From("project", Project.Type).
 			Ref("prompts").
+			Field("project_id").
+			Immutable().
+			Required().
+			Unique().
 			Annotations(
-				entgql.RelayConnection(),
+				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
 			),
 	}
 }

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"time"
 	"unicode"
 
 	"github.com/samber/lo"
@@ -27,10 +28,18 @@ func filterResolvedCandidatesForRequest(
 		return candidate != nil && candidate.when != nil
 	})
 	if !hasConditionalCandidates {
-		return aggregateChannelModelCandidates(resolvedCandidates)
+		candidates := aggregateChannelModelCandidates(resolvedCandidates)
+		candidates = populateAPIFormat(candidates, req)
+
+		return candidates
 	}
 
 	promptTokens := estimatePromptTokens(req)
+	stream := reqStream(req)
+	requestFormat := reqAPIFormat(req)
+	contentFeatures := detectRequestContentFeatures(req)
+	requestHeaders := buildRequestHeaderMap(req)
+	now := time.Now()
 	filtered := make([]*resolvedAssociationCandidate, 0, len(resolvedCandidates))
 
 	for _, candidate := range resolvedCandidates {
@@ -38,12 +47,14 @@ func filterResolvedCandidatesForRequest(
 			continue
 		}
 
-		if !matchesAssociationWhen(promptTokens, candidate.when) {
+		if !matchesAssociationWhen(promptTokens, stream, requestFormat, contentFeatures, requestHeaders, now, candidate.when) {
 			continue
 		}
 
 		filtered = append(filtered, candidate)
 	}
+
+	candidates := aggregateChannelModelCandidates(filtered)
 
 	if log.DebugEnabled(ctx) {
 		log.Debug(ctx, "evaluated conditional associations",
@@ -52,10 +63,71 @@ func filterResolvedCandidatesForRequest(
 		)
 	}
 
-	return aggregateChannelModelCandidates(filtered)
+	candidates = populateAPIFormat(candidates, req)
+
+	return candidates
 }
 
-func matchesAssociationWhen(promptTokens int64, when *objects.ModelAssociationWhen) bool {
+func populateAPIFormat(candidates []*ChannelModelsCandidate, req *llm.Request) []*ChannelModelsCandidate {
+	filtered := make([]*ChannelModelsCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if c == nil || c.Channel == nil {
+			continue
+		}
+
+		endpoints := c.Channel.ResolveEndpoints()
+		if c.APIFormat == "" {
+			c.APIFormat = SelectAPIFormat(endpoints, req)
+		}
+
+		if req.RequestType == llm.RequestTypeAlphaSearch && !hasAPIFormat(endpoints, llm.APIFormatOpenAIAlphaSearch.String()) {
+			continue
+		}
+
+		filtered = append(filtered, c)
+	}
+
+	return filtered
+}
+
+func hasAPIFormat(endpoints []objects.ChannelEndpoint, apiFormat string) bool {
+	return lo.ContainsBy(endpoints, func(endpoint objects.ChannelEndpoint) bool {
+		return endpoint.APIFormat == apiFormat
+	})
+}
+
+func reqStream(req *llm.Request) bool {
+	if req == nil || req.Stream == nil {
+		return false
+	}
+
+	return *req.Stream
+}
+
+func reqAPIFormat(req *llm.Request) string {
+	if req == nil {
+		return ""
+	}
+
+	return string(req.APIFormat)
+}
+
+type requestContentFeatures struct {
+	hasImage    bool
+	hasVideo    bool
+	hasDocument bool
+	hasAudio    bool
+}
+
+func matchesAssociationWhen(
+	promptTokens int64,
+	stream bool,
+	requestFormat string,
+	contentFeatures requestContentFeatures,
+	requestHeaders map[string]string,
+	now time.Time,
+	when *objects.ModelAssociationWhen,
+) bool {
 	if when == nil {
 		return true
 	}
@@ -65,12 +137,52 @@ func matchesAssociationWhen(promptTokens int64, when *objects.ModelAssociationWh
 	}
 
 	if when.Condition != nil && !objects.Evaluate(*when.Condition, map[string]any{
-		"prompt_tokens": promptTokens,
+		objects.ModelAssociationConditionFieldPromptTokens:  promptTokens,
+		objects.ModelAssociationConditionFieldStream:        stream,
+		objects.ModelAssociationConditionFieldRequestFormat: requestFormat,
+		objects.ModelAssociationConditionFieldHasImage:      contentFeatures.hasImage,
+		objects.ModelAssociationConditionFieldHasVideo:      contentFeatures.hasVideo,
+		objects.ModelAssociationConditionFieldHasDocument:   contentFeatures.hasDocument,
+		objects.ModelAssociationConditionFieldHasAudio:      contentFeatures.hasAudio,
+		objects.ModelAssociationConditionFieldRequestHeader: requestHeaders,
+		"now": now,
 	}) {
 		return false
 	}
 
 	return true
+}
+
+func detectRequestContentFeatures(req *llm.Request) requestContentFeatures {
+	var features requestContentFeatures
+	if req == nil {
+		return features
+	}
+
+	for _, message := range req.Messages {
+		for _, part := range message.Content.MultipleContent {
+			switch {
+			case part.ImageURL != nil:
+				features.hasImage = true
+			case part.VideoURL != nil:
+				features.hasVideo = true
+			case part.Document != nil:
+				features.hasDocument = true
+			case part.InputAudio != nil:
+				features.hasAudio = true
+			}
+
+			if features.hasAll() {
+				return features
+			}
+		}
+	}
+
+	return features
+}
+
+func (features requestContentFeatures) hasAll() bool {
+	return features.hasImage && features.hasVideo && features.hasDocument && features.hasAudio
 }
 
 func estimatePromptTokens(req *llm.Request) int64 {

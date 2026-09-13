@@ -285,6 +285,77 @@ function filterProviders(data, allowedIds) {
 		}
 	}
 
+	// Build meta developer from upstream meta provider (Meta Model API,
+	// carries the Muse lineup) plus llama channel's llama models
+	if (allowedIds.includes("meta")) {
+		const metaModels = new Map();
+		const upstreamMeta = data.providers.meta || null;
+
+		if (upstreamMeta) {
+			for (const model of upstreamMeta.models || []) {
+				metaModels.set(model.id, deepClone(model));
+			}
+		}
+
+		if (data.providers.llama) {
+			for (const model of data.providers.llama.models || []) {
+				if (!model.id?.toLowerCase().startsWith("llama")) continue;
+				if (!metaModels.has(model.id)) {
+					metaModels.set(model.id, deepClone(model));
+				}
+			}
+		}
+
+		if (metaModels.size > 0) {
+			filtered.meta = {
+				...(upstreamMeta || data.providers.llama || {}),
+				id: "meta",
+				name: "Meta",
+				display_name: "Meta",
+				models: Array.from(metaModels.values()),
+			};
+			console.log(
+				`Merged ${metaModels.size} models (muse + llama) into meta developer`,
+			);
+		}
+	}
+
+	// Aggregate IBM Granite models from all providers
+	if (allowedIds.includes("ibm")) {
+		const graniteModels = [];
+		const seen = new Set();
+
+		for (const provider of Object.values(data.providers)) {
+			for (const model of provider.models || []) {
+				const id = model.id?.toLowerCase() || "";
+				if (seen.has(id)) continue;
+				if (!id.includes("granite") && !id.includes("ibm")) continue;
+
+				// Skip embedding models
+				if (id.includes("embedding")) continue;
+				// Skip guardian/guardrail models
+				if (id.includes("guardian")) continue;
+				// Skip Cloudflare-hosted duplicates (@cf/ or workers-ai/ prefixes)
+				if (id.startsWith("@cf/") || id.includes("workers-ai/")) continue;
+
+				seen.add(id);
+				graniteModels.push(model);
+			}
+		}
+
+		if (graniteModels.length > 0) {
+			filtered.ibm = {
+				id: "ibm",
+				name: "IBM",
+				display_name: "IBM",
+				models: graniteModels,
+			};
+			console.log(
+				`Aggregated ${graniteModels.length} Granite models to ibm developer`,
+			);
+		}
+	}
+
 	// Map doubao channel's doubao models to bytedance developer
 	if (allowedIds.includes("bytedance") && data.providers.doubao) {
 		const doubaoProvider = data.providers.doubao;
@@ -301,6 +372,104 @@ function filterProviders(data, allowedIds) {
 			};
 			console.log(
 				`Mapped ${doubaoModels.length} doubao models to bytedance developer`,
+			);
+		}
+	}
+
+	// Merge Tencent plan providers into the Tencent developer
+	if (allowedIds.includes("tencent")) {
+		const tencentProviderKeys = [
+			"tencent-token-plan",
+			"tencent-tokenhub",
+			"tencent-coding-plan",
+		];
+		const mergedModels = new Map();
+		const baseProvider = filtered.tencent || data.providers.tencent || null;
+
+		// Process the base provider first so its metadata takes precedence
+		if (baseProvider) {
+			for (const model of baseProvider.models || []) {
+				const id = model.id?.toLowerCase() || "";
+				const normalizedId = id.startsWith("tencent/")
+					? id.slice("tencent/".length)
+					: id;
+				if (normalizedId && !mergedModels.has(normalizedId)) {
+					mergedModels.set(normalizedId, deepClone(model));
+				}
+			}
+		}
+
+		for (const key of tencentProviderKeys) {
+			const provider = data.providers[key];
+			if (!provider) continue;
+
+			for (const model of provider.models || []) {
+				const id = model.id?.toLowerCase() || "";
+				const normalizedId = id.startsWith("tencent/")
+					? id.slice("tencent/".length)
+					: id;
+				const isTencentModel =
+					normalizedId === "hy3" ||
+					normalizedId.startsWith("hy3-") ||
+					normalizedId.startsWith("hunyuan-");
+
+				if (!isTencentModel || mergedModels.has(normalizedId)) continue;
+				mergedModels.set(normalizedId, deepClone(model));
+			}
+		}
+
+		if (mergedModels.size > 0) {
+			filtered.tencent = {
+				...(baseProvider || {}),
+				id: "tencent",
+				name: "Tencent",
+				display_name: "Tencent",
+				models: Array.from(mergedModels.values()),
+			};
+			console.log(
+				`Merged ${mergedModels.size} Hy3/Hunyuan models into Tencent developer`,
+			);
+		}
+	}
+
+	// Merge xiaomi-token-plan-* providers into xiaomi developer
+	if (allowedIds.includes("xiaomi")) {
+		const xiaomiTokenPlanKeys = [
+			"xiaomi-token-plan-cn",
+			"xiaomi-token-plan-sgp",
+			"xiaomi-token-plan-ams",
+		];
+		const mergedModels = new Map();
+		const baseProvider = filtered.xiaomi || data.providers.xiaomi || null;
+
+		// Process base provider first so its real pricing takes precedence
+		if (baseProvider) {
+			for (const model of baseProvider.models || []) {
+				mergedModels.set(model.id, deepClone(model));
+			}
+		}
+
+		// Add token-plan models only for IDs not already present
+		for (const key of xiaomiTokenPlanKeys) {
+			const provider = data.providers[key];
+			if (!provider) continue;
+			for (const model of provider.models || []) {
+				if (!mergedModels.has(model.id)) {
+					mergedModels.set(model.id, deepClone(model));
+				}
+			}
+		}
+
+		if (mergedModels.size > 0) {
+			filtered.xiaomi = {
+				...(baseProvider || {}),
+				id: "xiaomi",
+				name: "Xiaomi",
+				display_name: "Xiaomi",
+				models: Array.from(mergedModels.values()),
+			};
+			console.log(
+				`Merged ${mergedModels.size} models from xiaomi-token-plan-* into xiaomi developer`,
 			);
 		}
 	}
@@ -331,6 +500,16 @@ function filterProviders(data, allowedIds) {
 		}
 	}
 
+	// thinkingmachines canonical models are curated in scripts/sync/models.json
+	// (models.dev lab page); the upstream entry only carries tinker-specific
+	// model IDs, so exclude it and let mergeWithModelsJson supply it.
+	if (allowedIds.includes("thinkingmachines")) {
+		delete filtered.thinkingmachines;
+		console.log(
+			"Excluded upstream thinkingmachines provider entry (canonical models come from models.json)",
+		);
+	}
+
 	return { providers: filtered };
 }
 
@@ -358,6 +537,7 @@ function mergeWithModelsJson(data, modelsJsonPath) {
 
 	for (const [providerKey, models] of Object.entries(modelsJson)) {
 		if (data.providers[providerKey]) {
+			if (!Array.isArray(models)) continue;
 			const existingProvider = data.providers[providerKey];
 			if (!existingProvider.models) {
 				existingProvider.models = [];
@@ -371,10 +551,16 @@ function mergeWithModelsJson(data, modelsJsonPath) {
 					existingIds.add(model.id);
 				}
 			}
-		} else {
+		} else if (Array.isArray(models)) {
 			data.providers[providerKey] = {
 				id: providerKey,
 				models: models,
+			};
+		} else if (isObject(models) && Array.isArray(models.models)) {
+			data.providers[providerKey] = {
+				...models,
+				id: models.id || providerKey,
+				models: models.models,
 			};
 		}
 	}
@@ -403,8 +589,25 @@ async function main() {
 		console.log("Sorting models by release date...");
 		sortModelsByDate(filtered);
 
+		const serialized = `${JSON.stringify(filtered, null, 2)}\n`;
 		console.log("Writing to:", OUTPUT_PATH);
-		fs.writeFileSync(OUTPUT_PATH, `${JSON.stringify(filtered, null, 2)}\n`);
+		fs.writeFileSync(OUTPUT_PATH, serialized);
+
+		const backendFallbackPath = path.join(
+			__dirname,
+			"../../internal/server/biz/catalogdata/providers.json",
+		);
+		fs.mkdirSync(path.dirname(backendFallbackPath), { recursive: true });
+		console.log("Writing backend fallback to:", backendFallbackPath);
+		fs.writeFileSync(backendFallbackPath, serialized);
+
+		const backendModelsPath = path.join(
+			__dirname,
+			"../../internal/server/biz/catalogdata/models.json",
+		);
+		if (fs.existsSync(MODELS_JSON_PATH)) {
+			fs.copyFileSync(MODELS_JSON_PATH, backendModelsPath);
+		}
 
 		console.log("Sync completed successfully!");
 	} catch (error) {

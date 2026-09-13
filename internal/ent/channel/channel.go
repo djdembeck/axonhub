@@ -57,8 +57,12 @@ const (
 	FieldOrderingWeight = "ordering_weight"
 	// FieldErrorMessage holds the string denoting the error_message field in the database.
 	FieldErrorMessage = "error_message"
+	// FieldAutoDisabledAt holds the string denoting the auto_disabled_at field in the database.
+	FieldAutoDisabledAt = "auto_disabled_at"
 	// FieldRemark holds the string denoting the remark field in the database.
 	FieldRemark = "remark"
+	// FieldEndpoints holds the string denoting the endpoints field in the database.
+	FieldEndpoints = "endpoints"
 	// EdgeRequests holds the string denoting the requests edge name in mutations.
 	EdgeRequests = "requests"
 	// EdgeExecutions holds the string denoting the executions edge name in mutations.
@@ -139,7 +143,9 @@ var Columns = []string{
 	FieldSettings,
 	FieldOrderingWeight,
 	FieldErrorMessage,
+	FieldAutoDisabledAt,
 	FieldRemark,
+	FieldEndpoints,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -185,6 +191,8 @@ var (
 	DefaultSettings *objects.ChannelSettings
 	// DefaultOrderingWeight holds the default value on creation for the "ordering_weight" field.
 	DefaultOrderingWeight int
+	// DefaultEndpoints holds the default value on creation for the "endpoints" field.
+	DefaultEndpoints []objects.ChannelEndpoint
 )
 
 // Type defines the type for the "type" enum field.
@@ -192,52 +200,71 @@ type Type string
 
 // Type values.
 const (
-	TypeOpenai            Type = "openai"
-	TypeOpenaiResponses   Type = "openai_responses"
-	TypeCodex             Type = "codex"
-	TypeVercel            Type = "vercel"
-	TypeAnthropic         Type = "anthropic"
-	TypeAnthropicAWS      Type = "anthropic_aws"
-	TypeAnthropicGcp      Type = "anthropic_gcp"
-	TypeGeminiOpenai      Type = "gemini_openai"
-	TypeGemini            Type = "gemini"
-	TypeGeminiVertex      Type = "gemini_vertex"
-	TypeDeepseek          Type = "deepseek"
-	TypeDeepseekAnthropic Type = "deepseek_anthropic"
-	TypeDeepinfra         Type = "deepinfra"
-	TypeFireworks         Type = "fireworks"
-	TypeDoubao            Type = "doubao"
-	TypeDoubaoAnthropic   Type = "doubao_anthropic"
-	TypeMoonshot          Type = "moonshot"
-	TypeMoonshotAnthropic Type = "moonshot_anthropic"
-	TypeZhipu             Type = "zhipu"
-	TypeZai               Type = "zai"
-	TypeZhipuAnthropic    Type = "zhipu_anthropic"
-	TypeZaiAnthropic      Type = "zai_anthropic"
-	TypeAnthropicFake     Type = "anthropic_fake"
-	TypeOpenaiFake        Type = "openai_fake"
-	TypeOpenrouter        Type = "openrouter"
-	TypeXiaomi            Type = "xiaomi"
-	TypeXai               Type = "xai"
-	TypePpio              Type = "ppio"
-	TypeSiliconflow       Type = "siliconflow"
-	TypeVolcengine        Type = "volcengine"
-	TypeLongcat           Type = "longcat"
-	TypeLongcatAnthropic  Type = "longcat_anthropic"
-	TypeMinimax           Type = "minimax"
-	TypeMinimaxAnthropic  Type = "minimax_anthropic"
-	TypeAihubmix          Type = "aihubmix"
-	TypeBurncloud         Type = "burncloud"
-	TypeModelscope        Type = "modelscope"
-	TypeBailian           Type = "bailian"
-	TypeJina              Type = "jina"
-	TypeGithub            Type = "github"
-	TypeGithubCopilot     Type = "github_copilot"
-	TypeClaudecode        Type = "claudecode"
-	TypeCerebras          Type = "cerebras"
-	TypeAntigravity       Type = "antigravity"
-	TypeNanogpt           Type = "nanogpt"
-	TypeNanogptResponses  Type = "nanogpt_responses"
+	TypeOpenai              Type = "openai"
+	TypeOpenaiResponses     Type = "openai_responses"
+	TypeAtlascloud          Type = "atlascloud"
+	TypeCline               Type = "cline"
+	TypeCodex               Type = "codex"
+	TypeVercel              Type = "vercel"
+	TypeAnthropic           Type = "anthropic"
+	TypeAnthropicAWS        Type = "anthropic_aws"
+	TypeAnthropicGcp        Type = "anthropic_gcp"
+	TypeGeminiOpenai        Type = "gemini_openai"
+	TypeGemini              Type = "gemini"
+	TypeGeminiVertex        Type = "gemini_vertex"
+	TypeDeepseek            Type = "deepseek"
+	TypeDeepseekAnthropic   Type = "deepseek_anthropic"
+	TypeDeepinfra           Type = "deepinfra"
+	TypeQiniu               Type = "qiniu"
+	TypeFireworks           Type = "fireworks"
+	TypeDoubao              Type = "doubao"
+	TypeDoubaoAnthropic     Type = "doubao_anthropic"
+	TypeMoonshot            Type = "moonshot"
+	TypeMoonshotAnthropic   Type = "moonshot_anthropic"
+	TypeZhipu               Type = "zhipu"
+	TypeZai                 Type = "zai"
+	TypeZhipuAnthropic      Type = "zhipu_anthropic"
+	TypeZaiAnthropic        Type = "zai_anthropic"
+	TypeAnthropicFake       Type = "anthropic_fake"
+	TypeOpenaiFake          Type = "openai_fake"
+	TypeOpenrouter          Type = "openrouter"
+	TypeXiaomi              Type = "xiaomi"
+	TypeXiaomiAnthropic     Type = "xiaomi_anthropic"
+	TypeXai                 Type = "xai"
+	TypeXaiResponses        Type = "xai_responses"
+	TypeXaiSubscription     Type = "xai_subscription"
+	TypePpio                Type = "ppio"
+	TypeSiliconflow         Type = "siliconflow"
+	TypeVolcengine          Type = "volcengine"
+	TypeVolcengineAnthropic Type = "volcengine_anthropic"
+	TypeLongcat             Type = "longcat"
+	TypeLongcatAnthropic    Type = "longcat_anthropic"
+	TypeMinimax             Type = "minimax"
+	TypeMinimaxAnthropic    Type = "minimax_anthropic"
+	TypeAihubmix            Type = "aihubmix"
+	TypeAihubmixAnthropic   Type = "aihubmix_anthropic"
+	TypeBurncloud           Type = "burncloud"
+	TypeModelscope          Type = "modelscope"
+	TypeBailian             Type = "bailian"
+	TypeBailianAnthropic    Type = "bailian_anthropic"
+	TypeMoonshotCoding      Type = "moonshot_coding"
+	TypeJina                Type = "jina"
+	TypeGithub              Type = "github"
+	TypeGithubCopilot       Type = "github_copilot"
+	TypeClaudecode          Type = "claudecode"
+	TypeCerebras            Type = "cerebras"
+	TypeAntigravity         Type = "antigravity"
+	TypeNanogpt             Type = "nanogpt"
+	TypeNanogptResponses    Type = "nanogpt_responses"
+	TypeOpencodeGo          Type = "opencode_go"
+	TypeOpencodeGoAnthropic Type = "opencode_go_anthropic"
+	TypeOllama              Type = "ollama"
+	TypeOllamaAnthropic     Type = "ollama_anthropic"
+	TypeEvolink             Type = "evolink"
+	TypeEvolinkAnthropic    Type = "evolink_anthropic"
+	TypeGroq                Type = "groq"
+	TypeQiniuAnthropic      Type = "qiniu_anthropic"
+	TypeFenno               Type = "fenno"
 )
 
 func (_type Type) String() string {
@@ -247,7 +274,7 @@ func (_type Type) String() string {
 // TypeValidator is a validator for the "type" field enum values. It is called by the builders before save.
 func TypeValidator(_type Type) error {
 	switch _type {
-	case TypeOpenai, TypeOpenaiResponses, TypeCodex, TypeVercel, TypeAnthropic, TypeAnthropicAWS, TypeAnthropicGcp, TypeGeminiOpenai, TypeGemini, TypeGeminiVertex, TypeDeepseek, TypeDeepseekAnthropic, TypeDeepinfra, TypeFireworks, TypeDoubao, TypeDoubaoAnthropic, TypeMoonshot, TypeMoonshotAnthropic, TypeZhipu, TypeZai, TypeZhipuAnthropic, TypeZaiAnthropic, TypeAnthropicFake, TypeOpenaiFake, TypeOpenrouter, TypeXiaomi, TypeXai, TypePpio, TypeSiliconflow, TypeVolcengine, TypeLongcat, TypeLongcatAnthropic, TypeMinimax, TypeMinimaxAnthropic, TypeAihubmix, TypeBurncloud, TypeModelscope, TypeBailian, TypeJina, TypeGithub, TypeGithubCopilot, TypeClaudecode, TypeCerebras, TypeAntigravity, TypeNanogpt, TypeNanogptResponses:
+	case TypeOpenai, TypeOpenaiResponses, TypeAtlascloud, TypeCline, TypeCodex, TypeVercel, TypeAnthropic, TypeAnthropicAWS, TypeAnthropicGcp, TypeGeminiOpenai, TypeGemini, TypeGeminiVertex, TypeDeepseek, TypeDeepseekAnthropic, TypeDeepinfra, TypeQiniu, TypeFireworks, TypeDoubao, TypeDoubaoAnthropic, TypeMoonshot, TypeMoonshotAnthropic, TypeZhipu, TypeZai, TypeZhipuAnthropic, TypeZaiAnthropic, TypeAnthropicFake, TypeOpenaiFake, TypeOpenrouter, TypeXiaomi, TypeXiaomiAnthropic, TypeXai, TypeXaiResponses, TypeXaiSubscription, TypePpio, TypeSiliconflow, TypeVolcengine, TypeVolcengineAnthropic, TypeLongcat, TypeLongcatAnthropic, TypeMinimax, TypeMinimaxAnthropic, TypeAihubmix, TypeAihubmixAnthropic, TypeBurncloud, TypeModelscope, TypeBailian, TypeBailianAnthropic, TypeMoonshotCoding, TypeJina, TypeGithub, TypeGithubCopilot, TypeClaudecode, TypeCerebras, TypeAntigravity, TypeNanogpt, TypeNanogptResponses, TypeOpencodeGo, TypeOpencodeGoAnthropic, TypeOllama, TypeOllamaAnthropic, TypeEvolink, TypeEvolinkAnthropic, TypeGroq, TypeQiniuAnthropic, TypeFenno:
 		return nil
 	default:
 		return fmt.Errorf("channel: invalid enum value for type field: %q", _type)
@@ -347,6 +374,11 @@ func ByOrderingWeight(opts ...sql.OrderTermOption) OrderOption {
 // ByErrorMessage orders the results by the error_message field.
 func ByErrorMessage(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldErrorMessage, opts...).ToFunc()
+}
+
+// ByAutoDisabledAt orders the results by the auto_disabled_at field.
+func ByAutoDisabledAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldAutoDisabledAt, opts...).ToFunc()
 }
 
 // ByRemark orders the results by the remark field.

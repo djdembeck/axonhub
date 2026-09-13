@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/llm"
-	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestConvertToChatCompletionResponse(t *testing.T) {
@@ -29,7 +28,7 @@ func TestConvertToChatCompletionResponse(t *testing.T) {
 			OutputTokens: 20,
 		},
 	}
-	result := convertToLlmResponse(anthropicResp, PlatformDirect, shared.TransportScope{})
+	result := convertToLlmResponse(anthropicResp, PlatformDirect)
 
 	require.Equal(t, "msg_123", result.ID)
 	require.Equal(t, "chat.completion", result.Object)
@@ -41,6 +40,28 @@ func TestConvertToChatCompletionResponse(t *testing.T) {
 	require.Equal(t, int64(10), result.Usage.PromptTokens)
 	require.Equal(t, int64(20), result.Usage.CompletionTokens)
 	require.Equal(t, int64(30), result.Usage.TotalTokens)
+}
+
+func TestConvertToLlmResponse_PreservesMultipleThinkingItems(t *testing.T) {
+	result := convertToLlmResponse(&Message{
+		ID:   "msg_reasoning_items",
+		Role: "assistant",
+		Content: []MessageContentBlock{
+			{Type: "thinking", Thinking: lo.ToPtr("first"), Signature: lo.ToPtr("gAAAA_FIRST_BLOB")},
+			{Type: "thinking", Thinking: lo.ToPtr("second"), Signature: lo.ToPtr("gAAAA_SECOND_BLOB")},
+			{Type: "tool_use", ID: "call_tool", Name: lo.ToPtr("lookup"), Input: json.RawMessage(`{}`)},
+		},
+	}, PlatformDirect)
+
+	require.Len(t, result.Choices, 1)
+	message := result.Choices[0].Message
+	require.Equal(t, []llm.ReasoningItem{
+		{Content: "first", Signature: "Z0FBQUFfRklSU1RfQkxPQg=="},
+		{Content: "second", Signature: "Z0FBQUFfU0VDT05EX0JMT0I="},
+	}, message.ReasoningItems)
+	require.Equal(t, "firstsecond", lo.FromPtr(message.ReasoningContent))
+	require.Equal(t, "Z0FBQUFfU0VDT05EX0JMT0I=", lo.FromPtr(message.ReasoningSignature))
+	require.Len(t, message.ToolCalls, 1)
 }
 
 func TestConvertToolChoiceToAnthropic(t *testing.T) {
@@ -399,7 +420,7 @@ func TestConvertToChatCompletionResponse_EdgeCases(t *testing.T) {
 						StopReason: lo.ToPtr(anthropicReason),
 					}
 
-					result := convertToLlmResponse(msg, PlatformDirect, shared.TransportScope{})
+					result := convertToLlmResponse(msg, PlatformDirect)
 					if expectedReason == "stop" {
 						require.Equal(t, expectedReason, *result.Choices[0].FinishReason)
 					} else {
@@ -512,9 +533,63 @@ func TestConvertToChatCompletionResponse_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertToLlmResponse(tt.input, PlatformDirect, shared.TransportScope{})
+			result := convertToLlmResponse(tt.input, PlatformDirect)
 			tt.validate(t, result)
 		})
+	}
+}
+
+func TestConvertToLlmResponse_WithTextBlockCitations(t *testing.T) {
+	anthropicResp := &Message{
+		ID:   "msg_citations",
+		Type: "message",
+		Role: "assistant",
+		Content: []MessageContentBlock{
+			{
+				Type: "text",
+				Text: lo.ToPtr("Answer with sources"),
+				Citations: []TextCitation{
+					{
+						Type:           "url_citation",
+						URL:            "https://example.com/a",
+						Title:          "Example A",
+						EncryptedIndex: lo.ToPtr("secret"),
+						CitedText:      lo.ToPtr("quoted"),
+					},
+					{
+						Type:  "url_citation",
+						URL:   "https://example.com/b",
+						Title: "Example B",
+					},
+				},
+			},
+		},
+		Model: "claude-3-sonnet-20240229",
+	}
+
+	result := convertToLlmResponse(anthropicResp, PlatformDirect)
+	require.NotNil(t, result)
+	require.Len(t, result.Choices, 1)
+	require.NotNil(t, result.Choices[0].Message)
+	require.Equal(t, []llm.Annotation{
+		{
+			Type: "url_citation",
+			URLCitation: &llm.URLCitation{
+				URL:   "https://example.com/a",
+				Title: "Example A",
+			},
+		},
+		{
+			Type: "url_citation",
+			URLCitation: &llm.URLCitation{
+				URL:   "https://example.com/b",
+				Title: "Example B",
+			},
+		},
+	}, result.Choices[0].Message.Annotations)
+	for _, annotation := range result.Choices[0].Message.Annotations {
+		require.Nil(t, annotation.StartIndex)
+		require.Nil(t, annotation.EndIndex)
 	}
 }
 

@@ -2,7 +2,6 @@ package anthropic
 
 import (
 	"encoding/json"
-	"fmt"
 
 	"github.com/samber/lo"
 
@@ -31,8 +30,10 @@ func convertImageSourceToLLMImageURLPart(source *ImageSource, cacheControl *Cach
 			mediaType = "application/octet-stream"
 		}
 
-		// Convert Anthropic image format to OpenAI format
-		imageURL := fmt.Sprintf("data:%s;base64,%s", mediaType, source.Data)
+		// Convert Anthropic image format to OpenAI format.
+		// Use xurl.BuildDataURL (single exact-size concat) instead of fmt.Sprintf
+		// to avoid the printer's doubling-growth buffer churn on large base64 data.
+		imageURL := xurl.BuildDataURL(mediaType, source.Data, true)
 		part.ImageURL = &llm.ImageURL{URL: imageURL}
 
 		return part, true
@@ -65,6 +66,13 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 	}
 	if anthropicReq.Metadata != nil {
 		chatReq.Metadata["user_id"] = anthropicReq.Metadata.UserID
+	}
+
+	// Propagate the top-level cache_control (Anthropic automatic caching)
+	// through the pipeline so the Anthropic outbound transformer can restore
+	// it on the upstream request and bypass its own breakpoint optimization.
+	if anthropicReq.CacheControl != nil {
+		chatReq.TransformerMetadata[TransformerMetadataKeyCacheControl] = anthropicReq.CacheControl
 	}
 
 	// Convert messages
@@ -118,25 +126,19 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 		} else if len(msg.Content.MultipleContent) > 0 {
 			contentParts := make([]llm.MessageContentPart, 0, len(msg.Content.MultipleContent))
 
-			var (
-				reasoningContent         string
-				hasReasoningInContent    bool
-				redactedReasoningContent string
-			)
+			var redactedReasoningContent string
 
-			var reasoningSignature string
+			var reasoningItems []llm.ReasoningItem
 
-			for _, block := range msg.Content.MultipleContent {
+			for blockIdx, block := range msg.Content.MultipleContent {
 				switch block.Type {
 				case "thinking":
-					// Keep thinking content in MultipleContent to preserve order
-					if block.Thinking != nil && *block.Thinking != "" {
-						reasoningContent = *block.Thinking
-						hasReasoningInContent = true
+					item := llm.ReasoningItem{
+						Content:   lo.FromPtr(block.Thinking),
+						Signature: lo.FromPtr(block.Signature),
 					}
-
-					if block.Signature != nil && *block.Signature != "" {
-						reasoningSignature = *block.Signature
+					if item.Content != "" || item.Signature != "" {
+						reasoningItems = append(reasoningItems, item)
 					}
 				case "redacted_thinking":
 					// Handle redacted thinking content - store the encrypted data
@@ -144,11 +146,13 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 						redactedReasoningContent = block.Data
 					}
 				case "text":
-					contentParts = append(contentParts, llm.MessageContentPart{
+					part := llm.MessageContentPart{
 						Type:         "text",
 						Text:         block.Text,
 						CacheControl: convertToLLMCacheControl(block.CacheControl),
-					})
+					}
+					setAnthropicBlockIndex(&part.TransformerMetadata, blockIdx)
+					contentParts = append(contentParts, part)
 					hasContent = true
 				case "image":
 					if part, ok := convertImageSourceToLLMImageURLPart(block.Source, block.CacheControl); ok {
@@ -205,7 +209,7 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 						messages = append(messages, toolMsg)
 					}
 				case "tool_use":
-					chatMsg.ToolCalls = append(chatMsg.ToolCalls, llm.ToolCall{
+					tc := llm.ToolCall{
 						ID:   block.ID,
 						Type: "function",
 						Function: llm.FunctionCall{
@@ -213,8 +217,32 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 							Arguments: string(block.Input),
 						},
 						CacheControl: convertToLLMCacheControl(block.CacheControl),
-					})
+					}
+					setAnthropicBlockIndex(&tc.TransformerMetadata, blockIdx)
+					chatMsg.ToolCalls = append(chatMsg.ToolCalls, tc)
 					hasContent = true
+				default:
+					switch {
+					case isAnthropicSpecialToolUseBlock(block.Type):
+						tc := llm.ToolCall{
+							ID:   block.ID,
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      lo.FromPtr(block.Name),
+								Arguments: string(block.Input),
+							},
+							CacheControl: convertToLLMCacheControl(block.CacheControl),
+						}
+						setAnthropicSpecialMeta(&tc.TransformerMetadata, block.Type, block.Caller)
+						setAnthropicBlockIndex(&tc.TransformerMetadata, blockIdx)
+						chatMsg.ToolCalls = append(chatMsg.ToolCalls, tc)
+						hasContent = true
+					case isAnthropicSpecialToolResultBlock(block.Type):
+						ir := inlineToolResultFromBlock(&block)
+						setAnthropicBlockIndex(&ir.TransformerMetadata, blockIdx)
+						chatMsg.InlineToolResults = append(chatMsg.InlineToolResults, ir)
+						hasContent = true
+					}
 				}
 			}
 
@@ -237,14 +265,23 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 				hasContent = true
 			}
 
-			// Assign reasoning content and signature if present
-			if reasoningContent != "" && hasReasoningInContent {
-				chatMsg.ReasoningContent = &reasoningContent
-				hasContent = true
-			}
+			if len(reasoningItems) > 0 {
+				chatMsg.ReasoningItems = reasoningItems
 
-			if reasoningSignature != "" {
-				chatMsg.ReasoningSignature = &reasoningSignature
+				// Keep a scalar fallback for non-Responses upstream converters, which
+				// do not consume ReasoningItems. The signature remains the last block's
+				// opaque value, matching the legacy representation.
+				var aggregateReasoning string
+				for _, item := range reasoningItems {
+					aggregateReasoning += item.Content
+				}
+				if aggregateReasoning != "" {
+					chatMsg.ReasoningContent = lo.ToPtr(aggregateReasoning)
+				}
+				if signature := reasoningItems[len(reasoningItems)-1].Signature; signature != "" {
+					chatMsg.ReasoningSignature = lo.ToPtr(signature)
+				}
+				hasContent = true
 			}
 
 			if redactedReasoningContent != "" {
@@ -308,6 +345,10 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 			if anthropicReq.Thinking.Display != "" {
 				chatReq.TransformerMetadata[TransformerMetadataKeyThinkingDisplay] = anthropicReq.Thinking.Display
 			}
+		case "disabled":
+			// Preserve disabled thinking type so outbound transformers can disable reasoning.
+			chatReq.TransformerMetadata[TransformerMetadataKeyThinkingType] = "disabled"
+			chatReq.ReasoningEffort = "none"
 		case "adaptive":
 			// Adaptive thinking doesn't require a budget; preserve the type marker via TransformerMetadata.
 			chatReq.TransformerMetadata[TransformerMetadataKeyThinkingType] = "adaptive"
@@ -369,6 +410,123 @@ func convertAnthropicToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 	return nil
 }
 
+func citationFromLLMAnnotation(annotation llm.Annotation, metadata map[string]any) (TextCitation, bool) {
+	if annotation.Type == "" && annotation.URLCitation == nil {
+		return TextCitation{}, false
+	}
+
+	citationType := annotation.Type
+	if citationType == "" || (citationType == "url_citation" && hasOpenAIResponsesWebSearchCallMetadata(metadata)) {
+		citationType = "web_search_result_location"
+	}
+
+	citation := TextCitation{Type: citationType}
+	if annotation.URLCitation != nil {
+		citation.URL = annotation.URLCitation.URL
+		citation.Title = annotation.URLCitation.Title
+	}
+
+	return citation, true
+}
+
+func hasOpenAIResponsesWebSearchCallMetadata(metadata map[string]any) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+
+	raw, ok := metadata["openai_responses_web_search_calls"]
+	if !ok || raw == nil {
+		return false
+	}
+
+	switch calls := raw.(type) {
+	case []any:
+		return len(calls) > 0
+	case []map[string]any:
+		return len(calls) > 0
+	default:
+		return true
+	}
+}
+
+func attachCitationsToFirstAnthropicTextBlock(contentBlocks []MessageContentBlock, annotations []llm.Annotation, metadata map[string]any) []MessageContentBlock {
+	if len(annotations) == 0 {
+		return contentBlocks
+	}
+
+	citations := lo.FilterMap(annotations, func(annotation llm.Annotation, _ int) (TextCitation, bool) {
+		return citationFromLLMAnnotation(annotation, metadata)
+	})
+	if len(citations) == 0 {
+		return contentBlocks
+	}
+
+	for i := range contentBlocks {
+		if contentBlocks[i].Type != "text" {
+			continue
+		}
+
+		existing := map[string]struct{}{}
+		for _, citation := range contentBlocks[i].Citations {
+			existing[citationKey(citation)] = struct{}{}
+		}
+		for _, citation := range citations {
+			if _, ok := existing[citationKey(citation)]; ok {
+				continue
+			}
+			contentBlocks[i].Citations = append(contentBlocks[i].Citations, citation)
+		}
+
+		return contentBlocks
+	}
+
+	emptyText := ""
+	contentBlocks = append(contentBlocks, MessageContentBlock{
+		Type:      "text",
+		Text:      &emptyText,
+		Citations: append([]TextCitation(nil), citations...),
+	})
+
+	return contentBlocks
+}
+
+func getAnthropicResponseContentFromMetadata(metadata map[string]any) []MessageContentBlock {
+	if len(metadata) == 0 {
+		return nil
+	}
+
+	raw, ok := metadata[TransformerMetadataKeyAnthropicResponseContent]
+	if !ok || raw == nil {
+		return nil
+	}
+
+	if blocks, ok := raw.([]MessageContentBlock); ok {
+		return cloneAnthropicResponseContentBlocks(blocks)
+	}
+
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+
+	var blocks []MessageContentBlock
+	if err := json.Unmarshal(data, &blocks); err != nil {
+		return nil
+	}
+
+	return blocks
+}
+
+func mergeAnthropicResponseContentBlocks(contentBlocks []MessageContentBlock, metadata map[string]any, annotations []llm.Annotation) []MessageContentBlock {
+	providerBlocks := getAnthropicResponseContentFromMetadata(metadata)
+	if len(providerBlocks) == 0 {
+		return attachCitationsToFirstAnthropicTextBlock(contentBlocks, annotations, metadata)
+	}
+
+	providerBlocks = attachCitationsToFirstAnthropicTextBlock(providerBlocks, annotations, metadata)
+	return providerBlocks
+}
+
 func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 	resp := &Message{
 		ID:    chatResp.ID,
@@ -398,6 +556,7 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 				if thinkingContent == nil {
 					thinkingContent = lo.ToPtr("")
 				}
+
 				thinkingBlock := MessageContentBlock{
 					Type:     "thinking",
 					Thinking: thinkingContent,
@@ -405,7 +564,7 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 				if message.ReasoningSignature != nil {
 					thinkingBlock.Signature = message.ReasoningSignature
 				} else {
-					thinkingBlock.Signature = lo.ToPtr("")
+					thinkingBlock.Signature = lo.ToPtr(generateSignature())
 				}
 
 				contentBlocks = append(contentBlocks, thinkingBlock)
@@ -419,28 +578,46 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 				})
 			}
 
-			// Handle regular content
+			// Collect text / image / tool_use / *_tool_result into a single
+			// ordered list so blocks tagged with anthropic_block_index (e.g.
+			// server_tool_use that appeared between text blocks in the
+			// original Anthropic turn) can be interleaved faithfully.
+			var (
+				ordered      []orderedContentBlock
+				leadingBlock *MessageContentBlock
+			)
+
+			appendOrdered := func(meta map[string]any, b MessageContentBlock) {
+				ordered = append(ordered, orderedContentBlock{
+					idx:   getAnthropicBlockIndex(meta),
+					order: len(ordered),
+					block: b,
+				})
+			}
+
 			if message.Content.Content != nil && *message.Content.Content != "" {
-				contentBlocks = append(contentBlocks, MessageContentBlock{
+				// A collapsed single-string text always represents the text
+				// that originally came *before* any tool calls or tool
+				// results (outbound_convert only collapses when that holds).
+				leadingBlock = &MessageContentBlock{
 					Type: "text",
 					Text: message.Content.Content,
-				})
+				}
 			} else if len(message.Content.MultipleContent) > 0 {
 				for _, part := range message.Content.MultipleContent {
 					switch part.Type {
 					case "text":
 						if part.Text != nil {
-							contentBlocks = append(contentBlocks, MessageContentBlock{
+							appendOrdered(part.TransformerMetadata, MessageContentBlock{
 								Type: "text",
 								Text: part.Text,
 							})
 						}
 					case "image_url":
 						if part.ImageURL != nil && part.ImageURL.URL != "" {
-							// Convert OpenAI image format to Anthropic format
 							url := part.ImageURL.URL
 							if parsed := xurl.ParseDataURL(url); parsed != nil {
-								contentBlocks = append(contentBlocks, MessageContentBlock{
+								appendOrdered(part.TransformerMetadata, MessageContentBlock{
 									Type: "image",
 									Source: &ImageSource{
 										Type:      "base64",
@@ -449,7 +626,7 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 									},
 								})
 							} else {
-								contentBlocks = append(contentBlocks, MessageContentBlock{
+								appendOrdered(part.TransformerMetadata, MessageContentBlock{
 									Type: "image",
 									Source: &ImageSource{
 										Type: "url",
@@ -462,27 +639,44 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 				}
 			}
 
-			// Handle tool calls
-			if len(message.ToolCalls) > 0 {
-				for _, toolCall := range message.ToolCalls {
-					var input json.RawMessage
-					if toolCall.Function.Arguments != "" {
-						// Attempt to use the provided arguments; repair if invalid, fallback to {}
-						input = xjson.SafeJSONRawMessage(toolCall.Function.Arguments)
-					} else {
-						input = json.RawMessage("{}")
-					}
+			for _, toolCall := range message.ToolCalls {
+				var input json.RawMessage
+				if toolCall.Function.Arguments != "" {
+					input = xjson.SafeJSONRawMessage(toolCall.Function.Arguments)
+				} else {
+					input = json.RawMessage("{}")
+				}
+				input = sanitizeReadToolInput(toolCall.Function.Name, input)
 
-					contentBlocks = append(contentBlocks, MessageContentBlock{
-						Type:  "tool_use",
-						ID:    toolCall.ID,
-						Name:  &toolCall.Function.Name,
-						Input: input,
-					})
+				blockType := "tool_use"
+				if at := getAnthropicType(toolCall.TransformerMetadata); at != "" {
+					blockType = at
+				}
+
+				appendOrdered(toolCall.TransformerMetadata, MessageContentBlock{
+					Type:   blockType,
+					ID:     toolCall.ID,
+					Name:   &toolCall.Function.Name,
+					Input:  input,
+					Caller: getAnthropicCaller(toolCall.TransformerMetadata),
+				})
+			}
+
+			for _, ir := range message.InlineToolResults {
+				if block, ok := toolResultBlockFromInline(ir); ok {
+					appendOrdered(ir.TransformerMetadata, block)
 				}
 			}
 
-			resp.Content = contentBlocks
+			if leadingBlock != nil {
+				contentBlocks = append(contentBlocks, *leadingBlock)
+			}
+
+			for _, ob := range sortOrderedContentBlocks(ordered) {
+				contentBlocks = append(contentBlocks, ob.block)
+			}
+
+			resp.Content = mergeAnthropicResponseContentBlocks(contentBlocks, chatResp.TransformerMetadata, message.Annotations)
 		}
 
 		// Convert finish reason
@@ -500,6 +694,14 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 			default:
 				resp.StopReason = choice.FinishReason
 			}
+		} else {
+			stopReason := "end_turn"
+			if lo.ContainsBy(resp.Content, func(block MessageContentBlock) bool {
+				return block.Type == "tool_use"
+			}) {
+				stopReason = "tool_use"
+			}
+			resp.StopReason = &stopReason
 		}
 	}
 

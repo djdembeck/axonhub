@@ -2,6 +2,7 @@ import type { ComponentType } from 'react';
 import {
   OpenAI,
   Anthropic,
+  Cline,
   Google,
   DeepSeek,
   Doubao,
@@ -25,9 +26,16 @@ import {
   AiHubMix,
   Cerebras,
   Claude,
+  Qiniu,
   XiaomiMiMo,
-  Fireworks
+  Fireworks,
+  Ollama,
+  OpenCode,
+  Groq,
 } from '@lobehub/icons';
+import { AtlasCloudIcon } from '../components/atlas-cloud-icon';
+import { EvolinkIcon } from '../components/evolink-icon';
+import { FennoIcon } from '../components/fenno-icon';
 import { NanoGPTIcon } from '../components/nanogpt-icon';
 import { CHANNEL_CONFIGS } from './config_channels';
 import { ApiFormat, ChannelType } from './schema';
@@ -41,7 +49,7 @@ export interface ProviderConfig {
 }
 
 /**
- * Provider configurations - groups channel types by provider/vendor
+ * Provider configurations - groups channel types by provider
  * Each provider can support multiple API formats (channel types)
  */
 export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
@@ -50,6 +58,24 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     icon: OpenAI,
     color: 'bg-white-100 text-white-800 border-white-200',
     channelTypes: ['openai', 'openai_responses'],
+  },
+  atlascloud: {
+    provider: 'atlascloud',
+    icon: AtlasCloudIcon,
+    color: 'bg-sky-100 text-sky-800 border-sky-200',
+    channelTypes: ['atlascloud'],
+  },
+  qiniu: {
+    provider: 'qiniu',
+    icon: Qiniu,
+    color: 'bg-blue-100 text-blue-800 border-blue-200',
+    channelTypes: ['qiniu_anthropic', 'qiniu'],
+  },
+  fenno: {
+    provider: 'fenno',
+    icon: FennoIcon,
+    color: 'bg-[#EEF2FF] text-[#3155C6] border-[#C7D2FE]',
+    channelTypes: ['fenno'],
   },
   deepseek: {
     provider: 'deepseek',
@@ -73,7 +99,7 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     provider: 'moonshot',
     icon: Moonshot,
     color: 'bg-black-100 text-black-800 border-black-200',
-    channelTypes: ['moonshot_anthropic', 'moonshot'],
+    channelTypes: ['moonshot_anthropic', 'moonshot', 'moonshot_coding'],
   },
   zhipu: {
     provider: 'zhipu',
@@ -133,7 +159,13 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     provider: 'xai',
     icon: XAI,
     color: 'bg-black-100 text-black-800 border-black-200',
-    channelTypes: ['xai'],
+    channelTypes: ['xai', 'xai_responses'],
+  },
+  xai_subscription: {
+    provider: 'xai_subscription',
+    icon: XAI,
+    color: 'bg-black-100 text-black-800 border-black-200',
+    channelTypes: ['xai_subscription'],
   },
   burncloud: {
     provider: 'burncloud',
@@ -169,13 +201,13 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     provider: 'volcengine',
     icon: Volcengine,
     color: 'bg-blue-100 text-blue-800 border-blue-200',
-    channelTypes: ['volcengine'],
+    channelTypes: ['volcengine_anthropic', 'volcengine'],
   },
   aihubmix: {
     provider: 'aihubmix',
     icon: AiHubMix,
     color: 'bg-blue-100 text-blue-800 border-blue-200',
-    channelTypes: ['aihubmix'],
+    channelTypes: ['aihubmix_anthropic', 'aihubmix'],
   },
   modelscope: {
     provider: 'modelscope',
@@ -187,7 +219,7 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     provider: 'bailian',
     icon: Bailian,
     color: 'bg-green-100 text-green-800 border-green-200',
-    channelTypes: ['bailian'],
+    channelTypes: ['bailian', 'bailian_anthropic'],
   },
   openrouter: {
     provider: 'openrouter',
@@ -199,7 +231,7 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     provider: 'xiaomi',
     icon: XiaomiMiMo,
     color: 'bg-orange-100 text-orange-800 border-orange-200',
-    channelTypes: ['xiaomi'],
+    channelTypes: ['xiaomi_anthropic', 'xiaomi'],
   },
   vercel: {
     provider: 'vercel',
@@ -230,6 +262,36 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     icon: Fireworks,
     color: 'bg-orange-100 text-orange-800 border-orange-200',
     channelTypes: ['fireworks'],
+  },
+  opencode_go: {
+    provider: 'opencode_go',
+    icon: OpenCode,
+    color: 'bg-indigo-100 text-indigo-800 border-indigo-200',
+    channelTypes: ['opencode_go', 'opencode_go_anthropic'],
+  },
+  ollama: {
+    provider: 'ollama',
+    icon: Ollama,
+    color: 'bg-slate-100 text-slate-800 border-slate-200',
+    channelTypes: ['ollama', 'ollama_anthropic'],
+  },
+  evolink: {
+    provider: 'evolink',
+    icon: EvolinkIcon,
+    color: 'bg-indigo-100 text-indigo-800 border-indigo-200',
+    channelTypes: ['evolink', 'evolink_anthropic'],
+  },
+  cline: {
+    provider: 'cline',
+    icon: Cline,
+    color: 'bg-purple-100 text-purple-800 border-purple-200',
+    channelTypes: ['cline'],
+  },
+  groq: {
+    provider: 'groq',
+    icon: Groq,
+    color: 'bg-orange-100 text-orange-800 border-orange-200',
+    channelTypes: ['groq'],
   },
 };
 

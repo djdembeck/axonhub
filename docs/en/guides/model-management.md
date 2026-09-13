@@ -15,6 +15,7 @@ In AxonHub:
 - **Model**: An abstract name you expose, like `gpt-4` or `claude-sonnet`
 - **Channel**: An actual AI provider connection
 - **Model Association**: Determines which channel and actual model to use when a client requests a model
+- **Developer Rule**: A reusable channel rule configured once for a model developer and inherited by models from the same developer
 
 ### Request Flow
 
@@ -34,6 +35,16 @@ Load Balancing: Select best channel to execute request
 Model Association is the **middle** step in a three-layer pipeline. For the full picture, see [Request Processing Guide](../getting-started/request-processing.md#core-concept-three-layers-of-model-settings).
 
 In short: **API Key Profile renames → Model Association selects channel → Channel renames → Send upstream**
+
+## Developer Rule Inheritance
+
+If multiple models from the same developer should use the same channel rules, configure **Developer Rules** on the developer group in the model list. A developer rule only selects a channel or channel tags. It does not lock in a specific upstream model; at routing time, each concrete model uses its own model ID when searching those channels.
+
+By default, a model inherits developer rules from the same developer and merges them with rules configured directly on the model:
+
+- Smaller `priority` values run first.
+- When priorities tie, model-level rules take precedence over inherited developer rules.
+- Enable **Do not inherit developer settings** in a model's association dialog when that model should use only its own rules.
 
 ## Model Association Types
 
@@ -133,57 +144,19 @@ Example configuration in Admin UI:
   - Type: Global Model Match
   - Model: gpt-4
 
-## Real-World Scenarios
-
-### Scenario 1: Primary-Backup Channel Setup
-
-**Need**: Prioritize OpenAI, automatically switch to DeepSeek on failure
-
-**Configuration:**
-1. Create OpenAI channel and DeepSeek channel
-2. In Model Management, for model "gpt-4", add associations:
-   - Priority 0: Specific Channel Model → OpenAI channel → gpt-4o
-   - Priority 10: Specific Channel Model → DeepSeek channel → deepseek-chat
-
-### Scenario 2: Multi-Version Compatibility
-
-**Need**: Client requests `gpt-4`, but any gpt-4 variant can be used
-
-**Configuration:**
-- Priority 0: Channel Regex Match → OpenAI channel → Pattern: `gpt-4.*`
-
-### Scenario 3: Environment Isolation
-
-**Need**: Production environment only uses production channels
-
-**Setup:**
-- Tag OpenAI channel: `production`
-- Tag test channel: `test`
-
-**Configuration:**
-- Priority 0: Tagged Channel Model → Tag: production → Model: gpt-4
-
-### Scenario 4: Exclude Specific Channels
-
-**Need**: Use gpt-4 from all channels, but exclude test and backup channels
-
-**Configuration:**
-- Priority 0: Global Regex Match
-  - Pattern: `gpt-4.*`
-  - Exclude Channel Tags: test, backup
-
 ## System Settings
 
-In **System Settings > Model Settings**, there are two important options:
+In **System Settings > Model Settings**, there are three common options:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | Query All Channel Models | Enabled | When enabled, `/v1/models` API returns all models from enabled channels + configured models |
 | Fallback to Channels on Model Not Found | Enabled | When enabled, if requested model has no associations, system automatically finds channels supporting it |
+| Hide Unroutable Models in Lists | Disabled | When enabled, public model-list APIs hide configured models that the current API key cannot structurally route to a capable channel. Requests for those models still return 422. The admin models table is unchanged. |
 
 **Recommendations:**
-- For beginners: Keep both enabled, system handles most cases automatically
-- For strict control: Disable both to only allow explicitly configured models
+- For beginners: Keep Query All Channel Models and Fallback to Channels enabled; leave Hide Unroutable Models off unless list/call mismatches matter
+- For strict control: Disable Query All Channel Models and Fallback to Channels so only explicitly configured models are used; enable Hide Unroutable Models so `/v1/models` matches that routing
 
 ## FAQ
 
@@ -194,6 +167,7 @@ Check in order:
 2. Are model associations configured with correct channels?
 3. Are channels enabled?
 4. Do channels support the models specified in associations?
+5. If the model should inherit developer rules, is **Do not inherit developer settings** disabled?
 
 ### Q: How to verify associations are working?
 

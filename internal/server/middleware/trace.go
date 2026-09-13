@@ -78,6 +78,10 @@ func tryGetTraceIDFromBody(c *gin.Context, config tracing.Config) (string, error
 func WithTrace(config tracing.Config, traceService *biz.TraceService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		traceID := getTraceIDFromHeader(c, config)
+		if traceID == "" && config.OpenCodeTraceEnabled {
+			traceID = tryExtractTraceIDFromOpenCodeRequest(c)
+		}
+
 		if traceID == "" && config.ClaudeCodeTraceEnabled {
 			var err error
 
@@ -103,8 +107,22 @@ func WithTrace(config tracing.Config, traceService *biz.TraceService) gin.Handle
 		}
 
 		if traceID == "" {
+			// WithLoggingTracing creates an ID for log correlation, but that alone
+			// must not opt the request into persisted tracing. Only explicitly
+			// configured trace sources should create a trace record.
 			c.Next()
+
 			return
+		}
+
+		// The trace middleware can resolve a more specific ID from fallback headers
+		// or request bodies. Keep the request context in sync with that final value.
+		c.Request = c.Request.WithContext(tracing.WithTraceID(c.Request.Context(), traceID))
+
+		for _, header := range config.ResponseTraceHeaders {
+			if header = strings.TrimSpace(header); header != "" {
+				c.Header(header, traceID)
+			}
 		}
 
 		// Get project ID from context
@@ -186,6 +204,18 @@ func tryExtractTraceIDFromClaudeCodeRequest(c *gin.Context, config tracing.Confi
 	log.Debug(c.Request.Context(), "Extracted trace ID from claude code payload", log.String("trace_id", traceID))
 
 	return traceID, nil
+}
+
+// tryExtractTraceIDFromOpenCodeRequest extracts the trace ID from the OpenCode session affinity header.
+func tryExtractTraceIDFromOpenCodeRequest(c *gin.Context) string {
+	traceID := c.GetHeader("x-session-affinity")
+	if traceID == "" {
+		return ""
+	}
+
+	log.Debug(c.Request.Context(), "Extracted trace ID from opencode header", log.String("trace_id", traceID))
+
+	return traceID
 }
 
 // tryExtractTraceIDFromCodexRequest extracts the trace ID from the Codex session header.

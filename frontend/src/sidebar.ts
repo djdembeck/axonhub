@@ -12,11 +12,13 @@ import {
   IconBaselineDensityMedium,
   IconAi,
   IconNote,
+  IconChartBar,
 } from '@tabler/icons-react';
 import { Command } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '@/stores/authStore';
 import { useRoutePermissions } from '@/hooks/useRoutePermissions';
+import { formatUserName, isCJKName } from '@/lib/utils';
 import { useMe } from '@/features/auth/data/auth';
 import { type SidebarData, type NavGroup, type NavLink } from './components/layout/types';
 
@@ -32,7 +34,8 @@ export function useSidebarData(): SidebarData {
   // Generate user initials for avatar
   const getInitials = (firstName?: string, lastName?: string, email?: string) => {
     if (firstName && lastName) {
-      return `${firstName.charAt(0)}${lastName.charAt(0)}`.toUpperCase();
+      const [first, second] = isCJKName(firstName, lastName) ? [lastName, firstName] : [firstName, lastName];
+      return `${first.charAt(0)}${second.charAt(0)}`.toUpperCase();
     }
     if (firstName) {
       return firstName.slice(0, 2).toUpperCase();
@@ -46,7 +49,7 @@ export function useSidebarData(): SidebarData {
   // Generate user display name
   const getDisplayName = (firstName?: string, lastName?: string, email?: string) => {
     if (firstName && lastName) {
-      return `${firstName} ${lastName}`;
+      return formatUserName(firstName, lastName);
     }
     if (firstName) {
       return firstName;
@@ -127,6 +130,11 @@ export function useSidebarData(): SidebarData {
           title: t('sidebar.items.requests'),
           url: '/project/requests',
           icon: IconActivity,
+        } as NavLink,
+        {
+          title: t('sidebar.items.usageStats'),
+          url: '/project/usage-stats',
+          icon: IconChartBar,
         } as NavLink,
         // {
         //   title: t('sidebar.items.usageLogs'),
