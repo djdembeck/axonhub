@@ -3,12 +3,21 @@ package biz
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
 	"time"
+
+	"github.com/aptible/supercronic/cronexpr"
 
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/log"
+	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcontext"
 )
+
+var compiledAPIKeyRuleRegexes sync.Map
 
 func (svc *ChannelService) markChannelUnavailable(ctx context.Context, channelID int, responseStatusCode int, threshold int, actualCount int) {
 	ctx, cancel := xcontext.DetachWithTimeout(ctx, 10*time.Second)
@@ -24,6 +33,7 @@ func (svc *ChannelService) markChannelUnavailable(ctx context.Context, channelID
 		).
 		SetStatus(channel.StatusDisabled).
 		SetErrorMessage(deriveErrorMessage(responseStatusCode)).
+		SetAutoDisabledAt(time.Now()).
 		Save(ctx)
 	if err != nil {
 		log.Error(ctx, "Failed to disable channel on unrecoverable error",
@@ -95,9 +105,23 @@ func (svc *ChannelService) markChannelUnavailable(ctx context.Context, channelID
 	svc.asyncReloadChannels()
 }
 
+// resolveAutoDisableStatuses returns the global auto-disable thresholds, which
+// apply to every channel that no per-channel rule already claimed. The second
+// result is false when auto-disable is off or has nothing configured to match.
+func (svc *ChannelService) resolveAutoDisableStatuses(policy *RetryPolicy) ([]AutoDisableChannelStatus, bool) {
+	enabled := policy.AutoDisableChannel.Enabled
+	statuses := policy.AutoDisableChannel.Statuses
+
+	if !enabled || len(statuses) == 0 {
+		return nil, false
+	}
+
+	return statuses, true
+}
+
 // checkAndHandleChannelError checks if the channel should be disabled based on the error status code.
-func (svc *ChannelService) checkAndHandleChannelError(ctx context.Context, perf *PerformanceRecord, policy *RetryPolicy) bool {
-	for _, statusConfig := range policy.AutoDisableChannel.Statuses {
+func (svc *ChannelService) checkAndHandleChannelError(ctx context.Context, perf *PerformanceRecord, statuses []AutoDisableChannelStatus) bool {
+	for _, statusConfig := range statuses {
 		if statusConfig.Status != perf.ResponseStatusCode {
 			continue
 		}
@@ -127,8 +151,8 @@ func (svc *ChannelService) checkAndHandleChannelError(ctx context.Context, perf 
 
 // checkAndHandleAPIKeyError checks if the API key should be disabled based on the error status code.
 // Returns true if the API key was disabled.
-func (svc *ChannelService) checkAndHandleAPIKeyError(ctx context.Context, perf *PerformanceRecord, policy *RetryPolicy) bool {
-	for _, statusConfig := range policy.AutoDisableChannel.Statuses {
+func (svc *ChannelService) checkAndHandleAPIKeyError(ctx context.Context, perf *PerformanceRecord, statuses []AutoDisableChannelStatus) bool {
+	for _, statusConfig := range statuses {
 		if statusConfig.Status != perf.ResponseStatusCode {
 			continue
 		}
@@ -168,4 +192,334 @@ func (svc *ChannelService) checkAndHandleAPIKeyError(ctx context.Context, perf *
 	}
 
 	return false
+}
+
+// EvaluateAPIKeyRulesForFailure evaluates channel-scoped API key rules for a
+// failure that was persisted outside the normal performance middleware path.
+func (svc *ChannelService) EvaluateAPIKeyRulesForFailure(
+	ctx context.Context,
+	channelID int,
+	apiKey string,
+	responseStatusCode int,
+	errorMessage string,
+) bool {
+	if channelID == 0 || apiKey == "" {
+		return false
+	}
+
+	_, acted := svc.checkAndHandleChannelAPIKeyRules(ctx, &PerformanceRecord{
+		ChannelID:          channelID,
+		APIKey:             apiKey,
+		ResponseStatusCode: responseStatusCode,
+		ErrorMessage:       errorMessage,
+	})
+	return acted
+}
+
+// checkAndHandleChannelAPIKeyRules evaluates rules in declaration order. The
+// first matching rule owns the failure so one request cannot increment several
+// overlapping counters or execute multiple actions.
+func (svc *ChannelService) checkAndHandleChannelAPIKeyRules(ctx context.Context, perf *PerformanceRecord) (matched, acted bool) {
+	rulePrefix := perf.APIKey + ":rule:"
+	ch := svc.GetEnabledChannel(perf.ChannelID)
+	if ch == nil || len(ch.Policies.APIKeyAutoDisableRules) == 0 {
+		svc.clearAPIKeyRuleCounts(perf.ChannelID, rulePrefix)
+		return false, false
+	}
+
+	for ruleIndex, rule := range ch.Policies.APIKeyAutoDisableRules {
+		if !matchesAPIKeyRule(rule, perf) {
+			continue
+		}
+
+		ruleKey := apiKeyRuleCounterKey(perf.APIKey, ruleIndex, rule)
+		// Every failure accepted by one rule contributes to that rule's single
+		// consecutive counter, including alternating configured status codes.
+		const countKey = 0
+
+		svc.apiKeyErrorCountsLock.Lock()
+		if svc.apiKeyErrorCounts[perf.ChannelID] == nil {
+			svc.apiKeyErrorCounts[perf.ChannelID] = make(map[string]map[int]int)
+		}
+		if svc.apiKeyRuleActionsInFlight == nil {
+			svc.apiKeyRuleActionsInFlight = make(map[int]map[string]bool)
+		}
+		if svc.apiKeyRuleActionsInFlight[perf.ChannelID] == nil {
+			svc.apiKeyRuleActionsInFlight[perf.ChannelID] = make(map[string]bool)
+		}
+		for key := range svc.apiKeyErrorCounts[perf.ChannelID] {
+			if strings.HasPrefix(key, rulePrefix) && key != ruleKey {
+				delete(svc.apiKeyErrorCounts[perf.ChannelID], key)
+			}
+		}
+		for key := range svc.apiKeyRuleActionsInFlight[perf.ChannelID] {
+			if strings.HasPrefix(key, rulePrefix) && key != ruleKey {
+				delete(svc.apiKeyRuleActionsInFlight[perf.ChannelID], key)
+			}
+		}
+		if svc.apiKeyErrorCounts[perf.ChannelID][ruleKey] == nil {
+			svc.apiKeyErrorCounts[perf.ChannelID][ruleKey] = make(map[int]int)
+		}
+		svc.apiKeyErrorCounts[perf.ChannelID][ruleKey][countKey]++
+		count := svc.apiKeyErrorCounts[perf.ChannelID][ruleKey][countKey]
+		threshold := max(rule.Times, 1)
+		_, actionInFlight := svc.apiKeyRuleActionsInFlight[perf.ChannelID][ruleKey]
+		shouldAct := count >= threshold && !actionInFlight
+		if shouldAct {
+			svc.apiKeyErrorCounts[perf.ChannelID][ruleKey][countKey] -= threshold
+			svc.apiKeyRuleActionsInFlight[perf.ChannelID][ruleKey] = false
+		}
+		svc.apiKeyErrorCountsLock.Unlock()
+
+		if shouldAct {
+			actionSucceeded := svc.executeAPIKeyRuleAction(ctx, perf, rule, count)
+			svc.apiKeyErrorCountsLock.Lock()
+			if streakReset, stillClaimed := svc.apiKeyRuleActionsInFlight[perf.ChannelID][ruleKey]; stillClaimed {
+				delete(svc.apiKeyRuleActionsInFlight[perf.ChannelID], ruleKey)
+				if !actionSucceeded && !streakReset {
+					if svc.apiKeyErrorCounts[perf.ChannelID] == nil {
+						svc.apiKeyErrorCounts[perf.ChannelID] = make(map[string]map[int]int)
+					}
+					if svc.apiKeyErrorCounts[perf.ChannelID][ruleKey] == nil {
+						svc.apiKeyErrorCounts[perf.ChannelID][ruleKey] = make(map[int]int)
+					}
+					svc.apiKeyErrorCounts[perf.ChannelID][ruleKey][countKey] += threshold
+				}
+				if svc.apiKeyErrorCounts[perf.ChannelID][ruleKey][countKey] == 0 {
+					delete(svc.apiKeyErrorCounts[perf.ChannelID], ruleKey)
+				}
+			}
+			svc.apiKeyErrorCountsLock.Unlock()
+			return true, actionSucceeded
+		}
+
+		return true, false
+	}
+
+	svc.clearAPIKeyRuleCounts(perf.ChannelID, rulePrefix)
+
+	return false, false
+}
+
+func (svc *ChannelService) clearAPIKeyRuleCounts(channelID int, rulePrefix string) {
+	svc.apiKeyErrorCountsLock.Lock()
+	defer svc.apiKeyErrorCountsLock.Unlock()
+
+	for key := range svc.apiKeyErrorCounts[channelID] {
+		if strings.HasPrefix(key, rulePrefix) {
+			delete(svc.apiKeyErrorCounts[channelID], key)
+		}
+	}
+	for key := range svc.apiKeyRuleActionsInFlight[channelID] {
+		if strings.HasPrefix(key, rulePrefix) {
+			delete(svc.apiKeyRuleActionsInFlight[channelID], key)
+		}
+	}
+}
+
+func apiKeyRuleCounterKey(apiKey string, ruleIndex int, rule objects.APIKeyAutoDisableRule) string {
+	disableDurationMinutes := 0
+	if rule.DisableDurationMinutes != nil {
+		disableDurationMinutes = *rule.DisableDurationMinutes
+	}
+
+	return fmt.Sprintf(
+		"%s:rule:%d:%v:%v:%d:%s:%d",
+		apiKey,
+		ruleIndex,
+		rule.StatusCodes,
+		rule.KeywordPatterns,
+		rule.Times,
+		rule.Action,
+		disableDurationMinutes,
+	)
+}
+
+func matchesAPIKeyRule(rule objects.APIKeyAutoDisableRule, perf *PerformanceRecord) bool {
+	if len(rule.StatusCodes) > 0 && !slices.Contains(rule.StatusCodes, perf.ResponseStatusCode) {
+		return false
+	}
+	if len(rule.KeywordPatterns) == 0 {
+		return true
+	}
+	if perf.ErrorMessage == "" {
+		return false
+	}
+
+	lowerMessage := strings.ToLower(perf.ErrorMessage)
+	for _, pattern := range rule.KeywordPatterns {
+		if re := compiledAPIKeyRuleRegex(pattern); re != nil {
+			if re.MatchString(perf.ErrorMessage) {
+				return true
+			}
+			continue
+		}
+		// Patterns may be plain keywords or regular expressions. Treat syntax
+		// that is not a valid expression as a case-insensitive literal keyword.
+		if strings.Contains(lowerMessage, strings.ToLower(pattern)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func compiledAPIKeyRuleRegex(pattern string) *regexp.Regexp {
+	cacheKey := "(?i)" + pattern
+	if cached, ok := compiledAPIKeyRuleRegexes.Load(cacheKey); ok {
+		re, _ := cached.(*regexp.Regexp)
+		return re
+	}
+
+	re, err := regexp.Compile(cacheKey)
+	if err != nil {
+		compiledAPIKeyRuleRegexes.Store(cacheKey, (*regexp.Regexp)(nil))
+		return nil
+	}
+	compiledAPIKeyRuleRegexes.Store(cacheKey, re)
+	return re
+}
+
+// nextAPIKeyRuleCronOccurrence resolves when a disable_until_cron rule lets the
+// credential back in: the first cron occurrence strictly after the failure. The
+// absolute instant is stored on the disable record, so recovery does not depend
+// on any instance re-evaluating the expression later.
+func nextAPIKeyRuleCronOccurrence(rule objects.APIKeyAutoDisableRule, now time.Time) (time.Time, error) {
+	loc := time.UTC
+
+	if rule.DisableUntilTimezone != "" {
+		parsed, err := time.LoadLocation(rule.DisableUntilTimezone)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("invalid timezone %q: %w", rule.DisableUntilTimezone, err)
+		}
+
+		loc = parsed
+	}
+
+	expr, err := cronexpr.Parse(rule.DisableUntilCron)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid cron expression %q: %w", rule.DisableUntilCron, err)
+	}
+
+	next := expr.Next(now.In(loc))
+	if next.IsZero() {
+		return time.Time{}, fmt.Errorf("cron expression %q never fires again", rule.DisableUntilCron)
+	}
+
+	return next, nil
+}
+
+func (svc *ChannelService) executeAPIKeyRuleAction(
+	ctx context.Context,
+	perf *PerformanceRecord,
+	rule objects.APIKeyAutoDisableRule,
+	count int,
+) bool {
+	reason := fmt.Sprintf("Disabled by channel API key rule after %d consecutive errors", count)
+
+	action := rule.Action
+
+	// An OAuth channel's credential cannot be deleted: DeleteDisabledAPIKeys
+	// rejects OAuth channels outright, so running the delete step would report the
+	// action as failed, restore the error counter and retry on every subsequent
+	// failure. Fall back to keeping it disabled, which is the same observable
+	// outcome for a channel holding a single credential.
+	if action == objects.APIKeyAutoDisableActionPermanentDelete && perf.APIKey == objects.OAuthCredentialRef {
+		action = objects.APIKeyAutoDisableActionPermanent
+	}
+
+	switch action {
+	case objects.APIKeyAutoDisableActionUntilCron:
+		expiresAt, err := nextAPIKeyRuleCronOccurrence(rule, time.Now())
+		if err != nil {
+			log.Error(ctx, "Failed to resolve api key rule cron schedule",
+				log.Int("channel_id", perf.ChannelID),
+				log.String("cron", rule.DisableUntilCron),
+				log.Cause(err),
+			)
+
+			return false
+		}
+
+		reason = fmt.Sprintf("Disabled until %s by channel API key rule after %d consecutive errors",
+			expiresAt.Format(time.RFC3339), count)
+
+		if err := svc.DisableAPIKey(ctx, perf.ChannelID, perf.APIKey, perf.ResponseStatusCode, reason, &expiresAt); err != nil {
+			log.Error(ctx, "Failed to disable API key until cron occurrence",
+				log.Int("channel_id", perf.ChannelID),
+				log.Cause(err),
+			)
+
+			return false
+		}
+
+		return true
+
+	case objects.APIKeyAutoDisableActionPermanent:
+		// No expiry, so the cleanup task never revives it: the credential stays on
+		// the channel until an operator re-enables it.
+		if err := svc.DisableAPIKey(ctx, perf.ChannelID, perf.APIKey, perf.ResponseStatusCode, reason); err != nil {
+			log.Error(ctx, "Failed to permanently disable API key by channel rule",
+				log.Int("channel_id", perf.ChannelID),
+				log.Cause(err),
+			)
+
+			return false
+		}
+
+		return true
+
+	case objects.APIKeyAutoDisableActionPermanentDelete:
+		if err := svc.DisableAPIKey(ctx, perf.ChannelID, perf.APIKey, perf.ResponseStatusCode, reason); err != nil {
+			log.Error(ctx, "Failed to permanently disable API key by channel rule",
+				log.Int("channel_id", perf.ChannelID),
+				log.Cause(err),
+			)
+
+			return false
+		}
+
+		result, err := svc.DeleteDisabledAPIKeys(ctx, perf.ChannelID, []string{perf.APIKey})
+		if err != nil {
+			log.Error(ctx, "Failed to delete API key disabled by channel rule",
+				log.Int("channel_id", perf.ChannelID),
+				log.Cause(err),
+			)
+
+			return false
+		}
+
+		// Channels must retain at least one credential. Keep that last key
+		// permanently disabled when deletion cannot remove it, otherwise the
+		// delete helper would make the rule a no-op by re-enabling the channel.
+		if result.Message == "ONE_KEY_PRESERVED" {
+			if err := svc.DisableAPIKey(ctx, perf.ChannelID, perf.APIKey, perf.ResponseStatusCode, reason); err != nil {
+				log.Error(ctx, "Failed to keep preserved API key disabled by channel rule",
+					log.Int("channel_id", perf.ChannelID),
+					log.Cause(err),
+				)
+
+				return false
+			}
+		}
+
+		return true
+	}
+
+	var expiresAt *time.Time
+	if rule.DisableDurationMinutes != nil {
+		disabledUntil := time.Now().Add(time.Duration(*rule.DisableDurationMinutes) * time.Minute)
+		expiresAt = &disabledUntil
+		reason = fmt.Sprintf("Temporarily disabled for %d minutes by channel API key rule after %d consecutive errors", *rule.DisableDurationMinutes, count)
+	}
+
+	if err := svc.DisableAPIKey(ctx, perf.ChannelID, perf.APIKey, perf.ResponseStatusCode, reason, expiresAt); err != nil {
+		log.Error(ctx, "Failed to temporarily disable API key by channel rule",
+			log.Int("channel_id", perf.ChannelID),
+			log.Cause(err),
+		)
+		return false
+	}
+
+	return true
 }

@@ -29,6 +29,11 @@ func NewInboundTransformer() *InboundTransformer {
 	return &InboundTransformer{}
 }
 
+// APIFormat returns the API format of the transformer.
+func (t *InboundTransformer) APIFormat() llm.APIFormat {
+	return llm.APIFormatOpenAIResponse
+}
+
 // TransformRequest transforms OpenAI Responses API HTTP request to llm.Request.
 func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *httpclient.Request) (*llm.Request, error) {
 	if httpReq == nil {
@@ -55,7 +60,7 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 		return nil, fmt.Errorf("%w: model is required", transformer.ErrInvalidRequest)
 	}
 
-	return convertToLLMRequest(&req)
+	return convertToLLMRequest(&req, httpReq.Body)
 }
 
 // TransformResponse transforms llm.Response to OpenAI Responses API HTTP response.
@@ -161,7 +166,7 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 }
 
 // convertToLLMRequest converts OpenAI Responses API Request to llm.Request.
-func convertToLLMRequest(req *Request) (*llm.Request, error) {
+func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) {
 	chatReq := &llm.Request{
 		Model:               req.Model,
 		Temperature:         req.Temperature,
@@ -290,6 +295,10 @@ func convertToLLMRequest(req *Request) (*llm.Request, error) {
 		chatReq.Verbosity = req.Text.Verbosity
 	}
 
+	if len(rawBody) > 0 {
+		attachOpenAIResponsesRequestExtensions(chatReq, req, rawBody[0])
+	}
+
 	return chatReq, nil
 }
 
@@ -303,12 +312,12 @@ func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 
 	if src.Mode != nil {
 		result.ToolChoice = src.Mode
-	} else if src.Type != nil && src.Name != nil {
+	} else if src.Type != nil {
 		result.NamedToolChoice = &llm.NamedToolChoice{
 			Type: *src.Type,
-			Function: llm.ToolFunction{
-				Name: *src.Name,
-			},
+		}
+		if src.Name != nil {
+			result.NamedToolChoice.Function.Name = *src.Name
 		}
 	}
 
@@ -316,7 +325,7 @@ func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 }
 
 // convertInputToMessages converts Responses API input to llm.Message slice.
-// It handles merging reasoning items with subsequent function_call items into a single assistant message.
+// It handles merging consecutive tool calls that belong to the same assistant turn.
 func convertInputToMessages(input *Input) ([]llm.Message, error) {
 	if input == nil {
 		return nil, nil
@@ -357,6 +366,30 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 			continue
 		}
 
+		if item.Type == "function_call" || item.Type == "custom_tool_call" {
+			msg := llm.Message{Role: "assistant"}
+
+			for i < len(input.Items) {
+				callItem := &input.Items[i]
+				if callItem.Type != "function_call" && callItem.Type != "custom_tool_call" {
+					break
+				}
+
+				callMsg, err := convertItemToMessage(callItem)
+				if err != nil {
+					return nil, err
+				}
+				if callMsg != nil {
+					msg.ToolCalls = append(msg.ToolCalls, callMsg.ToolCalls...)
+				}
+				i++
+			}
+
+			messages = append(messages, msg)
+
+			continue
+		}
+
 		// Handle regular items
 		msg, err := convertItemToMessage(item)
 		if err != nil {
@@ -381,27 +414,42 @@ func convertReasoningWithFollowing(items []Item, startIdx int) (*llm.Message, in
 		return nil, 0, nil
 	}
 
-	reasoningItem := &items[startIdx]
-	msg := &llm.Message{
-		Role:               "assistant",
-		ReasoningSignature: reasoningItem.EncryptedContent,
+	msg := &llm.Message{Role: "assistant"}
+	consumed := 0
+
+	// Collect all consecutive reasoning items before looking for the assistant
+	// content or tool call they belong to. Each item keeps its own ID, summary,
+	// and opaque encrypted content.
+	for i := startIdx; i < len(items) && items[i].Type == "reasoning"; i++ {
+		reasoningItem := &items[i]
+		var reasoningText strings.Builder
+		for _, summary := range reasoningItem.Summary {
+			reasoningText.WriteString(summary.Text)
+		}
+
+		msg.ReasoningItems = append(msg.ReasoningItems, llm.ReasoningItem{
+			ID:        reasoningItem.ID,
+			Content:   reasoningText.String(),
+			Signature: lo.FromPtr(reasoningItem.EncryptedContent),
+		})
+		consumed++
 	}
 
-	// Extract reasoning content
-	var reasoningText strings.Builder
-
-	for _, summary := range reasoningItem.Summary {
-		reasoningText.WriteString(summary.Text)
+	// Keep scalar fallbacks for Chat-compatible upstreams, which do not consume
+	// ReasoningItems. The item slice remains authoritative for Responses replay.
+	var aggregateReasoning strings.Builder
+	for _, item := range msg.ReasoningItems {
+		aggregateReasoning.WriteString(item.Content)
 	}
-
-	if reasoningText.Len() > 0 {
-		msg.ReasoningContent = lo.ToPtr(reasoningText.String())
+	if aggregateReasoning.Len() > 0 {
+		msg.ReasoningContent = lo.ToPtr(aggregateReasoning.String())
 	}
-
-	consumed := 1
+	if signature := msg.ReasoningItems[len(msg.ReasoningItems)-1].Signature; signature != "" {
+		msg.ReasoningSignature = lo.ToPtr(signature)
+	}
 
 	// Look ahead for subsequent function_call items to merge
-	for i := startIdx + 1; i < len(items); i++ {
+	for i := startIdx + consumed; i < len(items); i++ {
 		nextItem := &items[i]
 
 		switch nextItem.Type {
@@ -412,6 +460,7 @@ func convertReasoningWithFollowing(items []Item, startIdx int) (*llm.Message, in
 				Type: "function",
 				Function: llm.FunctionCall{
 					Name:      nextItem.Name,
+					Namespace: nextItem.Namespace,
 					Arguments: nextItem.Arguments,
 				},
 			})
@@ -423,6 +472,7 @@ func convertReasoningWithFollowing(items []Item, startIdx int) (*llm.Message, in
 			if nextItem.Input != nil {
 				inputStr = *nextItem.Input
 			}
+
 			msg.ToolCalls = append(msg.ToolCalls, llm.ToolCall{
 				ID:   nextItem.CallID,
 				Type: llm.ToolTypeResponsesCustomTool,
@@ -515,6 +565,7 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 					Type: "function",
 					Function: llm.FunctionCall{
 						Name:      item.Name,
+						Namespace: item.Namespace,
 						Arguments: item.Arguments,
 					},
 				},
@@ -731,6 +782,29 @@ func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
 				},
 			})
 
+		case "web_search":
+			webSearch := &llm.WebSearch{}
+			if tool.Filters != nil {
+				webSearch.AllowedDomains = append(webSearch.AllowedDomains, tool.Filters.AllowedDomains...)
+			}
+			if tool.UserLocation != nil {
+				locationType := tool.UserLocation.Type
+				if locationType == "" {
+					locationType = "approximate"
+				}
+				webSearch.UserLocation = llm.WebSearchToolUserLocation{
+					Type:     locationType,
+					City:     tool.UserLocation.City,
+					Country:  tool.UserLocation.Country,
+					Region:   tool.UserLocation.Region,
+					Timezone: tool.UserLocation.Timezone,
+				}
+			}
+			result = append(result, llm.Tool{
+				Type:      llm.ToolTypeWebSearch,
+				WebSearch: webSearch,
+			})
+
 		case "custom":
 			customTool := &llm.ResponseCustomTool{
 				Name:        tool.Name,
@@ -743,10 +817,33 @@ func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
 					Definition: tool.Format.Definition,
 				}
 			}
+
 			result = append(result, llm.Tool{
 				Type:               llm.ToolTypeResponsesCustomTool,
 				ResponseCustomTool: customTool,
 			})
+
+		case "namespace":
+			for _, subTool := range tool.Tools {
+				if subTool.Type != "function" {
+					continue
+				}
+
+				params, err := json.Marshal(subTool.Parameters)
+				if err != nil {
+					return nil, fmt.Errorf("failed to marshal namespace tool parameters: %w", err)
+				}
+
+				result = append(result, llm.Tool{
+					Type: "function",
+					Function: llm.Function{
+						Name:        namespaceFunctionName(tool.Name, subTool.Name),
+						Description: subTool.Description,
+						Parameters:  params,
+						Strict:      subTool.Strict,
+					},
+				})
+			}
 
 		default:
 			// Skip unsupported tool types
@@ -757,6 +854,96 @@ func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
 	return result, nil
 }
 
+func namespaceFunctionName(namespaceName, functionName string) string {
+	return namespaceName + "__" + functionName
+}
+
+func getResponseWebSearchCallsFromMetadata(metadata map[string]any) []Item {
+	if len(metadata) == 0 {
+		return nil
+	}
+
+	raw, ok := metadata[responsesWebSearchCallsTransformerMetadataKey]
+	if !ok || raw == nil {
+		return nil
+	}
+
+	items, ok := raw.([]Item)
+	if !ok {
+		data, err := json.Marshal(raw)
+		if err != nil {
+			return nil
+		}
+
+		if err := json.Unmarshal(data, &items); err != nil {
+			return nil
+		}
+	}
+
+	result := make([]Item, 0, len(items))
+	for _, item := range items {
+		if item.Type != "web_search_call" || item.Action == nil || item.Action.WebSearch == nil {
+			continue
+		}
+
+		src := item.Action.WebSearch
+		result = append(result, Item{
+			ID:     item.ID,
+			Type:   item.Type,
+			Status: item.Status,
+			Action: NewWebSearchAction(&WebSearchAction{
+				Type:    src.Type,
+				Query:   src.Query,
+				Queries: append([]string(nil), src.Queries...),
+				Sources: append([]WebSearchSource(nil), src.Sources...),
+			}),
+		})
+	}
+
+	return result
+}
+
+func attachAnnotationsToFirstTextItem(items []Item, annotations []llm.Annotation) ([]Item, bool) {
+	if len(items) == 0 || len(annotations) == 0 {
+		return items, false
+	}
+
+	firstTextItemIdx := -1
+	for i := range items {
+		switch items[i].Type {
+		case "output_text", "input_text", "text":
+			firstTextItemIdx = i
+		}
+
+		if firstTextItemIdx >= 0 {
+			break
+		}
+	}
+
+	if firstTextItemIdx < 0 {
+		return items, false
+	}
+
+	items[firstTextItemIdx].Annotations = lo.Map(annotations, func(annotation llm.Annotation, _ int) Annotation {
+		result := Annotation{
+			Type:       annotation.Type,
+			StartIndex: annotation.StartIndex,
+			EndIndex:   annotation.EndIndex,
+		}
+
+		if annotation.URLCitation != nil {
+			result.URLCitation = &URLCitation{
+				URL:   annotation.URLCitation.URL,
+				Title: annotation.URLCitation.Title,
+			}
+		}
+
+		return result
+	})
+
+	return items, true
+}
+
 // convertToResponsesAPIResponse converts llm.Response to Responses API Response.
 func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 	resp := &Response{
@@ -764,7 +951,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		ID:                 chatResp.ID,
 		Model:              chatResp.Model,
 		CreatedAt:          chatResp.Created,
-		Output:             make([]Item, 0),
+		Output:             append([]Item(nil), getResponseWebSearchCallsFromMetadata(chatResp.TransformerMetadata)...),
 		Status:             lo.ToPtr("completed"),
 		PreviousResponseID: chatResp.PreviousResponseID,
 	}
@@ -790,10 +977,10 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 			messageItemID = generateItemID()
 		}
 
-		// Handle reasoning content
-		if reasoningItem, ok := buildReasoningItem(*message); ok {
-			resp.Output = append(resp.Output, reasoningItem)
-		}
+		// Handle reasoning content. A message may carry multiple independently
+		// signed reasoning items, each of which must remain a separate Responses
+		// output item for a later tool-result request.
+		resp.Output = append(resp.Output, buildReasoningItems(*message)...)
 
 		// Handle tool calls (function calls and custom tool calls)
 		if len(message.ToolCalls) > 0 {
@@ -813,6 +1000,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 						Type:      "function_call",
 						CallID:    toolCall.ID,
 						Name:      toolCall.Function.Name,
+						Namespace: toolCall.Function.Namespace,
 						Arguments: toolCall.Function.Arguments,
 						Status:    lo.ToPtr("completed"),
 					})
@@ -823,18 +1011,17 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		// Handle text content
 		if message.Content.Content != nil && *message.Content.Content != "" {
 			text := *message.Content.Content
+			contentItems, _ := attachAnnotationsToFirstTextItem([]Item{{
+				Type:        "output_text",
+				Text:        &text,
+				Annotations: []Annotation{},
+			}}, message.Annotations)
 			resp.Output = append(resp.Output, Item{
 				ID:   messageItemID,
 				Type: "message",
 				Role: "assistant",
 				Content: &Input{
-					Items: []Item{
-						{
-							Type:        "output_text",
-							Text:        &text,
-							Annotations: []Annotation{},
-						},
-					},
+					Items: contentItems,
 				},
 				Status: lo.ToPtr("completed"),
 			})
@@ -876,6 +1063,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 			}
 
 			if len(contentItems) > 0 {
+				contentItems, _ = attachAnnotationsToFirstTextItem(contentItems, message.Annotations)
 				resp.Output = append(resp.Output, Item{
 					ID:      messageItemID,
 					Type:    "message",
@@ -931,29 +1119,48 @@ func generateItemID() string {
 	return fmt.Sprintf("item_%s", lo.RandomString(16, lo.AlphanumericCharset))
 }
 
-// buildReasoningItem creates a reasoning Item from a message's reasoning content and signature.
-// Returns the item and true if the message has reasoning data, otherwise returns zero value and false.
-func buildReasoningItem(msg llm.Message) (Item, bool) {
-	hasContent := msg.ReasoningContent != nil && *msg.ReasoningContent != ""
-	hasSignature := msg.ReasoningSignature != nil && *msg.ReasoningSignature != ""
-
-	if !hasContent && !hasSignature {
-		return Item{}, false
+// buildReasoningItems creates reasoning Items from a message. ReasoningItems
+// preserves the one-to-one association between a summary and its opaque
+// encrypted content; the scalar fields are retained as a legacy fallback.
+func buildReasoningItems(msg llm.Message) []Item {
+	reasoningItems := msg.ReasoningItems
+	if len(reasoningItems) == 0 {
+		reasoningItems = []llm.ReasoningItem{{
+			Content:   lo.FromPtr(msg.ReasoningContent),
+			Signature: lo.FromPtr(msg.ReasoningSignature),
+		}}
 	}
 
-	summary := []ReasoningSummary{}
-	if hasContent {
-		summary = append(summary, ReasoningSummary{
-			Type: "summary_text",
-			Text: *msg.ReasoningContent,
-		})
+	items := make([]Item, 0, len(reasoningItems))
+	for _, reasoningItem := range reasoningItems {
+		if reasoningItem.Content == "" && reasoningItem.Signature == "" {
+			continue
+		}
+
+		summary := []ReasoningSummary{}
+		if reasoningItem.Content != "" {
+			summary = append(summary, ReasoningSummary{
+				Type: "summary_text",
+				Text: reasoningItem.Content,
+			})
+		}
+
+		itemID := reasoningItem.ID
+		if itemID == "" {
+			itemID = generateItemID()
+		}
+
+		item := Item{
+			ID:      itemID,
+			Type:    "reasoning",
+			Status:  lo.ToPtr("completed"),
+			Summary: summary,
+		}
+		if reasoningItem.Signature != "" {
+			item.EncryptedContent = lo.ToPtr(reasoningItem.Signature)
+		}
+		items = append(items, item)
 	}
 
-	return Item{
-		ID:               generateItemID(),
-		Type:             "reasoning",
-		Status:           lo.ToPtr("completed"),
-		Summary:          summary,
-		EncryptedContent: msg.ReasoningSignature,
-	}, true
+	return items
 }

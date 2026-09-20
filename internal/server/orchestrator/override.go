@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
 	"strings"
 	"text/template"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
-	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
@@ -28,17 +28,63 @@ type RenderContext struct {
 	Model string `json:"model"`
 	// Metadata is the metadata used in the current request.
 	Metadata map[string]string `json:"metadata"`
+	// RequestHeader is the filtered request headers used in the current request.
+	RequestHeader map[string]string `json:"request_header"`
+	// PromptCacheKey is the prompt cache key provided by the original request.
+	PromptCacheKey string `json:"prompt_cache_key"`
 	// ReasoningEffort is the reasoning effort used in the current request.
 	ReasoningEffort string `json:"reasoning_effort"`
 }
 
+var overrideTemplateFuncs = template.FuncMap{
+	"toJSON": func(value any) (string, error) {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	},
+}
+
+func buildRequestHeaderMap(llmReq *llm.Request) map[string]string {
+	requestHeaders := make(map[string]string)
+	if llmReq == nil || llmReq.RawRequest == nil || llmReq.RawRequest.Headers == nil {
+		return requestHeaders
+	}
+
+	for key, values := range llmReq.RawRequest.Headers {
+		if len(values) == 0 {
+			continue
+		}
+
+		if httpclient.IsSensitiveHeader(key) {
+			continue
+		}
+
+		value := values[0]
+		canonicalKey := http.CanonicalHeaderKey(key)
+		requestHeaders[canonicalKey] = value
+		requestHeaders[strings.ToLower(key)] = value
+	}
+
+	return requestHeaders
+}
+
 func buildRenderContext(llmReq *llm.Request, requestModel string) RenderContext {
-	return RenderContext{
+	renderCtx := RenderContext{
 		RequestModel:    requestModel,
 		Model:           llmReq.Model,
 		Metadata:        llmReq.Metadata,
+		RequestHeader:   buildRequestHeaderMap(llmReq),
 		ReasoningEffort: llmReq.ReasoningEffort,
 	}
+	if llmReq.PromptCacheKey != nil {
+		renderCtx.PromptCacheKey = *llmReq.PromptCacheKey
+	} else if llmReq.Compact != nil {
+		renderCtx.PromptCacheKey = llmReq.Compact.PromptCacheKey
+	}
+
+	return renderCtx
 }
 
 // renderTemplate renders a Go template string against RenderContext. Returns the original value on error.
@@ -47,7 +93,7 @@ func renderTemplate(ctx context.Context, value string, renderCtx RenderContext) 
 		return value
 	}
 
-	tmpl, err := template.New("override").Funcs(template.FuncMap{}).Parse(value)
+	tmpl, err := template.New("override").Funcs(overrideTemplateFuncs).Parse(value)
 	if err != nil {
 		log.Warn(ctx, "failed to parse override template",
 			log.String("template", value),
@@ -110,6 +156,22 @@ func applyOverrideRequestBody(outbound *PersistentOutboundTransformer) pipeline.
 			return request, nil
 		}
 
+		// Body override operations are implemented with sjson, which silently discards a
+		// non-JSON document and rebuilds it as a fresh JSON object. Applying them to a
+		// multipart body (image edit/variation, transcription, ...) would replace the whole
+		// payload with a tiny JSON object while the Content-Type still advertises the
+		// multipart boundary, so the upstream sees a truncated form.
+		if !bodyOverrideSupported(request) {
+			log.Warn(ctx, "skipping body override operations for non-JSON request body",
+				log.String("channel", channel.Name),
+				log.Int("channel_id", channel.ID),
+				log.String("content_type", requestContentType(request)),
+				log.String("api_format", request.APIFormat),
+			)
+
+			return request, nil
+		}
+
 		llmReq := outbound.state.LlmRequest
 		renderCtx := buildRenderContext(llmReq, outbound.state.OriginalModel)
 		body := request.Body
@@ -153,6 +215,48 @@ func applyOverrideRequestBody(outbound *PersistentOutboundTransformer) pipeline.
 	})
 }
 
+// requestContentType returns the effective outbound Content-Type, preferring the
+// explicit field and falling back to the header.
+func requestContentType(request *httpclient.Request) string {
+	if request == nil {
+		return ""
+	}
+
+	if request.ContentType != "" {
+		return request.ContentType
+	}
+
+	return request.Headers.Get("Content-Type")
+}
+
+// bodyOverrideSupported reports whether channel body override operations can safely be
+// applied to the outbound request body. Only JSON bodies are patchable: sjson treats any
+// non-JSON input as an empty document and returns a freshly built object, which would
+// destroy multipart and binary payloads.
+func bodyOverrideSupported(request *httpclient.Request) bool {
+	if request == nil || len(request.Body) == 0 {
+		return false
+	}
+
+	contentType := requestContentType(request)
+	if contentType != "" {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err == nil && !isJSONMediaType(mediaType) {
+			return false
+		}
+	}
+
+	return gjson.ValidBytes(request.Body)
+}
+
+func isJSONMediaType(mediaType string) bool {
+	mediaType = strings.ToLower(mediaType)
+
+	return mediaType == "application/json" ||
+		mediaType == "text/json" ||
+		strings.HasSuffix(mediaType, "+json")
+}
+
 func applyBodyOperation(
 	ctx context.Context,
 	body []byte,
@@ -166,12 +270,22 @@ func applyBodyOperation(
 	switch op.Op {
 	case objects.OverrideOpSet:
 		return applyBodySet(ctx, body, op, renderCtx)
+	case objects.OverrideOpSetIfAbsent:
+		return applyBodySetIfAbsent(ctx, body, op, renderCtx)
 	case objects.OverrideOpDelete:
 		return applyBodyDelete(body, op)
 	case objects.OverrideOpRename:
 		return applyBodyRename(body, op)
 	case objects.OverrideOpCopy:
 		return applyBodyCopy(body, op)
+	case objects.OverrideOpArrayAppend:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtEnd)
+	case objects.OverrideOpArrayPrepend:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtStart)
+	case objects.OverrideOpArrayInsert:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtIndex)
+	case objects.OverrideOpArrayRemove:
+		return applyBodyArrayRemove(body, op)
 	default:
 		log.Warn(ctx, "unknown override operation",
 			log.String("op", op.Op),
@@ -194,6 +308,20 @@ func applyBodySet(
 	}
 
 	return sjson.SetBytes(body, op.Path, renderedValue)
+}
+
+func applyBodySetIfAbsent(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+) ([]byte, error) {
+	existing := gjson.GetBytes(body, op.Path)
+	if existing.Exists() || existing.Raw == "null" {
+		return body, nil
+	}
+
+	return applyBodySet(ctx, body, op, renderCtx)
 }
 
 func applyBodyDelete(body []byte, op objects.OverrideOperation) ([]byte, error) {
@@ -221,6 +349,140 @@ func applyBodyCopy(body []byte, op objects.OverrideOperation) ([]byte, error) {
 	}
 
 	return sjson.SetBytes(body, op.To, result.Value())
+}
+
+type arrayInsertMode int
+
+const (
+	arrayInsertAtStart arrayInsertMode = iota
+	arrayInsertAtEnd
+	arrayInsertAtIndex
+)
+
+// applyBodyArrayInsert inserts one or more values into an array at the requested position.
+// Behavior:
+//   - If the rendered value is a JSON array and op.Splat is nil or true, its elements are
+//     spread into the target array. Set Splat=false to insert the array as a single nested element.
+//   - When the target path does not exist, a new array is created with the value(s).
+//   - When the target path exists but is not an array, an error is returned.
+//   - For arrayInsertAtIndex, op.Index is required and may be negative (counted from the end).
+//     Out-of-range indexes are clamped to [0, len].
+func applyBodyArrayInsert(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+	mode arrayInsertMode,
+) ([]byte, error) {
+	if op.Path == "" {
+		return body, fmt.Errorf("array op requires a path")
+	}
+
+	rendered := renderOverrideValue(ctx, op.Value, renderCtx)
+
+	splat := true
+	if op.Splat != nil {
+		splat = *op.Splat
+	}
+
+	var toInsert []any
+
+	if arr, ok := rendered.([]any); ok && splat {
+		toInsert = arr
+	} else {
+		toInsert = []any{rendered}
+	}
+
+	existing := gjson.GetBytes(body, op.Path)
+	if !existing.Exists() {
+		// Create a new array at the path. For arrayInsertAtIndex with a non-zero index,
+		// the position is effectively clamped to 0 since the array is empty.
+		return sjson.SetBytes(body, op.Path, toInsert)
+	}
+
+	if !existing.IsArray() {
+		return body, fmt.Errorf("path %q is not an array", op.Path)
+	}
+
+	var current []any
+	if err := json.Unmarshal([]byte(existing.Raw), &current); err != nil {
+		return body, fmt.Errorf("decode array at %q: %w", op.Path, err)
+	}
+
+	var pos int
+
+	switch mode {
+	case arrayInsertAtStart:
+		pos = 0
+	case arrayInsertAtEnd:
+		pos = len(current)
+	case arrayInsertAtIndex:
+		if op.Index == nil {
+			return body, fmt.Errorf("array_insert requires an index")
+		}
+
+		pos = *op.Index
+		if pos < 0 {
+			pos = len(current) + pos
+		}
+
+		if pos < 0 {
+			pos = 0
+		}
+
+		if pos > len(current) {
+			pos = len(current)
+		}
+	}
+
+	merged := make([]any, 0, len(current)+len(toInsert))
+	merged = append(merged, current[:pos]...)
+	merged = append(merged, toInsert...)
+	merged = append(merged, current[pos:]...)
+
+	return sjson.SetBytes(body, op.Path, merged)
+}
+
+// applyBodyArrayRemove removes array items whose relative match path equals the configured value.
+func applyBodyArrayRemove(body []byte, op objects.OverrideOperation) ([]byte, error) {
+	if op.Path == "" {
+		return body, fmt.Errorf("array_remove requires a path")
+	}
+
+	if op.Match == nil {
+		return body, fmt.Errorf("array_remove requires a match")
+	}
+
+	if strings.TrimSpace(op.Match.Path) == "" {
+		return body, fmt.Errorf("array_remove requires a match path")
+	}
+
+	if strings.TrimSpace(op.Match.Eq) == "" {
+		return body, fmt.Errorf("array_remove requires a match eq value")
+	}
+
+	existing := gjson.GetBytes(body, op.Path)
+	if !existing.Exists() {
+		return body, nil
+	}
+
+	if !existing.IsArray() {
+		return body, fmt.Errorf("path %q is not an array", op.Path)
+	}
+
+	matchEq := strings.TrimSpace(op.Match.Eq)
+	items := existing.Array()
+	kept := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		result := gjson.GetBytes([]byte(item.Raw), op.Match.Path)
+		if result.Exists() && result.String() == matchEq {
+			continue
+		}
+
+		kept = append(kept, json.RawMessage([]byte(item.Raw)))
+	}
+
+	return sjson.SetBytes(body, op.Path, kept)
 }
 
 func applyOverrideOperationToHeaders(
@@ -290,126 +552,6 @@ func applyOverrideRequestHeaders(outbound *PersistentOutboundTransformer) pipeli
 
 		for _, op := range overrideHeaders {
 			applyOverrideOperationToHeaders(ctx, request.Headers, op, renderCtx)
-		}
-
-		return request, nil
-	})
-}
-
-// applyPassThroughBody creates a middleware that reuses the original inbound request body when
-// the channel enables pass-through and the inbound and outbound API formats are identical.
-// For formats that encode the selected model in the request body, the mapped llmReq.Model is
-// written back into the copied raw payload so pass-through does not bypass model mapping.
-func applyPassThroughBody(outbound *PersistentOutboundTransformer) pipeline.Middleware {
-	return pipeline.OnRawRequest("pass-through-body", func(ctx context.Context, request *httpclient.Request) (*httpclient.Request, error) {
-		channel := outbound.GetCurrentChannel()
-		if channel.Settings == nil || !channel.Settings.PassThroughBody {
-			return request, nil
-		}
-
-		llmReq := outbound.state.LlmRequest
-
-		// Compare inbound API format (from llm.Request) with outbound API format (from httpclient.Request).
-		// httpclient.Request.APIFormat is set by the outbound transformer to indicate the actual format
-		// used for this specific request.
-		if request.APIFormat == "" || string(llmReq.APIFormat) != request.APIFormat {
-			return request, nil
-		}
-
-		log.Debug(ctx, "applying pass-through body",
-			log.String("channel", channel.Name),
-			log.String("api_format", request.APIFormat),
-		)
-
-		body, err := mergePassThroughBody(llmReq.RawRequest.Body, llmReq.APIFormat, llmReq.Model)
-		if err != nil {
-			log.Warn(ctx, "failed to merge pass-through body, keeping outbound body",
-				log.String("channel", channel.Name),
-				log.Int("channel_id", channel.ID),
-				log.Cause(err),
-			)
-
-			return request, nil
-		}
-
-		request.Body = body
-
-		return request, nil
-	})
-}
-
-func mergePassThroughBody(rawBody []byte, apiFormat llm.APIFormat, model string) ([]byte, error) {
-	body := append([]byte(nil), rawBody...)
-
-	if !passThroughBodyNeedsModelPatch(apiFormat) {
-		return body, nil
-	}
-
-	if model == "" {
-		return body, nil
-	}
-
-	nextBody, err := sjson.SetBytes(body, "model", model)
-	if err != nil {
-		return nil, fmt.Errorf("set model in pass-through body: %w", err)
-	}
-
-	return nextBody, nil
-}
-
-func passThroughBodyNeedsModelPatch(apiFormat llm.APIFormat) bool {
-	//nolint:exhaustive // ohter format do not need model field.
-	switch apiFormat {
-	case llm.APIFormatOpenAIChatCompletion,
-		llm.APIFormatOpenAIResponse,
-		llm.APIFormatOpenAIResponseCompact,
-		llm.APIFormatOpenAIEmbedding,
-		llm.APIFormatAnthropicMessage:
-		return true
-	default:
-		return false
-	}
-}
-
-// applyUserAgentPassThrough creates a middleware that applies the User-Agent pass-through setting.
-func applyUserAgentPassThrough(outbound *PersistentOutboundTransformer, systemService *biz.SystemService) pipeline.Middleware {
-	return pipeline.OnRawRequest("user-agent-pass-through", func(ctx context.Context, request *httpclient.Request) (*httpclient.Request, error) {
-		channel := outbound.GetCurrentChannel()
-		if channel == nil {
-			return request, nil
-		}
-
-		var passThroughEnabled bool
-		if channel.Settings != nil && channel.Settings.PassThroughUserAgent != nil {
-			passThroughEnabled = *channel.Settings.PassThroughUserAgent
-		} else {
-			globalPassThrough, err := systemService.UserAgentPassThrough(ctx)
-			if err != nil {
-				log.Warn(ctx, "failed to get global user agent pass through setting", log.Cause(err))
-
-				passThroughEnabled = false
-			} else {
-				passThroughEnabled = globalPassThrough
-			}
-		}
-
-		// Handle User-Agent header based on pass-through setting
-		// This must be done here (before persistRequestExecution) to ensure
-		// the correct User-Agent is logged in request execution records.
-		if request.Headers == nil {
-			request.Headers = make(http.Header)
-		}
-
-		if passThroughEnabled {
-			// Pass-through enabled: use the original client's User-Agent
-			if outbound.state.LlmRequest != nil && outbound.state.LlmRequest.RawRequest != nil {
-				if clientUA := outbound.state.LlmRequest.RawRequest.Headers.Get("User-Agent"); clientUA != "" {
-					request.Headers.Set("User-Agent", clientUA)
-				}
-			}
-		} else {
-			// Pass-through disabled: use AxonHub's default User-Agent
-			request.Headers.Set("User-Agent", "axonhub/1.0")
 		}
 
 		return request, nil

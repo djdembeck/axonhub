@@ -136,8 +136,12 @@ func convertLLMFinishReasonToGemini(reason *string) string {
 	}
 }
 
-func convertImageURLToGeminiPart(url string) *Part {
-	if parsed := xurl.ParseDataURL(url); parsed != nil {
+func convertImageURLToGeminiPart(image *llm.ImageURL) *Part {
+	if image == nil || image.URL == "" {
+		return nil
+	}
+
+	if parsed := xurl.ParseDataURL(image.URL); parsed != nil {
 		return &Part{
 			InlineData: &Blob{
 				MIMEType: parsed.MediaType,
@@ -146,14 +150,12 @@ func convertImageURLToGeminiPart(url string) *Part {
 		}
 	}
 
-	// Regular URL - use FileData with MIME type detection
-	part := &Part{
+	return &Part{
 		FileData: &FileData{
-			FileURI: url,
+			FileURI:  image.URL,
+			MIMEType: imageMIMEType(image),
 		},
 	}
-
-	return part
 }
 
 func convertVideoURLToGeminiPart(video *llm.VideoURL) *Part {
@@ -173,20 +175,38 @@ func convertVideoURLToGeminiPart(video *llm.VideoURL) *Part {
 	return &Part{
 		FileData: &FileData{
 			FileURI:  video.URL,
-			MIMEType: "video/*",
+			MIMEType: mediaMIMEType(video.MIMEType, video.URL, isVideoMIMEType),
 		},
 	}
 }
 
 func convertAudioToGeminiPart(audio *llm.InputAudio) *Part {
-	if audio == nil || audio.Data == "" {
+	if audio == nil {
+		return nil
+	}
+
+	if audio.Data != "" {
+		mimeType := audio.MIMEType
+		if mimeType == "" {
+			mimeType = audioFormatToMIMEType(audio.Format)
+		}
+
+		return &Part{
+			InlineData: &Blob{
+				MIMEType: mimeType,
+				Data:     audio.Data,
+			},
+		}
+	}
+
+	if audio.URL == "" {
 		return nil
 	}
 
 	return &Part{
-		InlineData: &Blob{
-			MIMEType: audioFormatToMIMEType(audio.Format),
-			Data:     audio.Data,
+		FileData: &FileData{
+			FileURI:  audio.URL,
+			MIMEType: mediaMIMEType(audio.MIMEType, audio.URL, isAudioMIMEType),
 		},
 	}
 }
@@ -213,13 +233,10 @@ func convertDocumentURLToGeminiPart(doc *llm.DocumentURL) *Part {
 		}
 	}
 
-	// Regular URL - use FileData
-	mimeType := doc.MIMEType
-
 	return &Part{
 		FileData: &FileData{
 			FileURI:  doc.URL,
-			MIMEType: mimeType,
+			MIMEType: mediaMIMEType(doc.MIMEType, doc.URL, isDocumentMIMEType),
 		},
 	}
 }

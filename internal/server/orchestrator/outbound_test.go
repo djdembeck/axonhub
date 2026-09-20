@@ -3,21 +3,28 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
 	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
+	entchannel "github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/enttest"
 	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
+	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/pipeline"
+	"github.com/looplj/axonhub/llm/pipeline/cc"
 	"github.com/looplj/axonhub/llm/streams"
+	"github.com/looplj/axonhub/llm/transformer"
 )
 
 // mockTransformer is a simple mock transformer for testing.
@@ -26,31 +33,180 @@ type mockTransformer struct {
 	aggregatedMeta     llm.ResponseMeta
 	aggregatedErr      error
 	apiFormat          llm.APIFormat
+	requestAPIFormat   llm.APIFormat
+	includeEffort      bool
 }
 
 func (m *mockTransformer) TransformRequest(ctx context.Context, req *llm.Request) (*httpclient.Request, error) {
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"model":       req.Model,
 		"messages":    req.Messages,
 		"temperature": 0.5,
 		"max_tokens":  1000,
-	})
+	}
+	if m.includeEffort {
+		payload["reasoning_effort"] = req.ReasoningEffort
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 
 	return &httpclient.Request{
-		Method: "POST",
-		URL:    "https://api.example.com/v1/chat/completions",
-		Body:   body,
+		Method:    "POST",
+		URL:       "https://api.example.com/v1/chat/completions",
+		Body:      body,
+		APIFormat: string(m.requestAPIFormat),
 	}, nil
+}
+
+func TestPersistentOutboundTransformer_TransformRequest_ClaudeCodeOpenAICompatibility(t *testing.T) {
+	tests := []struct {
+		name           string
+		channelType    entchannel.Type
+		userAgent      string
+		wantEffort     string
+		wantSecondRole string
+	}{
+		{
+			name:           "Claude Code maps DeepSeek OpenAI outbound",
+			channelType:    entchannel.TypeDeepseek,
+			userAgent:      "claude-cli/2.1.170 (external, cli)",
+			wantEffort:     "max",
+			wantSecondRole: "user",
+		},
+		{
+			name:           "Claude Code maps OpenCode OpenAI outbound",
+			channelType:    entchannel.TypeOpencodeGo,
+			userAgent:      "claude-cli/2.1.170 (external, cli)",
+			wantEffort:     "max",
+			wantSecondRole: "user",
+		},
+		{
+			name:           "non Claude Code DeepSeek keeps transformer behavior",
+			channelType:    entchannel.TypeDeepseek,
+			userAgent:      "codex_cli_rs/1.0",
+			wantEffort:     "xhigh",
+			wantSecondRole: "system",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outbound := &mockTransformer{
+				apiFormat:        llm.APIFormatGeminiContents,
+				requestAPIFormat: llm.APIFormatOpenAIChatCompletion,
+				includeEffort:    true,
+			}
+			selectedChannel := &biz.Channel{
+				Channel: &ent.Channel{
+					ID:   1,
+					Name: tt.name,
+					Type: tt.channelType,
+					Settings: &objects.ChannelSettings{TransformOptions: objects.TransformOptions{
+						ReasoningEffortMapping: []llm.ReasoningEffortMapping{{From: "xhigh", To: "max"}},
+					}},
+				},
+				Outbound: outbound,
+			}
+			processor := &PersistentOutboundTransformer{
+				wrapped: outbound,
+				outboundLlmRequestMiddlewares: []pipeline.OutboundLlmRequestMiddleware{
+					cc.SystemCacheCompatibility(),
+				},
+				state: &PersistenceState{
+					ChannelModelsCandidates: []*ChannelModelsCandidate{{
+						Channel:   selectedChannel,
+						Models:    []biz.ChannelModelEntry{{RequestModel: "alias", ActualModel: "provider-model"}},
+						APIFormat: llm.APIFormatOpenAIChatCompletion.String(),
+					}},
+				},
+			}
+			request := &llm.Request{
+				Model:           "alias",
+				ReasoningEffort: "xhigh",
+				Messages: []llm.Message{
+					{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hello")}},
+					{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("reminder")}},
+				},
+				RawRequest: &httpclient.Request{Headers: http.Header{
+					"User-Agent": []string{tt.userAgent},
+				}},
+			}
+
+			httpRequest, err := processor.TransformRequest(context.Background(), request)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantEffort, gjson.GetBytes(httpRequest.Body, "reasoning_effort").String())
+			require.Equal(t, tt.wantSecondRole, gjson.GetBytes(httpRequest.Body, "messages.1.role").String())
+		})
+	}
+}
+
+func TestPersistentOutboundTransformer_TransformRequest_AppliesSystemCompatibilityPerAttempt(t *testing.T) {
+	tests := []struct {
+		name          string
+		formats       []llm.APIFormat
+		expectedRoles []string
+	}{
+		{
+			name:          "supported then unsupported",
+			formats:       []llm.APIFormat{llm.APIFormatOpenAIChatCompletion, llm.APIFormatGeminiContents},
+			expectedRoles: []string{"user", "system"},
+		},
+		{
+			name:          "unsupported then supported",
+			formats:       []llm.APIFormat{llm.APIFormatGeminiContents, llm.APIFormatOpenAIResponse},
+			expectedRoles: []string{"system", "user"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidates := make([]*ChannelModelsCandidate, 0, len(tt.formats))
+			for index, format := range tt.formats {
+				outbound := &mockTransformer{apiFormat: format, requestAPIFormat: format}
+				channel := &biz.Channel{
+					Channel:  &ent.Channel{ID: index + 1, Name: format.String()},
+					Outbound: outbound,
+				}
+				candidates = append(candidates, &ChannelModelsCandidate{
+					Channel:   channel,
+					Models:    []biz.ChannelModelEntry{{RequestModel: "alias", ActualModel: "provider-model"}},
+					APIFormat: format.String(),
+				})
+			}
+
+			state := &PersistenceState{ChannelModelsCandidates: candidates}
+			_, processor := NewPersistentTransformers(state, nil, cc.SystemCacheCompatibility())
+			request := &llm.Request{
+				Model: "alias",
+				Messages: []llm.Message{
+					{Role: "system"},
+					{Role: "user"},
+					{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("reminder")}},
+				},
+				RawRequest: &httpclient.Request{Headers: http.Header{
+					"User-Agent": []string{"claude-cli/2.1.170 (external, cli)"},
+				}},
+			}
+
+			for attempt, expectedRole := range tt.expectedRoles {
+				processor.state.CurrentCandidateIndex = attempt
+				httpRequest, err := processor.TransformRequest(context.Background(), request)
+				require.NoError(t, err)
+				require.Equal(t, expectedRole, gjson.GetBytes(httpRequest.Body, "messages.2.role").String())
+				require.Equal(t, "system", request.Messages[2].Role, "attempt middleware must not mutate the shared request")
+			}
+		})
+	}
 }
 
 func (m *mockTransformer) TransformResponse(ctx context.Context, resp *httpclient.Response) (*llm.Response, error) {
 	return &llm.Response{}, nil
 }
 
-func (m *mockTransformer) TransformStream(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
+func (m *mockTransformer) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
 	return nil, nil
 }
 
@@ -58,7 +214,7 @@ func (m *mockTransformer) TransformError(ctx context.Context, err *httpclient.Er
 	return nil
 }
 
-func (m *mockTransformer) AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
+func (m *mockTransformer) AggregateStreamChunks(ctx context.Context, _ *httpclient.Request, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
 	return m.aggregatedResponse, m.aggregatedMeta, m.aggregatedErr
 }
 
@@ -226,6 +382,197 @@ func TestPersistentOutboundTransformer_PrepareForRetry(t *testing.T) {
 	})
 }
 
+func TestPersistentOutboundTransformer_PrepareForRetry_UsesCandidateAPIFormatOutbound(t *testing.T) {
+	ctx := context.Background()
+
+	primaryOutbound := &mockTransformer{apiFormat: llm.APIFormatOpenAIChatCompletion}
+	embeddingOutbound := &mockTransformer{apiFormat: llm.APIFormatOpenAIEmbedding}
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "test-channel",
+		},
+		Outbound: primaryOutbound,
+		Outbounds: map[string]transformer.Outbound{
+			llm.APIFormatOpenAIEmbedding.String(): embeddingOutbound,
+		},
+	}
+
+	processor := &PersistentOutboundTransformer{
+		wrapped: primaryOutbound,
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{
+				Channel:   channel,
+				APIFormat: llm.APIFormatOpenAIEmbedding.String(),
+				Models: []biz.ChannelModelEntry{
+					{RequestModel: "text-embedding-3-small", ActualModel: "text-embedding-3-small"},
+					{RequestModel: "text-embedding-3-large", ActualModel: "text-embedding-3-large"},
+				},
+			},
+			CurrentModelIndex: 0,
+			RequestExec:       &ent.RequestExecution{ID: 1},
+		},
+	}
+
+	err := processor.PrepareForRetry(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, processor.state.CurrentModelIndex)
+	require.Same(t, embeddingOutbound, processor.wrapped)
+}
+
+func TestPersistentOutboundTransformer_NextChannel_UsesCandidateAPIFormatOutbound(t *testing.T) {
+	ctx := context.Background()
+
+	primaryOutbound := &mockTransformer{apiFormat: llm.APIFormatOpenAIChatCompletion}
+	embeddingOutbound := &mockTransformer{apiFormat: llm.APIFormatOpenAIEmbedding}
+	chatChannel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "chat-channel",
+		},
+		Outbound: primaryOutbound,
+	}
+	embeddingChannel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   2,
+			Name: "embedding-channel",
+		},
+		Outbound: primaryOutbound,
+		Outbounds: map[string]transformer.Outbound{
+			llm.APIFormatOpenAIEmbedding.String(): embeddingOutbound,
+		},
+	}
+
+	processor := &PersistentOutboundTransformer{
+		wrapped: primaryOutbound,
+		state: &PersistenceState{
+			CurrentCandidateIndex: 0,
+			ChannelModelsCandidates: []*ChannelModelsCandidate{
+				{
+					Channel: chatChannel,
+					Models:  []biz.ChannelModelEntry{{RequestModel: "gpt-4o-mini", ActualModel: "gpt-4o-mini"}},
+				},
+				{
+					Channel:   embeddingChannel,
+					APIFormat: llm.APIFormatOpenAIEmbedding.String(),
+					Models:    []biz.ChannelModelEntry{{RequestModel: "text-embedding-3-small", ActualModel: "text-embedding-3-small"}},
+				},
+			},
+		},
+	}
+
+	err := processor.NextChannel(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, processor.state.CurrentCandidateIndex)
+	require.Same(t, embeddingChannel, processor.state.CurrentCandidate.Channel)
+	require.Same(t, embeddingOutbound, processor.wrapped)
+}
+
+func TestSelectOutboundForCandidate(t *testing.T) {
+	primaryOutbound := &mockTransformer{apiFormat: llm.APIFormatOpenAIChatCompletion}
+	embeddingOutbound := &mockTransformer{apiFormat: llm.APIFormatOpenAIEmbedding}
+
+	t.Run("nil candidate returns nil", func(t *testing.T) {
+		require.Nil(t, selectOutboundForCandidate(nil))
+	})
+
+	t.Run("candidate with nil channel returns nil", func(t *testing.T) {
+		candidate := &ChannelModelsCandidate{APIFormat: llm.APIFormatOpenAIEmbedding.String()}
+		require.Nil(t, selectOutboundForCandidate(candidate))
+	})
+
+	t.Run("api format set and found in outbounds returns matching outbound", func(t *testing.T) {
+		channel := &biz.Channel{
+			Channel:   &ent.Channel{ID: 1, Name: "test"},
+			Outbound:  primaryOutbound,
+			Outbounds: map[string]transformer.Outbound{llm.APIFormatOpenAIEmbedding.String(): embeddingOutbound},
+		}
+		candidate := &ChannelModelsCandidate{
+			Channel:   channel,
+			APIFormat: llm.APIFormatOpenAIEmbedding.String(),
+		}
+		require.Same(t, embeddingOutbound, selectOutboundForCandidate(candidate))
+	})
+
+	t.Run("api format set but not in outbounds falls back to channel outbound", func(t *testing.T) {
+		channel := &biz.Channel{
+			Channel:   &ent.Channel{ID: 1, Name: "test"},
+			Outbound:  primaryOutbound,
+			Outbounds: map[string]transformer.Outbound{},
+		}
+		candidate := &ChannelModelsCandidate{
+			Channel:   channel,
+			APIFormat: llm.APIFormatOpenAIEmbedding.String(),
+		}
+		require.Same(t, primaryOutbound, selectOutboundForCandidate(candidate))
+	})
+
+	t.Run("nil outbounds falls back to channel outbound", func(t *testing.T) {
+		channel := &biz.Channel{
+			Channel:  &ent.Channel{ID: 1, Name: "test"},
+			Outbound: primaryOutbound,
+		}
+		candidate := &ChannelModelsCandidate{
+			Channel:   channel,
+			APIFormat: llm.APIFormatOpenAIEmbedding.String(),
+		}
+		require.Same(t, primaryOutbound, selectOutboundForCandidate(candidate))
+	})
+
+	t.Run("empty api format falls back to channel outbound", func(t *testing.T) {
+		channel := &biz.Channel{
+			Channel:   &ent.Channel{ID: 1, Name: "test"},
+			Outbound:  primaryOutbound,
+			Outbounds: map[string]transformer.Outbound{llm.APIFormatOpenAIEmbedding.String(): embeddingOutbound},
+		}
+		candidate := &ChannelModelsCandidate{
+			Channel:   channel,
+			APIFormat: "",
+		}
+		require.Same(t, primaryOutbound, selectOutboundForCandidate(candidate))
+	})
+}
+
+func TestPersistentOutboundTransformer_TransformRequest_ResetsStreamCompletedForNewAttempt(t *testing.T) {
+	ctx := context.Background()
+
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:              1,
+			Name:            "test-channel",
+			SupportedModels: []string{"gpt-4"},
+		},
+		Outbound: &mockTransformer{},
+	}
+
+	processor := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			StreamCompleted: true,
+			ChannelModelsCandidates: []*ChannelModelsCandidate{
+				{Channel: channel, Priority: 0, Models: []biz.ChannelModelEntry{{RequestModel: "gpt-4", ActualModel: "gpt-4"}}},
+			},
+			CurrentCandidateIndex: 0,
+			RequestExec:           &ent.RequestExecution{ID: 1},
+		},
+	}
+
+	text := "Hello"
+	llmRequest := &llm.Request{
+		Model: "gpt-4",
+		Messages: []llm.Message{{
+			Role: "user",
+			Content: llm.MessageContent{
+				Content: &text,
+			},
+		}},
+	}
+
+	_, err := processor.TransformRequest(ctx, llmRequest)
+	require.NoError(t, err)
+	require.False(t, processor.state.StreamCompleted)
+}
+
 func TestPersistentOutboundTransformer_CanRetry(t *testing.T) {
 	channel := &biz.Channel{
 		Channel: &ent.Channel{
@@ -295,29 +642,117 @@ func TestPersistentOutboundTransformer_CanRetry(t *testing.T) {
 		require.False(t, outbound.CanRetry(errSkipCandidateByCircuitBreaker))
 	})
 
-	t.Run("retryable error does not depend on model index", func(t *testing.T) {
+	t.Run("sticky candidate should not trigger same-channel retry", func(t *testing.T) {
 		outbound := &PersistentOutboundTransformer{
 			wrapped: &mockTransformer{},
 			state: &PersistenceState{
 				CurrentCandidate: &ChannelModelsCandidate{
-					Channel: channel,
-					Models:  []biz.ChannelModelEntry{{RequestModel: "gpt-4", ActualModel: "gpt-4"}},
+					Channel:     channel,
+					TraceSticky: true,
+					Models: []biz.ChannelModelEntry{
+						{RequestModel: "gpt-4", ActualModel: "gpt-4"},
+						{RequestModel: "gpt-4", ActualModel: "gpt-4-alternative"},
+					},
 				},
-				CurrentModelIndex: 0,
 			},
 		}
 
-		require.True(t, outbound.CanRetry(retryableErr))
+		require.False(t, outbound.CanRetry(retryableErr))
+	})
+
+	t.Run("auto-aggregate empty errors are retryable", func(t *testing.T) {
+		for _, retryErr := range []error{
+			fmt.Errorf("failed to auto-aggregate streaming response: %w", pipeline.ErrEmptyResponse),
+			fmt.Errorf("failed to auto-aggregate streaming response: %w", pipeline.ErrEmptyStreamChunks),
+			fmt.Errorf("failed to auto-aggregate streaming response: %w", pipeline.ErrEmptyAggregatedBody),
+		} {
+			outbound := &PersistentOutboundTransformer{
+				wrapped: &mockTransformer{},
+				state: &PersistenceState{
+					CurrentCandidate: &ChannelModelsCandidate{
+						Channel: channel,
+						Models:  []biz.ChannelModelEntry{{RequestModel: "gpt-4", ActualModel: "gpt-4"}},
+					},
+					CurrentModelIndex: 0,
+				},
+			}
+
+			require.True(t, outbound.CanRetry(retryErr))
+		}
+	})
+}
+
+func TestShouldForceStreamingForCandidate(t *testing.T) {
+	newCandidate := func(policy objects.CapabilityPolicy, apiFormat llm.APIFormat) *ChannelModelsCandidate {
+		return &ChannelModelsCandidate{
+			APIFormat: apiFormat.String(),
+			Channel: &biz.Channel{
+				Channel: &ent.Channel{
+					Policies: objects.ChannelPolicies{Stream: policy},
+				},
+			},
+		}
+	}
+
+	t.Run("supported require-stream fallback request forces streaming", func(t *testing.T) {
+		require.True(t, shouldForceStreamingForCandidate(
+			newCandidate(objects.CapabilityPolicyRequire, llm.APIFormatOpenAIChatCompletion),
+			&llm.Request{RequestType: llm.RequestTypeChat, APIFormat: llm.APIFormatOpenAIChatCompletion},
+		))
+	})
+
+	t.Run("native non-stream candidate does not force streaming", func(t *testing.T) {
+		require.False(t, shouldForceStreamingForCandidate(
+			newCandidate(objects.CapabilityPolicyUnlimited, llm.APIFormatOpenAIChatCompletion),
+			&llm.Request{RequestType: llm.RequestTypeChat, APIFormat: llm.APIFormatOpenAIChatCompletion},
+		))
+	})
+
+	t.Run("unsupported embedding request does not force streaming", func(t *testing.T) {
+		require.False(t, shouldForceStreamingForCandidate(
+			newCandidate(objects.CapabilityPolicyRequire, llm.APIFormatOpenAIEmbedding),
+			&llm.Request{RequestType: llm.RequestTypeEmbedding, APIFormat: llm.APIFormatOpenAIEmbedding},
+		))
+	})
+
+	t.Run("unsupported compact request does not force streaming", func(t *testing.T) {
+		require.False(t, shouldForceStreamingForCandidate(
+			newCandidate(objects.CapabilityPolicyRequire, llm.APIFormatOpenAIResponseCompact),
+			&llm.Request{RequestType: llm.RequestTypeCompact, APIFormat: llm.APIFormatOpenAIResponseCompact},
+		))
+	})
+
+	t.Run("client requested stream keeps existing streaming path", func(t *testing.T) {
+		require.False(t, shouldForceStreamingForCandidate(
+			newCandidate(objects.CapabilityPolicyRequire, llm.APIFormatOpenAIChatCompletion),
+			&llm.Request{Stream: lo.ToPtr(true), RequestType: llm.RequestTypeChat, APIFormat: llm.APIFormatOpenAIChatCompletion},
+		))
 	})
 }
 
 func TestIsCompletedAggregatedOutboundResponse(t *testing.T) {
-	t.Run("usage means completed", func(t *testing.T) {
-		require.True(t, isCompletedAggregatedOutboundResponse(llm.ResponseMeta{Usage: &llm.Usage{TotalTokens: 15}}))
+	t.Run("usage with completion tokens means completed", func(t *testing.T) {
+		require.True(t, isCompletedAggregated(llm.ResponseMeta{Usage: &llm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}}))
 	})
 
-	t.Run("missing usage is not completed", func(t *testing.T) {
-		require.False(t, isCompletedAggregatedOutboundResponse(llm.ResponseMeta{}))
+	t.Run("usage with zero completion tokens is not completed", func(t *testing.T) {
+		require.False(t, isCompletedAggregated(llm.ResponseMeta{Usage: &llm.Usage{PromptTokens: 10, CompletionTokens: 0, TotalTokens: 10}}))
+	})
+
+	t.Run("response id without usage is not completed", func(t *testing.T) {
+		require.False(t, isCompletedAggregated(llm.ResponseMeta{ID: "resp_123"}))
+	})
+
+	t.Run("explicit completed flag is completed", func(t *testing.T) {
+		require.True(t, isCompletedAggregated(llm.ResponseMeta{ID: llm.SpeechStreamResponseID, Completed: true}))
+	})
+
+	t.Run("speech stream aggregate id alone is not completed", func(t *testing.T) {
+		require.False(t, isCompletedAggregated(llm.ResponseMeta{ID: llm.SpeechStreamResponseID}))
+	})
+
+	t.Run("missing usage and id is not completed", func(t *testing.T) {
+		require.False(t, isCompletedAggregated(llm.ResponseMeta{}))
 	})
 }
 
@@ -365,7 +800,12 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 		ctx := ent.NewContext(ctx, client)
 		project := createTestProject(t, ctx, client)
 		ch := createTestChannel(t, ctx, client)
-		_, requestService, _, usageLogService := setupTestServices(t, client)
+		_, requestService, systemService, usageLogService := setupTestServices(t, client)
+		require.NoError(t, systemService.SetStoragePolicy(ctx, &biz.StoragePolicy{
+			StoreChunks:       true,
+			StoreRequestBody:  true,
+			StoreResponseBody: true,
+		}))
 
 		req, err := client.Request.Create().
 			SetProjectID(project.ID).
@@ -388,8 +828,9 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 			Save(ctx)
 		require.NoError(t, err)
 
+		partialEvent := &httpclient.StreamEvent{Type: "response.in_progress", Data: []byte(`{"type":"response.in_progress"}`)}
 		stream := &sliceEventStream{
-			events: []*httpclient.StreamEvent{{Type: "response.in_progress", Data: []byte(`{"type":"response.in_progress"}`)}},
+			events: []*httpclient.StreamEvent{partialEvent},
 		}
 		transformer := &mockTransformer{
 			apiFormat:          llm.APIFormatOpenAIResponse,
@@ -409,6 +850,13 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 		require.Equal(t, requestexecution.StatusFailed, dbExec.Status)
 		require.Contains(t, dbExec.ErrorMessage, "stream ended without terminal event or completed response")
 		require.False(t, state.StreamCompleted)
+
+		storeChunks, err := systemService.StoreChunks(ctx)
+		require.NoError(t, err)
+		require.True(t, storeChunks, "store_chunks should be enabled for this test")
+
+		// Incomplete streams must still persist buffered chunks for debugging.
+		require.Len(t, dbExec.ResponseChunks, 1, "failed execution should keep response_chunks in DB")
 	})
 
 	t.Run("aggregated completed response without terminal event is completed", func(t *testing.T) {
@@ -537,6 +985,66 @@ func TestOutboundPersistentStream_Close_AggregatedResponsesCompletionHandling(t 
 		require.JSONEq(t, string(aggregated), string(dbExec.ResponseBody))
 		require.Equal(t, "resp_codex_like", dbExec.ExternalID)
 		require.True(t, state.StreamCompleted)
+	})
+
+	t.Run("canceled client after finish reason is still completed without done or usage", func(t *testing.T) {
+		client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+		defer client.Close()
+
+		baseCtx := ent.NewContext(ctx, client)
+		project := createTestProject(t, baseCtx, client)
+		ch := createTestChannel(t, baseCtx, client)
+		_, requestService, _, usageLogService := setupTestServices(t, client)
+
+		req, err := client.Request.Create().
+			SetProjectID(project.ID).
+			SetChannelID(ch.ID).
+			SetModelID("gpt-4.1").
+			SetStatus(request.StatusPending).
+			SetRequestBody([]byte(`{"stream":true}`)).
+			Save(baseCtx)
+		require.NoError(t, err)
+
+		exec, err := client.RequestExecution.Create().
+			SetRequestID(req.ID).
+			SetProjectID(project.ID).
+			SetChannelID(ch.ID).
+			SetModelID("gpt-4.1").
+			SetRequestBody([]byte(`{"stream":true}`)).
+			SetFormat("openai/chat_completions").
+			SetStatus(requestexecution.StatusPending).
+			SetStream(true).
+			Save(baseCtx)
+		require.NoError(t, err)
+
+		finalChunk := &httpclient.StreamEvent{
+			Data: []byte(`{"id":"chatcmpl_complete","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`),
+		}
+		stream := &sliceEventStream{events: []*httpclient.StreamEvent{finalChunk}}
+		aggregated := []byte(`{"id":"chatcmpl_complete","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+		transformer := &mockTransformer{
+			apiFormat:          llm.APIFormatOpenAIChatCompletion,
+			aggregatedResponse: aggregated,
+			aggregatedMeta:     llm.ResponseMeta{ID: "chatcmpl_complete"},
+		}
+		state := &PersistenceState{}
+
+		requestCtx, cancel := context.WithCancel(baseCtx)
+		persistentStream := NewOutboundPersistentStream(requestCtx, stream, req, exec, requestService, usageLogService, transformer, nil, state)
+		require.True(t, persistentStream.Next())
+		require.Equal(t, finalChunk, persistentStream.Current())
+		require.True(t, state.StreamCompleted)
+
+		// Simulate the agent closing its SSE request immediately after consuming
+		// the final semantic response, before a trailing [DONE] can be consumed.
+		cancel()
+		require.NoError(t, persistentStream.Close())
+
+		dbExec, err := client.RequestExecution.Get(baseCtx, exec.ID)
+		require.NoError(t, err)
+		require.Equal(t, requestexecution.StatusCompleted, dbExec.Status)
+		require.Empty(t, dbExec.ErrorMessage)
+		require.JSONEq(t, string(aggregated), string(dbExec.ResponseBody))
 	})
 }
 
@@ -726,7 +1234,7 @@ func TestPersistentOutboundTransformer_CanRetry_429_WithoutRetryAfter(t *testing
 		Outbound: &mockTransformer{},
 	}
 
-	t.Run("429 without Retry-After (nil headers) should allow retry", func(t *testing.T) {
+	t.Run("429 without Retry-After (nil headers) should skip same-channel retry", func(t *testing.T) {
 		outbound := &PersistentOutboundTransformer{
 			wrapped: &mockTransformer{},
 			state: &PersistenceState{
@@ -744,10 +1252,10 @@ func TestPersistentOutboundTransformer_CanRetry_429_WithoutRetryAfter(t *testing
 			Headers:    nil,
 		}
 
-		require.True(t, outbound.CanRetry(httpErr))
+		require.False(t, outbound.CanRetry(httpErr))
 	})
 
-	t.Run("429 without Retry-After (empty headers) should allow retry", func(t *testing.T) {
+	t.Run("429 without Retry-After (empty headers) should skip same-channel retry", func(t *testing.T) {
 		outbound := &PersistentOutboundTransformer{
 			wrapped: &mockTransformer{},
 			state: &PersistenceState{
@@ -765,10 +1273,10 @@ func TestPersistentOutboundTransformer_CanRetry_429_WithoutRetryAfter(t *testing
 			Headers:    http.Header{},
 		}
 
-		require.True(t, outbound.CanRetry(httpErr))
+		require.False(t, outbound.CanRetry(httpErr))
 	})
 
-	t.Run("429 without Retry-After (headers but no Retry-After key) should allow retry", func(t *testing.T) {
+	t.Run("429 without Retry-After (headers but no Retry-After key) should skip same-channel retry", func(t *testing.T) {
 		outbound := &PersistentOutboundTransformer{
 			wrapped: &mockTransformer{},
 			state: &PersistenceState{
@@ -788,8 +1296,36 @@ func TestPersistentOutboundTransformer_CanRetry_429_WithoutRetryAfter(t *testing
 			},
 		}
 
-		require.True(t, outbound.CanRetry(httpErr))
+		require.False(t, outbound.CanRetry(httpErr))
 	})
+}
+
+func TestPersistentOutboundTransformer_CanRetry_ChannelRetryableStatusCodes(t *testing.T) {
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "test-channel",
+			Settings: &objects.ChannelSettings{
+				RetryableStatusCodes: []int{http.StatusBadRequest, http.StatusForbidden},
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{
+				Channel: channel,
+				Models:  []biz.ChannelModelEntry{{RequestModel: "gpt-4", ActualModel: "gpt-4"}},
+			},
+			CurrentModelIndex: 0,
+		},
+	}
+
+	require.True(t, outbound.CanRetry(&httpclient.Error{StatusCode: http.StatusBadRequest}))
+	require.True(t, outbound.CanRetry(&httpclient.Error{StatusCode: http.StatusForbidden}))
+	require.False(t, outbound.CanRetry(&httpclient.Error{StatusCode: http.StatusUnauthorized}))
 }
 
 func TestPersistentOutboundTransformer_CanRetry_429_WithMultipleModels(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/scopes"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/gc"
 	"github.com/samber/lo"
 )
 
@@ -32,6 +33,13 @@ func (r *mutationResolver) UpdateBrandSettings(ctx context.Context, input Update
 		err := r.systemService.SetBrandLogo(ctx, *input.BrandLogo)
 		if err != nil {
 			return false, fmt.Errorf("failed to update brand logo setting: %w", err)
+		}
+	}
+
+	if input.Title != nil {
+		err := r.systemService.SetTitle(ctx, *input.Title)
+		if err != nil {
+			return false, fmt.Errorf("failed to update title setting: %w", err)
 		}
 	}
 
@@ -70,6 +78,19 @@ func (r *mutationResolver) UpdateWebhookNotifierConfig(ctx context.Context, inpu
 
 // UpdateSystemModelSettings is the resolver for the updateSystemModelSettings field.
 func (r *mutationResolver) UpdateSystemModelSettings(ctx context.Context, input biz.SystemModelSettings) (bool, error) {
+	// Older clients may update the model toggles without sending developer rules.
+	// Preserve them unless the caller explicitly sends an empty list.
+	// This still follows the existing last-writer-wins behavior for concurrent
+	// full settings updates; callers editing developer rules should send the
+	// complete developerSettings list.
+	if input.DeveloperSettings == nil {
+		current, err := r.systemService.ModelSettings(ctx)
+		if err != nil {
+			return false, fmt.Errorf("failed to get current system model settings: %w", err)
+		}
+		input.DeveloperSettings = current.DeveloperSettings
+	}
+
 	err := r.systemService.SetModelSettings(ctx, input)
 	if err != nil {
 		return false, fmt.Errorf("failed to update system model settings: %w", err)
@@ -119,16 +140,8 @@ func (r *mutationResolver) CompleteAutoDisableChannelOnboarding(ctx context.Cont
 }
 
 // UpdateSystemChannelSettings is the resolver for the updateSystemChannelSettings field.
-func (r *mutationResolver) UpdateSystemChannelSettings(ctx context.Context, input biz.SystemChannelSettings) (bool, error) {
-	setting := *r.systemService.ChannelSettingOrDefault(ctx)
-	if input.Probe.Frequency != "" {
-		setting.Probe = input.Probe
-	}
-	if input.AutoSync.Frequency != "" {
-		setting.AutoSync = input.AutoSync
-	}
-
-	err := r.systemService.SetChannelSetting(ctx, setting)
+func (r *mutationResolver) UpdateSystemChannelSettings(ctx context.Context, input biz.UpdateSystemChannelSettings) (bool, error) {
+	err := r.systemService.UpdateChannelSetting(ctx, input)
 	if err != nil {
 		return false, fmt.Errorf("failed to update channel setting: %w", err)
 	}
@@ -143,6 +156,8 @@ func (r *mutationResolver) UpdateSystemGeneralSettings(ctx context.Context, inpu
 		return false, fmt.Errorf("failed to update general settings: %w", err)
 	}
 
+	r.backupService.Reschedule(ctx, r.scheduler)
+
 	return true, nil
 }
 
@@ -151,6 +166,81 @@ func (r *mutationResolver) UpdateVideoStorageSettings(ctx context.Context, input
 	err := r.systemService.SetVideoStorageSettings(ctx, input)
 	if err != nil {
 		return false, fmt.Errorf("failed to update video storage settings: %w", err)
+	}
+
+	r.videoWorker.Reschedule(ctx, r.scheduler)
+
+	return true, nil
+}
+
+// UpdateQuotaEnforcementSettings is the resolver for the updateQuotaEnforcementSettings field.
+func (r *mutationResolver) UpdateQuotaEnforcementSettings(ctx context.Context, input UpdateQuotaEnforcementSettingsInput) (bool, error) {
+	current, err := r.systemService.QuotaEnforcementSettings(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to read current quota enforcement settings: %w", err)
+	}
+	newSettings := biz.QuotaEnforcementSettings{
+		Enabled:           current.Enabled,
+		Mode:              current.Mode,
+		AllowedChannelIDs: current.AllowedChannelIDs,
+	}
+	if input.Enabled != nil {
+		newSettings.Enabled = *input.Enabled
+	}
+	if input.Mode != nil {
+		newSettings.Mode = *input.Mode
+	}
+	if input.AllowedChannelIDs != nil {
+		newSettings.AllowedChannelIDs = objects.IntGuids(input.AllowedChannelIDs)
+	}
+
+	err = r.systemService.SetQuotaEnforcementSettings(ctx, newSettings)
+	if err != nil {
+		return false, fmt.Errorf("failed to update quota enforcement settings: %w", err)
+	}
+
+	return true, nil
+}
+
+// UpdateProviderQuotaCollectionSettings is the resolver for the updateProviderQuotaCollectionSettings field.
+func (r *mutationResolver) UpdateProviderQuotaCollectionSettings(ctx context.Context, input UpdateProviderQuotaCollectionSettingsInput) (bool, error) {
+	providers := make([]biz.ProviderQuotaCollectionProvider, 0, len(input.Providers))
+	for _, provider := range input.Providers {
+		providers = append(providers, biz.ProviderQuotaCollectionProvider{
+			Provider: provider.Provider,
+			Enabled:  provider.Enabled,
+		})
+	}
+
+	if err := r.systemService.UpdateProviderQuotaCollectionSettings(ctx, input.Enabled, providers); err != nil {
+		return false, fmt.Errorf("failed to update provider quota collection settings: %w", err)
+	}
+
+	return true, nil
+}
+
+// UpdateSecuritySettings is the resolver for the updateSecuritySettings field.
+func (r *mutationResolver) UpdateSecuritySettings(ctx context.Context, input UpdateSecuritySettingsInput) (bool, error) {
+	current, err := r.systemService.SecuritySettings(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to read current security settings: %w", err)
+	}
+
+	newSettings := biz.SecuritySettings{
+		BlockedIPs:              current.BlockedIPs,
+		ShowRequestLogIPBanIcon: current.ShowRequestLogIPBanIcon,
+	}
+
+	if input.BlockedIPs != nil {
+		newSettings.BlockedIPs = input.BlockedIPs
+	}
+	if input.ShowRequestLogIPBanIcon != nil {
+		newSettings.ShowRequestLogIPBanIcon = *input.ShowRequestLogIPBanIcon
+	}
+
+	err = r.systemService.SetSecuritySettings(ctx, newSettings)
+	if err != nil {
+		return false, fmt.Errorf("failed to update security settings: %w", err)
 	}
 
 	return true, nil
@@ -167,8 +257,25 @@ func (r *mutationResolver) CheckProviderQuotas(ctx context.Context) (bool, error
 	return true, nil
 }
 
+// ResetChannelQuotaNow is the resolver for the resetChannelQuotaNow field.
+func (r *mutationResolver) ResetChannelQuotaNow(ctx context.Context, channelID objects.GUID) (bool, error) {
+	if !scopes.UserHasScope(ctx, scopes.ScopeWriteChannels) {
+		return false, fmt.Errorf("permission denied: requires write:channels scope")
+	}
+
+	if r.providerQuotaService == nil {
+		return false, fmt.Errorf("provider quota service is not available")
+	}
+
+	if err := r.providerQuotaService.ResetChannelQuotaNow(ctx, channelID.ID); err != nil {
+		return false, fmt.Errorf("failed to reset channel quota: %w", err)
+	}
+
+	return true, nil
+}
+
 // TriggerGcCleanup is the resolver for the triggerGcCleanup field.
-func (r *mutationResolver) TriggerGcCleanup(ctx context.Context) (bool, error) {
+func (r *mutationResolver) TriggerGcCleanup(ctx context.Context, input gc.TriggerGcCleanupInput) (bool, error) {
 	if !scopes.UserHasScope(ctx, scopes.ScopeWriteSettings) {
 		return false, fmt.Errorf("permission denied: requires write:settings scope")
 	}
@@ -183,7 +290,7 @@ func (r *mutationResolver) TriggerGcCleanup(ctx context.Context) (bool, error) {
 
 		// Use a detached context with system bypass for background execution
 		bgCtx := authz.WithSystemBypass(context.WithoutCancel(ctx), "manual-gc-cleanup")
-		_ = r.gcWorker.RunCleanupNow(bgCtx)
+		_ = r.gcWorker.RunCleanupNow(bgCtx, input)
 	}()
 
 	return true, nil
@@ -219,6 +326,61 @@ func (r *mutationResolver) UpdateUserAgentPassThroughSettings(ctx context.Contex
 	return true, nil
 }
 
+// UpdatePassThroughSettings is the resolver for the updatePassThroughSettings field.
+func (r *mutationResolver) UpdatePassThroughSettings(ctx context.Context, input UpdatePassThroughSettingsInput) (bool, error) {
+	err := r.systemService.SetPassThrough(ctx, input.Enabled)
+	if err != nil {
+		return false, fmt.Errorf("failed to update pass-through settings: %w", err)
+	}
+
+	return true, nil
+}
+
+// UpdateCatalogSettings is the resolver for the updateCatalogSettings field.
+func (r *mutationResolver) UpdateCatalogSettings(ctx context.Context, input UpdateCatalogSettingsInput) (bool, error) {
+	if !scopes.UserHasScope(ctx, scopes.ScopeWriteSettings) {
+		return false, fmt.Errorf("permission denied: requires write_settings scope")
+	}
+
+	settings := r.systemService.CatalogSettingsOrDefault(ctx)
+	if input.UpstreamURL != nil {
+		settings.UpstreamURL = *input.UpstreamURL
+	}
+
+	if input.RefreshSeconds != nil {
+		settings.RefreshSeconds = *input.RefreshSeconds
+	}
+
+	if err := r.systemService.SetCatalogSettings(ctx, settings); err != nil {
+		return false, fmt.Errorf("failed to update catalog settings: %w", err)
+	}
+
+	if r.catalogService != nil {
+		r.catalogService.Invalidate()
+		r.catalogService.Reschedule(ctx, r.scheduler)
+	}
+
+	return true, nil
+}
+
+// RefreshProvidersCatalog is the resolver for the refreshProvidersCatalog field.
+func (r *mutationResolver) RefreshProvidersCatalog(ctx context.Context) (*ProvidersCatalog, error) {
+	if !scopes.UserHasScope(ctx, scopes.ScopeWriteSettings) {
+		return nil, fmt.Errorf("permission denied: requires write_settings scope")
+	}
+
+	if r.catalogService == nil {
+		return nil, fmt.Errorf("catalog service is not configured")
+	}
+
+	snapshot, err := r.catalogService.Refresh(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh providers catalog: %w", err)
+	}
+
+	return providersCatalogFromSnapshot(snapshot), nil
+}
+
 // ClearCache is the resolver for the clearCache field.
 func (r *mutationResolver) ClearCache(ctx context.Context, input ClearCacheInput) (*ClearCachePayload, error) {
 	user, ok := contexts.GetUser(ctx)
@@ -246,6 +408,74 @@ func (r *mutationResolver) ClearCache(ctx context.Context, input ClearCacheInput
 	}, nil
 }
 
+// Providers is the resolver for the providers field.
+func (r *providerQuotaCollectionSettingsResolver) Providers(ctx context.Context, obj *biz.ProviderQuotaCollectionSettings) ([]*biz.ProviderQuotaCollectionProvider, error) {
+	providers := make([]*biz.ProviderQuotaCollectionProvider, 0, len(obj.Providers))
+	for _, providerType := range biz.SupportedProviderQuotaTypes() {
+		providers = append(providers, &biz.ProviderQuotaCollectionProvider{
+			Provider: providerType,
+			Enabled:  obj.Providers[providerType],
+		})
+	}
+
+	return providers, nil
+}
+
+// PreviewGcCleanup is the resolver for the previewGcCleanup field.
+func (r *queryResolver) PreviewGcCleanup(ctx context.Context, input gc.TriggerGcCleanupInput) ([]*gc.GcCleanupPreviewItem, error) {
+	if !scopes.UserHasScope(ctx, scopes.ScopeReadSettings) {
+		return nil, fmt.Errorf("permission denied: requires read:settings scope")
+	}
+
+	items, err := r.gcWorker.PreviewCleanup(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*gc.GcCleanupPreviewItem, len(items))
+	for i := range items {
+		result[i] = &items[i]
+	}
+	return result, nil
+}
+
+// ProvidersCatalog is the resolver for the providersCatalog field.
+func (r *queryResolver) ProvidersCatalog(ctx context.Context, filtered *bool) (*ProvidersCatalog, error) {
+	if !scopes.UserHasScope(ctx, scopes.ScopeReadChannels) {
+		return nil, fmt.Errorf("permission denied: requires read_channels scope")
+	}
+
+	if r.catalogService == nil {
+		return nil, fmt.Errorf("catalog service is not configured")
+	}
+
+	wantFiltered := true
+	if filtered != nil {
+		wantFiltered = *filtered
+	}
+
+	snapshot, err := r.catalogService.Snapshot(ctx, wantFiltered)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load providers catalog: %w", err)
+	}
+
+	return providersCatalogFromSnapshot(snapshot), nil
+}
+
+// CatalogSettings is the resolver for the catalogSettings field.
+func (r *queryResolver) CatalogSettings(ctx context.Context) (*biz.CatalogSettings, error) {
+	if !scopes.UserHasScope(ctx, scopes.ScopeReadSettings) {
+		return nil, fmt.Errorf("permission denied: requires read_settings scope")
+	}
+
+	settings, err := r.systemService.CatalogSettings(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get catalog settings: %w", err)
+	}
+
+	return settings, nil
+}
+
 // SystemStatus is the resolver for the systemStatus field.
 func (r *queryResolver) SystemStatus(ctx context.Context) (*SystemStatus, error) {
 	isInitialized, err := r.systemService.IsInitialized(ctx)
@@ -270,9 +500,15 @@ func (r *queryResolver) BrandSettings(ctx context.Context) (*BrandSettings, erro
 		return nil, fmt.Errorf("failed to get brand logo: %w", err)
 	}
 
+	title, err := r.systemService.Title(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get title: %w", err)
+	}
+
 	return &BrandSettings{
 		BrandName: &brandName,
 		BrandLogo: &brandLogo,
+		Title:     &title,
 	}, nil
 }
 
@@ -357,8 +593,8 @@ func (r *queryResolver) SystemVersion(ctx context.Context) (*build.Info, error) 
 }
 
 // CheckForUpdate is the resolver for the checkForUpdate field.
-func (r *queryResolver) CheckForUpdate(ctx context.Context) (*VersionCheck, error) {
-	result, err := r.systemService.CheckForUpdate(ctx)
+func (r *queryResolver) CheckForUpdate(ctx context.Context, includeBeta bool) (*VersionCheck, error) {
+	result, err := r.systemService.CheckForUpdate(ctx, includeBeta)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check for update: %w", err)
 	}
@@ -391,6 +627,21 @@ func (r *queryResolver) VideoStorageSettings(ctx context.Context) (*biz.VideoSto
 	return r.systemService.VideoStorageSettings(ctx)
 }
 
+// QuotaEnforcementSettings is the resolver for the quotaEnforcementSettings field.
+func (r *queryResolver) QuotaEnforcementSettings(ctx context.Context) (*biz.QuotaEnforcementSettings, error) {
+	return r.systemService.QuotaEnforcementSettings(ctx)
+}
+
+// ProviderQuotaCollectionSettings is the resolver for the providerQuotaCollectionSettings field.
+func (r *queryResolver) ProviderQuotaCollectionSettings(ctx context.Context) (*biz.ProviderQuotaCollectionSettings, error) {
+	return r.systemService.ProviderQuotaCollectionSettings(ctx)
+}
+
+// SecuritySettings is the resolver for the securitySettings field.
+func (r *queryResolver) SecuritySettings(ctx context.Context) (*biz.SecuritySettings, error) {
+	return r.systemService.SecuritySettings(ctx)
+}
+
 // ProxyPresets is the resolver for the proxyPresets field.
 func (r *queryResolver) ProxyPresets(ctx context.Context) ([]*biz.ProxyPreset, error) {
 	presets, err := r.systemService.ProxyPresets(ctx)
@@ -409,6 +660,18 @@ func (r *queryResolver) UserAgentPassThroughSettings(ctx context.Context) (*User
 	}
 
 	return &UserAgentPassThroughSettings{
+		Enabled: enabled,
+	}, nil
+}
+
+// PassThroughSettings is the resolver for the passThroughSettings field.
+func (r *queryResolver) PassThroughSettings(ctx context.Context) (*PassThroughSettings, error) {
+	enabled, err := r.systemService.PassThrough(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pass-through settings: %w", err)
+	}
+
+	return &PassThroughSettings{
 		Enabled: enabled,
 	}, nil
 }
@@ -450,3 +713,23 @@ func (r *queryResolver) GetCacheDiagnostics(ctx context.Context, input *GetCache
 		Targets:  normalizeDiagnosticsTargets(targets),
 	}, nil
 }
+
+// AllowedChannelIDs is the resolver for the allowedChannelIDs field.
+func (r *quotaEnforcementSettingsResolver) AllowedChannelIDs(ctx context.Context, obj *biz.QuotaEnforcementSettings) ([]*objects.GUID, error) {
+	return lo.Map(obj.AllowedChannelIDs, func(id int, _ int) *objects.GUID {
+		return &objects.GUID{Type: "Channel", ID: id}
+	}), nil
+}
+
+// ProviderQuotaCollectionSettings returns ProviderQuotaCollectionSettingsResolver implementation.
+func (r *Resolver) ProviderQuotaCollectionSettings() ProviderQuotaCollectionSettingsResolver {
+	return &providerQuotaCollectionSettingsResolver{r}
+}
+
+// QuotaEnforcementSettings returns QuotaEnforcementSettingsResolver implementation.
+func (r *Resolver) QuotaEnforcementSettings() QuotaEnforcementSettingsResolver {
+	return &quotaEnforcementSettingsResolver{r}
+}
+
+type providerQuotaCollectionSettingsResolver struct{ *Resolver }
+type quotaEnforcementSettingsResolver struct{ *Resolver }

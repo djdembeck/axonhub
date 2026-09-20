@@ -95,6 +95,15 @@ type Request struct {
 
 	// Verbosity constrains response verbosity.
 	Verbosity *string `json:"verbosity,omitempty"`
+
+	// Thinking controls reasoning/thinking behavior (used by DeepSeek and compatible providers).
+	Thinking *Thinking `json:"thinking,omitempty"`
+}
+
+// Thinking represents the thinking configuration for reasoning models.
+type Thinking struct {
+	// Type is "enabled" or "disabled".
+	Type string `json:"type"`
 }
 
 // StreamOptions for streaming responses.
@@ -129,6 +138,7 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		s.Stop = &str
 		s.MultipleStop = nil
+
 		return nil
 	}
 
@@ -138,6 +148,7 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		s.Stop = nil
 		s.MultipleStop = strs
+
 		return nil
 	}
 
@@ -179,6 +190,10 @@ type Message struct {
 type Annotation struct {
 	// Type is the type of annotation, e.g., "url_citation"
 	Type string `json:"type,omitempty"`
+	// StartIndex is the start byte offset of the annotated span in the message content.
+	StartIndex *int64 `json:"start_index,omitempty"`
+	// EndIndex is the end byte offset of the annotated span in the message content.
+	EndIndex *int64 `json:"end_index,omitempty"`
 	// URLCitation contains URL citation details when Type is "url_citation"
 	URLCitation *URLCitation `json:"url_citation,omitempty"`
 }
@@ -225,6 +240,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		c.Content = &str
 		c.MultipleContent = nil
+
 		return nil
 	}
 
@@ -234,6 +250,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		c.Content = nil
 		c.MultipleContent = parts
+
 		return nil
 	}
 
@@ -365,7 +382,7 @@ type Function struct {
 
 // FunctionCall represents a function call.
 type FunctionCall struct {
-	Name      string `json:"name"`
+	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
 }
 

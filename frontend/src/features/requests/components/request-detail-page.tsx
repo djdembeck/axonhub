@@ -1,17 +1,18 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { format } from 'date-fns';
-import { useParams, useNavigate } from '@tanstack/react-router';
-import { ArrowLeft, FileText } from 'lucide-react';
+import { useParams, useNavigate, useRouterState } from '@tanstack/react-router';
+import { ArrowLeft, Copy, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
+import { getTokenFromStorage } from '@/stores/authStore';
+import { useSelectedProjectId } from '@/stores/projectStore';
 import { extractNumberID } from '@/lib/utils';
-import { usePaginationSearch } from '@/hooks/use-pagination-search';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Header } from '@/components/layout/header';
 import { Main } from '@/components/layout/main';
 import { useStoragePolicy } from '@/features/system/data/system';
-import { useSelectedProjectId } from '@/stores/projectStore';
-import { getTokenFromStorage } from '@/stores/authStore';
 import { type Request, useRequest } from '../data';
 import { RequestDetailContent } from './request-detail-content';
 
@@ -78,7 +79,7 @@ async function readPreviewStream(
   const flushBuffer = async (final = false) => {
     const normalizedBuffer = buffer.replace(/\r\n/g, '\n');
     const separator = '\n\n';
-    let separatorIndex = normalizedBuffer.indexOf(separator);
+    const separatorIndex = normalizedBuffer.indexOf(separator);
 
     while (separatorIndex !== -1) {
       const rawEvent = normalizedBuffer.slice(0, separatorIndex);
@@ -120,7 +121,9 @@ export default function RequestDetailPage() {
   const { t } = useTranslation();
   const { requestId } = useParams({ from: '/_authenticated/project/requests/$requestId' });
   const navigate = useNavigate();
-  const { getSearchParams } = usePaginationSearch({ defaultPageSize: 20 });
+  const currentSearch = useRouterState({
+    select: (state) => (state.location.search ?? {}) as Record<string, unknown>,
+  });
   const selectedProjectId = useSelectedProjectId();
   const { data: storagePolicy } = useStoragePolicy();
   const isLivePreviewEnabled = storagePolicy?.livePreview ?? false;
@@ -130,10 +133,10 @@ export default function RequestDetailPage() {
   const previewCompletedRef = useRef(false);
   const previewChunkCountRef = useRef(0);
 
-  const {
-    data: requestData,
-    refetch: refetchRequest,
-  } = useRequest(requestId, { projectId: selectedProjectId, disableAutoRefresh: isPreviewStreaming });
+  const { data: requestData, refetch: refetchRequest } = useRequest(requestId, {
+    projectId: selectedProjectId,
+    disableAutoRefresh: isPreviewStreaming,
+  });
 
   const request = previewRequest ?? requestData;
 
@@ -246,12 +249,14 @@ export default function RequestDetailPage() {
         if (!contentType.includes('text/event-stream')) {
           const fallbackResponse = (await response.json()) as PreviewFallbackResponse;
           if (!isDisposed && fallbackResponse.mode === 'static-fetch') {
-            setPreviewRequest((currentRequest) => currentRequest
-              ? {
-                  ...currentRequest,
-                  responseChunks: fallbackResponse.responseChunks ?? currentRequest.responseChunks,
-                }
-              : currentRequest);
+            setPreviewRequest((currentRequest) =>
+              currentRequest
+                ? {
+                    ...currentRequest,
+                    responseChunks: fallbackResponse.responseChunks ?? currentRequest.responseChunks,
+                  }
+                : currentRequest
+            );
             setIsPreviewStreaming(false);
             setPreviewFallbackActive(true);
           } else if (!isDisposed) {
@@ -278,12 +283,14 @@ export default function RequestDetailPage() {
 
               const nextChunk = parsePreviewChunk(data);
               previewChunkCountRef.current += 1;
-              setPreviewRequest((currentRequest) => currentRequest
-                ? {
-                  ...currentRequest,
-                  responseChunks: [...(currentRequest.responseChunks ?? []), nextChunk],
-                }
-                : currentRequest);
+              setPreviewRequest((currentRequest) =>
+                currentRequest
+                  ? {
+                      ...currentRequest,
+                      responseChunks: [...(currentRequest.responseChunks ?? []), nextChunk],
+                    }
+                  : currentRequest
+              );
               return;
             }
 
@@ -337,12 +344,22 @@ export default function RequestDetailPage() {
   const handleBack = () => {
     navigate({
       to: '/project/requests',
-      search: getSearchParams(),
+      search: currentSearch,
     });
   };
 
+  const copyRequestID = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(request?.id ?? requestId);
+      toast.success(t('requests.actions.copied'));
+    } catch {
+      toast.error(t('common.errors.copyFailed'));
+    }
+  };
+
   return (
-    <div className='flex h-screen flex-col'>
+    <div className='flex h-full flex-col'>
       <Header className='bg-background/95 supports-[backdrop-filter]:bg-background/60 border-b backdrop-blur'>
         <div className='flex items-center space-x-4'>
           <Button variant='ghost' size='sm' onClick={handleBack} className='hover:bg-accent'>
@@ -355,9 +372,20 @@ export default function RequestDetailPage() {
               <FileText className='text-primary h-4 w-4' />
             </div>
             <div>
-              <h1 className='text-lg leading-none font-semibold'>
-                {t('requests.detail.title')} #{request ? extractNumberID(request.id) || request.id : extractNumberID(requestId) || requestId}
-              </h1>
+              <div className='flex items-center gap-1'>
+                <h1 className='text-lg leading-none font-semibold'>
+                  {t('requests.detail.title')} #
+                  {request ? extractNumberID(request.id) || request.id : extractNumberID(requestId) || requestId}
+                </h1>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant='ghost' size='icon-sm' className='h-7 w-7' onClick={() => void copyRequestID()} aria-label={t('requests.actions.copyRequestId')}>
+                      <Copy className='h-3.5 w-3.5' />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t('requests.actions.copyRequestId')}</TooltipContent>
+                </Tooltip>
+              </div>
               {request && (
                 <div className='mt-1 flex items-center gap-2'>
                   <p className='text-muted-foreground text-sm'>{request.modelID || t('requests.columns.unknown')}</p>

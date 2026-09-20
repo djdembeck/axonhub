@@ -134,6 +134,20 @@ func (_c *RequestCreate) SetModelID(v string) *RequestCreate {
 	return _c
 }
 
+// SetReasoningEffort sets the "reasoning_effort" field.
+func (_c *RequestCreate) SetReasoningEffort(v string) *RequestCreate {
+	_c.mutation.SetReasoningEffort(v)
+	return _c
+}
+
+// SetNillableReasoningEffort sets the "reasoning_effort" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableReasoningEffort(v *string) *RequestCreate {
+	if v != nil {
+		_c.SetReasoningEffort(*v)
+	}
+	return _c
+}
+
 // SetFormat sets the "format" field.
 func (_c *RequestCreate) SetFormat(v string) *RequestCreate {
 	_c.mutation.SetFormat(v)
@@ -487,6 +501,11 @@ func (_c *RequestCreate) check() error {
 	if _, ok := _c.mutation.RequestBody(); !ok {
 		return &ValidationError{Name: "request_body", err: errors.New(`ent: missing required field "Request.request_body"`)}
 	}
+	if v, ok := _c.mutation.ExternalID(); ok {
+		if err := request.ExternalIDValidator(v); err != nil {
+			return &ValidationError{Name: "external_id", err: fmt.Errorf(`ent: validator failed for field "Request.external_id": %w`, err)}
+		}
+	}
 	if _, ok := _c.mutation.Status(); !ok {
 		return &ValidationError{Name: "status", err: errors.New(`ent: missing required field "Request.status"`)}
 	}
@@ -549,6 +568,10 @@ func (_c *RequestCreate) createSpec() (*Request, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.ModelID(); ok {
 		_spec.SetField(request.FieldModelID, field.TypeString, value)
 		_node.ModelID = value
+	}
+	if value, ok := _c.mutation.ReasoningEffort(); ok {
+		_spec.SetField(request.FieldReasoningEffort, field.TypeString, value)
+		_node.ReasoningEffort = value
 	}
 	if value, ok := _c.mutation.Format(); ok {
 		_spec.SetField(request.FieldFormat, field.TypeString, value)
@@ -1072,6 +1095,9 @@ func (u *RequestUpsertOne) UpdateNewValues() *RequestUpsertOne {
 		}
 		if _, exists := u.create.mutation.ModelID(); exists {
 			s.SetIgnore(request.FieldModelID)
+		}
+		if _, exists := u.create.mutation.ReasoningEffort(); exists {
+			s.SetIgnore(request.FieldReasoningEffort)
 		}
 		if _, exists := u.create.mutation.Format(); exists {
 			s.SetIgnore(request.FieldFormat)
@@ -1613,6 +1639,9 @@ func (u *RequestUpsertBulk) UpdateNewValues() *RequestUpsertBulk {
 			}
 			if _, exists := b.mutation.ModelID(); exists {
 				s.SetIgnore(request.FieldModelID)
+			}
+			if _, exists := b.mutation.ReasoningEffort(); exists {
+				s.SetIgnore(request.FieldReasoningEffort)
 			}
 			if _, exists := b.mutation.Format(); exists {
 				s.SetIgnore(request.FieldFormat)

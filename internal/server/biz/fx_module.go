@@ -4,6 +4,9 @@ import (
 	"context"
 
 	"go.uber.org/fx"
+
+	"github.com/looplj/axonhub/internal/log"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 )
 
 var Module = fx.Module("biz",
@@ -16,6 +19,7 @@ var Module = fx.Module("biz",
 	fx.Provide(NewUsageLogService),
 	fx.Provide(NewVideoService),
 	fx.Provide(NewUserService),
+	fx.Provide(NewInvitationService),
 	fx.Provide(NewAPIKeyService),
 	fx.Provide(NewProjectService),
 	fx.Provide(NewRoleService),
@@ -29,15 +33,11 @@ var Module = fx.Module("biz",
 	fx.Provide(NewPromptProtectionRuleService),
 	fx.Provide(NewQuotaService),
 	fx.Provide(NewProviderQuotaService),
-	fx.Invoke(func(lc fx.Lifecycle, svc *ProviderQuotaService) {
-		lc.Append(fx.Hook{
-			OnStart: func(ctx context.Context) error {
-				return svc.Start(ctx)
-			},
-			OnStop: func(ctx context.Context) error {
-				return svc.Stop(ctx)
-			},
-		})
+	fx.Provide(NewOIDCService),
+	fx.Provide(NewAPIKeyProfileTemplateService),
+	fx.Provide(NewCatalogService),
+	fx.Invoke(func(channelSvc *ChannelService, quotaSvc *ProviderQuotaService) {
+		channelSvc.SetChannelProviderQuotaInvalidator(quotaSvc)
 	}),
 	fx.Invoke(func(lc fx.Lifecycle, svc *APIKeyService) {
 		lc.Append(fx.Hook{
@@ -64,21 +64,43 @@ var Module = fx.Module("biz",
 			},
 		})
 	}),
-	fx.Invoke(func(lc fx.Lifecycle, svc *ChannelService) {
+	fx.Invoke(func(lc fx.Lifecycle, svc *ChannelService, s *scheduler.Scheduler) {
 		lc.Append(fx.Hook{
+			OnStart: func(ctx context.Context) error {
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Error(context.Background(), "initChannelPerformances panicked", log.Any("panic", r))
+						}
+					}()
+					svc.initChannelPerformances(context.Background())
+				}()
+				return svc.RegisterScheduledTasks(ctx, s)
+			},
 			OnStop: func(ctx context.Context) error {
 				svc.Stop()
 				return nil
 			},
 		})
 	}),
-	fx.Invoke(func(lc fx.Lifecycle, svc *ChannelProbeService) {
+	fx.Invoke(func(lc fx.Lifecycle, svc *DataStorageService, s *scheduler.Scheduler) {
 		lc.Append(fx.Hook{
 			OnStart: func(ctx context.Context) error {
-				return svc.Start(ctx)
+				return svc.RegisterScheduledTasks(ctx, s)
 			},
-			OnStop: func(ctx context.Context) error {
-				return svc.Stop(ctx)
+		})
+	}),
+	fx.Invoke(func(lc fx.Lifecycle, svc *ChannelProbeService, s *scheduler.Scheduler) {
+		lc.Append(fx.Hook{
+			OnStart: func(ctx context.Context) error {
+				return svc.RegisterScheduledTasks(ctx, s)
+			},
+		})
+	}),
+	fx.Invoke(func(lc fx.Lifecycle, svc *PromptService, s *scheduler.Scheduler) {
+		lc.Append(fx.Hook{
+			OnStart: func(ctx context.Context) error {
+				return svc.RegisterScheduledTasks(ctx, s)
 			},
 		})
 	}),
@@ -88,6 +110,21 @@ var Module = fx.Module("biz",
 				svc.Stop()
 				return nil
 			},
+		})
+	}),
+	fx.Invoke(func(lc fx.Lifecycle, svc *ProviderQuotaService, s *scheduler.Scheduler) {
+		lc.Append(fx.Hook{
+			OnStart: func(ctx context.Context) error {
+				return svc.RegisterScheduledTasks(ctx, s)
+			},
+		})
+	}),
+	fx.Invoke(func(lc fx.Lifecycle, svc *CatalogService, s *scheduler.Scheduler) {
+		lc.Append(fx.Hook{
+			OnStart: func(ctx context.Context) error {
+				return svc.RegisterScheduledTasks(ctx, s)
+			},
+			OnStop: nil,
 		})
 	}),
 )

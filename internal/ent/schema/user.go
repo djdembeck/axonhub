@@ -80,6 +80,12 @@ func (User) Edges() []ent.Edge {
 				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
 				entgql.RelayConnection(),
 			),
+		edge.From("oidc_identities", OIDCIdentity.Type).
+			Ref("user").
+			Annotations(
+				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
+				entgql.RelayConnection(),
+			),
 	}
 }
 
@@ -95,13 +101,13 @@ func (User) Policy() ent.Policy {
 	return scopes.Policy{
 		Query: scopes.QueryPolicy{
 			scopes.OwnerRule(),
+			scopes.ProjectOwnerReadUsersRule(),
 			scopes.UserReadScopeRule(scopes.ScopeReadUsers),
 			scopes.UserOwnedQueryRule(),
 		},
 		Mutation: scopes.MutationPolicy{
 			scopes.OwnerRule(),
 			scopes.UserWriteScopeRule(scopes.ScopeWriteUsers),
-			scopes.UserOwnedMutationRule(),
 		},
 	}
 }

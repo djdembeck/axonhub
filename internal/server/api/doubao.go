@@ -19,18 +19,20 @@ import (
 type DoubaoHandlersParams struct {
 	fx.In
 
-	VideoService    *biz.VideoService
-	ChannelService  *biz.ChannelService
-	ModelService    *biz.ModelService
-	DefaultSelector *orchestrator.DefaultSelector
-	RequestService  *biz.RequestService
-	SystemService   *biz.SystemService
-	UsageLogService *biz.UsageLogService
-	PromptService   *biz.PromptService
+	VideoService                *biz.VideoService
+	ChannelService              *biz.ChannelService
+	ModelService                *biz.ModelService
+	DefaultSelector             *orchestrator.DefaultSelector
+	RequestService              *biz.RequestService
+	SystemService               *biz.SystemService
+	UsageLogService             *biz.UsageLogService
+	PromptService               *biz.PromptService
 	PromptProtectionRuleService *biz.PromptProtectionRuleService
-	QuotaService    *biz.QuotaService
-	HttpClient      *httpclient.HttpClient
-	LiveStreamRegistry *biz.LiveStreamRegistry
+	QuotaService                *biz.QuotaService
+	HttpClient                  *httpclient.HttpClient
+	LiveStreamRegistry          *biz.LiveStreamRegistry
+	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
+	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
 }
 
 type DoubaoHandlers struct {
@@ -56,6 +58,8 @@ func NewDoubaoHandlers(params DoubaoHandlersParams) *DoubaoHandlers {
 			params.QuotaService,
 			params.PromptProtectionRuleService,
 			params.LiveStreamRegistry,
+			params.ChannelLimiterManager,
+			params.ProviderQuotaStatusProvider,
 		),
 		InboundTransformer: inbound,
 	}
@@ -80,7 +84,7 @@ func (h *DoubaoHandlers) CreateTask(c *gin.Context) {
 	if err != nil {
 		log.Error(ctx, "Error processing doubao create", log.Cause(err))
 
-		httpErr := h.CreateOrchestrator.Inbound.TransformError(ctx, err)
+		httpErr := transformOrchestratorError(ctx, err, h.CreateOrchestrator)
 		c.JSON(httpErr.StatusCode, json.RawMessage(httpErr.Body))
 		return
 	}

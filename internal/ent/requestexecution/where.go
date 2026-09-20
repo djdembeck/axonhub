@@ -100,6 +100,11 @@ func Format(v string) predicate.RequestExecution {
 	return predicate.RequestExecution(sql.FieldEQ(FieldFormat, v))
 }
 
+// ReasoningEffort applies equality check predicate on the "reasoning_effort" field. It's identical to ReasoningEffortEQ.
+func ReasoningEffort(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldEQ(FieldReasoningEffort, v))
+}
+
 // ErrorMessage applies equality check predicate on the "error_message" field. It's identical to ErrorMessageEQ.
 func ErrorMessage(v string) predicate.RequestExecution {
 	return predicate.RequestExecution(sql.FieldEQ(FieldErrorMessage, v))
@@ -128,6 +133,16 @@ func MetricsFirstTokenLatencyMs(v int64) predicate.RequestExecution {
 // MetricsReasoningDurationMs applies equality check predicate on the "metrics_reasoning_duration_ms" field. It's identical to MetricsReasoningDurationMsEQ.
 func MetricsReasoningDurationMs(v int64) predicate.RequestExecution {
 	return predicate.RequestExecution(sql.FieldEQ(FieldMetricsReasoningDurationMs, v))
+}
+
+// RequestURL applies equality check predicate on the "request_url" field. It's identical to RequestURLEQ.
+func RequestURL(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldEQ(FieldRequestURL, v))
+}
+
+// PassThroughApplied applies equality check predicate on the "pass_through_applied" field. It's identical to PassThroughAppliedEQ.
+func PassThroughApplied(v bool) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldEQ(FieldPassThroughApplied, v))
 }
 
 // CreatedAtEQ applies the EQ predicate on the "created_at" field.
@@ -535,6 +550,81 @@ func FormatContainsFold(v string) predicate.RequestExecution {
 	return predicate.RequestExecution(sql.FieldContainsFold(FieldFormat, v))
 }
 
+// ReasoningEffortEQ applies the EQ predicate on the "reasoning_effort" field.
+func ReasoningEffortEQ(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldEQ(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortNEQ applies the NEQ predicate on the "reasoning_effort" field.
+func ReasoningEffortNEQ(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldNEQ(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortIn applies the In predicate on the "reasoning_effort" field.
+func ReasoningEffortIn(vs ...string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldIn(FieldReasoningEffort, vs...))
+}
+
+// ReasoningEffortNotIn applies the NotIn predicate on the "reasoning_effort" field.
+func ReasoningEffortNotIn(vs ...string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldNotIn(FieldReasoningEffort, vs...))
+}
+
+// ReasoningEffortGT applies the GT predicate on the "reasoning_effort" field.
+func ReasoningEffortGT(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldGT(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortGTE applies the GTE predicate on the "reasoning_effort" field.
+func ReasoningEffortGTE(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldGTE(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortLT applies the LT predicate on the "reasoning_effort" field.
+func ReasoningEffortLT(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldLT(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortLTE applies the LTE predicate on the "reasoning_effort" field.
+func ReasoningEffortLTE(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldLTE(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortContains applies the Contains predicate on the "reasoning_effort" field.
+func ReasoningEffortContains(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldContains(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortHasPrefix applies the HasPrefix predicate on the "reasoning_effort" field.
+func ReasoningEffortHasPrefix(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldHasPrefix(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortHasSuffix applies the HasSuffix predicate on the "reasoning_effort" field.
+func ReasoningEffortHasSuffix(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldHasSuffix(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortIsNil applies the IsNil predicate on the "reasoning_effort" field.
+func ReasoningEffortIsNil() predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldIsNull(FieldReasoningEffort))
+}
+
+// ReasoningEffortNotNil applies the NotNil predicate on the "reasoning_effort" field.
+func ReasoningEffortNotNil() predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldNotNull(FieldReasoningEffort))
+}
+
+// ReasoningEffortEqualFold applies the EqualFold predicate on the "reasoning_effort" field.
+func ReasoningEffortEqualFold(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldEqualFold(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortContainsFold applies the ContainsFold predicate on the "reasoning_effort" field.
+func ReasoningEffortContainsFold(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldContainsFold(FieldReasoningEffort, v))
+}
+
 // ResponseBodyIsNil applies the IsNil predicate on the "response_body" field.
 func ResponseBodyIsNil() predicate.RequestExecution {
 	return predicate.RequestExecution(sql.FieldIsNull(FieldResponseBody))
@@ -868,6 +958,91 @@ func RequestHeadersIsNil() predicate.RequestExecution {
 // RequestHeadersNotNil applies the NotNil predicate on the "request_headers" field.
 func RequestHeadersNotNil() predicate.RequestExecution {
 	return predicate.RequestExecution(sql.FieldNotNull(FieldRequestHeaders))
+}
+
+// RequestURLEQ applies the EQ predicate on the "request_url" field.
+func RequestURLEQ(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldEQ(FieldRequestURL, v))
+}
+
+// RequestURLNEQ applies the NEQ predicate on the "request_url" field.
+func RequestURLNEQ(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldNEQ(FieldRequestURL, v))
+}
+
+// RequestURLIn applies the In predicate on the "request_url" field.
+func RequestURLIn(vs ...string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldIn(FieldRequestURL, vs...))
+}
+
+// RequestURLNotIn applies the NotIn predicate on the "request_url" field.
+func RequestURLNotIn(vs ...string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldNotIn(FieldRequestURL, vs...))
+}
+
+// RequestURLGT applies the GT predicate on the "request_url" field.
+func RequestURLGT(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldGT(FieldRequestURL, v))
+}
+
+// RequestURLGTE applies the GTE predicate on the "request_url" field.
+func RequestURLGTE(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldGTE(FieldRequestURL, v))
+}
+
+// RequestURLLT applies the LT predicate on the "request_url" field.
+func RequestURLLT(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldLT(FieldRequestURL, v))
+}
+
+// RequestURLLTE applies the LTE predicate on the "request_url" field.
+func RequestURLLTE(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldLTE(FieldRequestURL, v))
+}
+
+// RequestURLContains applies the Contains predicate on the "request_url" field.
+func RequestURLContains(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldContains(FieldRequestURL, v))
+}
+
+// RequestURLHasPrefix applies the HasPrefix predicate on the "request_url" field.
+func RequestURLHasPrefix(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldHasPrefix(FieldRequestURL, v))
+}
+
+// RequestURLHasSuffix applies the HasSuffix predicate on the "request_url" field.
+func RequestURLHasSuffix(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldHasSuffix(FieldRequestURL, v))
+}
+
+// RequestURLIsNil applies the IsNil predicate on the "request_url" field.
+func RequestURLIsNil() predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldIsNull(FieldRequestURL))
+}
+
+// RequestURLNotNil applies the NotNil predicate on the "request_url" field.
+func RequestURLNotNil() predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldNotNull(FieldRequestURL))
+}
+
+// RequestURLEqualFold applies the EqualFold predicate on the "request_url" field.
+func RequestURLEqualFold(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldEqualFold(FieldRequestURL, v))
+}
+
+// RequestURLContainsFold applies the ContainsFold predicate on the "request_url" field.
+func RequestURLContainsFold(v string) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldContainsFold(FieldRequestURL, v))
+}
+
+// PassThroughAppliedEQ applies the EQ predicate on the "pass_through_applied" field.
+func PassThroughAppliedEQ(v bool) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldEQ(FieldPassThroughApplied, v))
+}
+
+// PassThroughAppliedNEQ applies the NEQ predicate on the "pass_through_applied" field.
+func PassThroughAppliedNEQ(v bool) predicate.RequestExecution {
+	return predicate.RequestExecution(sql.FieldNEQ(FieldPassThroughApplied, v))
 }
 
 // HasRequest applies the HasEdge predicate on the "request" edge.

@@ -7,11 +7,12 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/samber/lo"
+
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
-	"github.com/samber/lo"
 )
 
 var _ transformer.Inbound = (*CompactInboundTransformer)(nil)
@@ -22,6 +23,11 @@ type CompactInboundTransformer struct{}
 // NewCompactInboundTransformer creates a new CompactInboundTransformer.
 func NewCompactInboundTransformer() *CompactInboundTransformer {
 	return &CompactInboundTransformer{}
+}
+
+// APIFormat returns the API format of the transformer.
+func (t *CompactInboundTransformer) APIFormat() llm.APIFormat {
+	return llm.APIFormatOpenAIResponseCompact
 }
 
 // TransformRequest transforms HTTP compact request to llm.Request.
@@ -114,9 +120,7 @@ func convertCompactMessagesToItems(msgs []llm.Message) []Item {
 	items := make([]Item, 0, len(msgs))
 
 	for _, msg := range msgs {
-		if reasoningItem, ok := buildReasoningItem(msg); ok {
-			items = append(items, reasoningItem)
-		}
+		items = append(items, buildReasoningItems(msg)...)
 
 		items = append(items, convertCompactMessageToItems(msg)...)
 	}
@@ -132,6 +136,7 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 
 	var items []Item
 	var contentItems []Item
+	annotationsAttached := false
 
 	textItemType := "input_text"
 	if role == "assistant" {
@@ -141,6 +146,11 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 	flushMessage := func() {
 		if len(contentItems) == 0 {
 			return
+		}
+		if !annotationsAttached {
+			var attached bool
+			contentItems, attached = attachAnnotationsToFirstTextItem(contentItems, msg.Annotations)
+			annotationsAttached = attached
 		}
 		items = append(items, Item{
 			ID:      msg.ID,
@@ -181,6 +191,7 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 		case "compaction", "compaction_summary":
 			if part.Compact != nil {
 				flushMessage()
+
 				items = append(items, compactionItemFromPart(part, part.Type))
 			}
 		}

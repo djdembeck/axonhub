@@ -28,6 +28,11 @@ type Config struct {
 	// Default to nil.
 	ExtraTraceHeaders []string `conf:"extra_trace_headers" yaml:"extra_trace_headers" json:"extra_trace_headers"`
 
+	// ResponseTraceHeaders is the response header names to write the resolved trace ID to.
+	// An empty list disables trace ID response headers.
+	// Default to nil.
+	ResponseTraceHeaders []string `conf:"response_trace_headers" yaml:"response_trace_headers" json:"response_trace_headers"`
+
 	// ExtraTraceBodyFields is the extra body fields names for trace ID.
 	// It will use if primary trace header is not found in request body.
 	// Default to nil.
@@ -40,6 +45,10 @@ type Config struct {
 	// CodexTraceEnabled enables extracting trace IDs from Codex request headers.
 	// Default to false.
 	CodexTraceEnabled bool `conf:"codex_trace_enabled" yaml:"codex_trace_enabled" json:"codex_trace_enabled"`
+
+	// OpenCodeTraceEnabled enables extracting trace IDs from OpenCode request headers.
+	// Default to false.
+	OpenCodeTraceEnabled bool `conf:"opencode_trace_enabled" yaml:"opencode_trace_enabled" json:"opencode_trace_enabled"`
 }
 
 // GenerateTraceID generate trace id, format as at-{{uuid}}.

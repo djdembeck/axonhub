@@ -34,9 +34,12 @@ export const requestExecutionSchema = z.object({
   responseStatusCode: z.number().nullable().optional(),
   status: requestExecutionStatusSchema,
   format: z.string().optional(),
+  reasoningEffort: z.string().nullable().optional(),
   metricsLatencyMs: z.number().nullable().optional(),
   metricsFirstTokenLatencyMs: z.number().nullable().optional(),
   metricsReasoningDurationMs: z.number().nullable().optional(),
+  requestURL: z.string().nullable().optional(),
+  passThroughApplied: z.boolean().optional(),
 });
 export type RequestExecution = z.infer<typeof requestExecutionSchema>;
 
@@ -51,6 +54,7 @@ export const requestSchema = z.object({
   channel: channelSchema.partial().nullable().optional(),
   source: requestSourceSchema,
   modelID: z.string(),
+  reasoningEffort: z.string().nullable().optional(),
   contentSaved: z.boolean().optional(),
   contentStorageKey: z.string().nullable().optional(),
   requestHeaders: z.any().nullable().optional(),
