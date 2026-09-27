@@ -4,13 +4,16 @@ package ent
 
 import (
 	"github.com/looplj/axonhub/internal/ent/apikey"
+	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channelmodelprice"
 	"github.com/looplj/axonhub/internal/ent/channelmodelpriceversion"
 	"github.com/looplj/axonhub/internal/ent/channeloverridetemplate"
 	"github.com/looplj/axonhub/internal/ent/channelprobe"
 	"github.com/looplj/axonhub/internal/ent/datastorage"
+	"github.com/looplj/axonhub/internal/ent/invitation"
 	"github.com/looplj/axonhub/internal/ent/model"
+	"github.com/looplj/axonhub/internal/ent/oidcidentity"
 	"github.com/looplj/axonhub/internal/ent/predicate"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/prompt"
@@ -35,7 +38,7 @@ import (
 
 // schemaGraph holds a representation of ent/schema at runtime.
 var schemaGraph = func() *sqlgraph.Schema {
-	graph := &sqlgraph.Schema{Nodes: make([]*sqlgraph.Node, 22)}
+	graph := &sqlgraph.Schema{Nodes: make([]*sqlgraph.Node, 25)}
 	graph.Nodes[0] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   apikey.Table,
@@ -47,20 +50,41 @@ var schemaGraph = func() *sqlgraph.Schema {
 		},
 		Type: "APIKey",
 		Fields: map[string]*sqlgraph.FieldSpec{
-			apikey.FieldCreatedAt: {Type: field.TypeTime, Column: apikey.FieldCreatedAt},
-			apikey.FieldUpdatedAt: {Type: field.TypeTime, Column: apikey.FieldUpdatedAt},
-			apikey.FieldDeletedAt: {Type: field.TypeInt, Column: apikey.FieldDeletedAt},
-			apikey.FieldUserID:    {Type: field.TypeInt, Column: apikey.FieldUserID},
-			apikey.FieldProjectID: {Type: field.TypeInt, Column: apikey.FieldProjectID},
-			apikey.FieldKey:       {Type: field.TypeString, Column: apikey.FieldKey},
-			apikey.FieldName:      {Type: field.TypeString, Column: apikey.FieldName},
-			apikey.FieldType:      {Type: field.TypeEnum, Column: apikey.FieldType},
-			apikey.FieldStatus:    {Type: field.TypeEnum, Column: apikey.FieldStatus},
-			apikey.FieldScopes:    {Type: field.TypeJSON, Column: apikey.FieldScopes},
-			apikey.FieldProfiles:  {Type: field.TypeJSON, Column: apikey.FieldProfiles},
+			apikey.FieldCreatedAt:  {Type: field.TypeTime, Column: apikey.FieldCreatedAt},
+			apikey.FieldUpdatedAt:  {Type: field.TypeTime, Column: apikey.FieldUpdatedAt},
+			apikey.FieldDeletedAt:  {Type: field.TypeInt, Column: apikey.FieldDeletedAt},
+			apikey.FieldUserID:     {Type: field.TypeInt, Column: apikey.FieldUserID},
+			apikey.FieldProjectID:  {Type: field.TypeInt, Column: apikey.FieldProjectID},
+			apikey.FieldKey:        {Type: field.TypeString, Column: apikey.FieldKey},
+			apikey.FieldName:       {Type: field.TypeString, Column: apikey.FieldName},
+			apikey.FieldType:       {Type: field.TypeEnum, Column: apikey.FieldType},
+			apikey.FieldStatus:     {Type: field.TypeEnum, Column: apikey.FieldStatus},
+			apikey.FieldScopes:     {Type: field.TypeJSON, Column: apikey.FieldScopes},
+			apikey.FieldProfiles:   {Type: field.TypeJSON, Column: apikey.FieldProfiles},
+			apikey.FieldAllowedIps: {Type: field.TypeJSON, Column: apikey.FieldAllowedIps},
 		},
 	}
 	graph.Nodes[1] = &sqlgraph.Node{
+		NodeSpec: sqlgraph.NodeSpec{
+			Table:   apikeyprofiletemplate.Table,
+			Columns: apikeyprofiletemplate.Columns,
+			ID: &sqlgraph.FieldSpec{
+				Type:   field.TypeInt,
+				Column: apikeyprofiletemplate.FieldID,
+			},
+		},
+		Type: "APIKeyProfileTemplate",
+		Fields: map[string]*sqlgraph.FieldSpec{
+			apikeyprofiletemplate.FieldCreatedAt:   {Type: field.TypeTime, Column: apikeyprofiletemplate.FieldCreatedAt},
+			apikeyprofiletemplate.FieldUpdatedAt:   {Type: field.TypeTime, Column: apikeyprofiletemplate.FieldUpdatedAt},
+			apikeyprofiletemplate.FieldDeletedAt:   {Type: field.TypeInt, Column: apikeyprofiletemplate.FieldDeletedAt},
+			apikeyprofiletemplate.FieldName:        {Type: field.TypeString, Column: apikeyprofiletemplate.FieldName},
+			apikeyprofiletemplate.FieldDescription: {Type: field.TypeString, Column: apikeyprofiletemplate.FieldDescription},
+			apikeyprofiletemplate.FieldProjectID:   {Type: field.TypeInt, Column: apikeyprofiletemplate.FieldProjectID},
+			apikeyprofiletemplate.FieldProfile:     {Type: field.TypeJSON, Column: apikeyprofiletemplate.FieldProfile},
+		},
+	}
+	graph.Nodes[2] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   channel.Table,
 			Columns: channel.Columns,
@@ -90,10 +114,13 @@ var schemaGraph = func() *sqlgraph.Schema {
 			channel.FieldSettings:                {Type: field.TypeJSON, Column: channel.FieldSettings},
 			channel.FieldOrderingWeight:          {Type: field.TypeInt, Column: channel.FieldOrderingWeight},
 			channel.FieldErrorMessage:            {Type: field.TypeString, Column: channel.FieldErrorMessage},
+			channel.FieldAutoDisabledAt:          {Type: field.TypeTime, Column: channel.FieldAutoDisabledAt},
+			channel.FieldAutoDisableExpiresAt:    {Type: field.TypeTime, Column: channel.FieldAutoDisableExpiresAt},
 			channel.FieldRemark:                  {Type: field.TypeString, Column: channel.FieldRemark},
+			channel.FieldEndpoints:               {Type: field.TypeJSON, Column: channel.FieldEndpoints},
 		},
 	}
-	graph.Nodes[2] = &sqlgraph.Node{
+	graph.Nodes[3] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   channelmodelprice.Table,
 			Columns: channelmodelprice.Columns,
@@ -113,7 +140,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			channelmodelprice.FieldReferenceID: {Type: field.TypeString, Column: channelmodelprice.FieldReferenceID},
 		},
 	}
-	graph.Nodes[3] = &sqlgraph.Node{
+	graph.Nodes[4] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   channelmodelpriceversion.Table,
 			Columns: channelmodelpriceversion.Columns,
@@ -136,7 +163,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			channelmodelpriceversion.FieldReferenceID:         {Type: field.TypeString, Column: channelmodelpriceversion.FieldReferenceID},
 		},
 	}
-	graph.Nodes[4] = &sqlgraph.Node{
+	graph.Nodes[5] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   channeloverridetemplate.Table,
 			Columns: channeloverridetemplate.Columns,
@@ -159,7 +186,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			channeloverridetemplate.FieldBodyOverrideOperations:   {Type: field.TypeJSON, Column: channeloverridetemplate.FieldBodyOverrideOperations},
 		},
 	}
-	graph.Nodes[5] = &sqlgraph.Node{
+	graph.Nodes[6] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   channelprobe.Table,
 			Columns: channelprobe.Columns,
@@ -178,7 +205,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			channelprobe.FieldTimestamp:             {Type: field.TypeInt64, Column: channelprobe.FieldTimestamp},
 		},
 	}
-	graph.Nodes[6] = &sqlgraph.Node{
+	graph.Nodes[7] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   datastorage.Table,
 			Columns: datastorage.Columns,
@@ -200,7 +227,29 @@ var schemaGraph = func() *sqlgraph.Schema {
 			datastorage.FieldStatus:      {Type: field.TypeEnum, Column: datastorage.FieldStatus},
 		},
 	}
-	graph.Nodes[7] = &sqlgraph.Node{
+	graph.Nodes[8] = &sqlgraph.Node{
+		NodeSpec: sqlgraph.NodeSpec{
+			Table:   invitation.Table,
+			Columns: invitation.Columns,
+			ID: &sqlgraph.FieldSpec{
+				Type:   field.TypeInt,
+				Column: invitation.FieldID,
+			},
+		},
+		Type: "Invitation",
+		Fields: map[string]*sqlgraph.FieldSpec{
+			invitation.FieldCreatedAt: {Type: field.TypeTime, Column: invitation.FieldCreatedAt},
+			invitation.FieldUpdatedAt: {Type: field.TypeTime, Column: invitation.FieldUpdatedAt},
+			invitation.FieldDeletedAt: {Type: field.TypeInt, Column: invitation.FieldDeletedAt},
+			invitation.FieldTokenHash: {Type: field.TypeString, Column: invitation.FieldTokenHash},
+			invitation.FieldProjectID: {Type: field.TypeInt, Column: invitation.FieldProjectID},
+			invitation.FieldRoleID:    {Type: field.TypeInt, Column: invitation.FieldRoleID},
+			invitation.FieldExpiresAt: {Type: field.TypeTime, Column: invitation.FieldExpiresAt},
+			invitation.FieldMaxUses:   {Type: field.TypeInt, Column: invitation.FieldMaxUses},
+			invitation.FieldUsedCount: {Type: field.TypeInt, Column: invitation.FieldUsedCount},
+		},
+	}
+	graph.Nodes[9] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   model.Table,
 			Columns: model.Columns,
@@ -226,7 +275,29 @@ var schemaGraph = func() *sqlgraph.Schema {
 			model.FieldRemark:    {Type: field.TypeString, Column: model.FieldRemark},
 		},
 	}
-	graph.Nodes[8] = &sqlgraph.Node{
+	graph.Nodes[10] = &sqlgraph.Node{
+		NodeSpec: sqlgraph.NodeSpec{
+			Table:   oidcidentity.Table,
+			Columns: oidcidentity.Columns,
+			ID: &sqlgraph.FieldSpec{
+				Type:   field.TypeInt,
+				Column: oidcidentity.FieldID,
+			},
+		},
+		Type: "OIDCIdentity",
+		Fields: map[string]*sqlgraph.FieldSpec{
+			oidcidentity.FieldCreatedAt:   {Type: field.TypeTime, Column: oidcidentity.FieldCreatedAt},
+			oidcidentity.FieldUpdatedAt:   {Type: field.TypeTime, Column: oidcidentity.FieldUpdatedAt},
+			oidcidentity.FieldDeletedAt:   {Type: field.TypeInt, Column: oidcidentity.FieldDeletedAt},
+			oidcidentity.FieldIssuer:      {Type: field.TypeString, Column: oidcidentity.FieldIssuer},
+			oidcidentity.FieldSubject:     {Type: field.TypeString, Column: oidcidentity.FieldSubject},
+			oidcidentity.FieldEmail:       {Type: field.TypeString, Column: oidcidentity.FieldEmail},
+			oidcidentity.FieldIdpName:     {Type: field.TypeString, Column: oidcidentity.FieldIdpName},
+			oidcidentity.FieldLastLoginAt: {Type: field.TypeTime, Column: oidcidentity.FieldLastLoginAt},
+			oidcidentity.FieldUserID:      {Type: field.TypeInt, Column: oidcidentity.FieldUserID},
+		},
+	}
+	graph.Nodes[11] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   project.Table,
 			Columns: project.Columns,
@@ -246,7 +317,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			project.FieldProfiles:    {Type: field.TypeJSON, Column: project.FieldProfiles},
 		},
 	}
-	graph.Nodes[9] = &sqlgraph.Node{
+	graph.Nodes[12] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   prompt.Table,
 			Columns: prompt.Columns,
@@ -270,7 +341,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			prompt.FieldSettings:    {Type: field.TypeJSON, Column: prompt.FieldSettings},
 		},
 	}
-	graph.Nodes[10] = &sqlgraph.Node{
+	graph.Nodes[13] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   promptprotectionrule.Table,
 			Columns: promptprotectionrule.Columns,
@@ -291,7 +362,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			promptprotectionrule.FieldSettings:    {Type: field.TypeJSON, Column: promptprotectionrule.FieldSettings},
 		},
 	}
-	graph.Nodes[11] = &sqlgraph.Node{
+	graph.Nodes[14] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   providerquotastatus.Table,
 			Columns: providerquotastatus.Columns,
@@ -312,9 +383,10 @@ var schemaGraph = func() *sqlgraph.Schema {
 			providerquotastatus.FieldNextResetAt:  {Type: field.TypeTime, Column: providerquotastatus.FieldNextResetAt},
 			providerquotastatus.FieldReady:        {Type: field.TypeBool, Column: providerquotastatus.FieldReady},
 			providerquotastatus.FieldNextCheckAt:  {Type: field.TypeTime, Column: providerquotastatus.FieldNextCheckAt},
+			providerquotastatus.FieldAccountKey:   {Type: field.TypeString, Column: providerquotastatus.FieldAccountKey},
 		},
 	}
-	graph.Nodes[12] = &sqlgraph.Node{
+	graph.Nodes[15] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   request.Table,
 			Columns: request.Columns,
@@ -333,9 +405,11 @@ var schemaGraph = func() *sqlgraph.Schema {
 			request.FieldDataStorageID:              {Type: field.TypeInt, Column: request.FieldDataStorageID},
 			request.FieldSource:                     {Type: field.TypeEnum, Column: request.FieldSource},
 			request.FieldModelID:                    {Type: field.TypeString, Column: request.FieldModelID},
+			request.FieldReasoningEffort:            {Type: field.TypeString, Column: request.FieldReasoningEffort},
 			request.FieldFormat:                     {Type: field.TypeString, Column: request.FieldFormat},
 			request.FieldRequestHeaders:             {Type: field.TypeJSON, Column: request.FieldRequestHeaders},
 			request.FieldRequestBody:                {Type: field.TypeJSON, Column: request.FieldRequestBody},
+			request.FieldResponseHeaders:            {Type: field.TypeJSON, Column: request.FieldResponseHeaders},
 			request.FieldResponseBody:               {Type: field.TypeJSON, Column: request.FieldResponseBody},
 			request.FieldResponseChunks:             {Type: field.TypeJSON, Column: request.FieldResponseChunks},
 			request.FieldChannelID:                  {Type: field.TypeInt, Column: request.FieldChannelID},
@@ -343,6 +417,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			request.FieldStatus:                     {Type: field.TypeEnum, Column: request.FieldStatus},
 			request.FieldStream:                     {Type: field.TypeBool, Column: request.FieldStream},
 			request.FieldClientIP:                   {Type: field.TypeString, Column: request.FieldClientIP},
+			request.FieldUserAgent:                  {Type: field.TypeString, Column: request.FieldUserAgent},
 			request.FieldMetricsLatencyMs:           {Type: field.TypeInt64, Column: request.FieldMetricsLatencyMs},
 			request.FieldMetricsFirstTokenLatencyMs: {Type: field.TypeInt64, Column: request.FieldMetricsFirstTokenLatencyMs},
 			request.FieldMetricsReasoningDurationMs: {Type: field.TypeInt64, Column: request.FieldMetricsReasoningDurationMs},
@@ -352,7 +427,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			request.FieldContentSavedAt:             {Type: field.TypeTime, Column: request.FieldContentSavedAt},
 		},
 	}
-	graph.Nodes[13] = &sqlgraph.Node{
+	graph.Nodes[16] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   requestexecution.Table,
 			Columns: requestexecution.Columns,
@@ -368,11 +443,16 @@ var schemaGraph = func() *sqlgraph.Schema {
 			requestexecution.FieldProjectID:                  {Type: field.TypeInt, Column: requestexecution.FieldProjectID},
 			requestexecution.FieldRequestID:                  {Type: field.TypeInt, Column: requestexecution.FieldRequestID},
 			requestexecution.FieldChannelID:                  {Type: field.TypeInt, Column: requestexecution.FieldChannelID},
+			requestexecution.FieldChannelAPIKeyIndex:         {Type: field.TypeInt, Column: requestexecution.FieldChannelAPIKeyIndex},
 			requestexecution.FieldDataStorageID:              {Type: field.TypeInt, Column: requestexecution.FieldDataStorageID},
 			requestexecution.FieldExternalID:                 {Type: field.TypeString, Column: requestexecution.FieldExternalID},
 			requestexecution.FieldModelID:                    {Type: field.TypeString, Column: requestexecution.FieldModelID},
+			requestexecution.FieldUpstreamModelID:            {Type: field.TypeString, Column: requestexecution.FieldUpstreamModelID},
 			requestexecution.FieldFormat:                     {Type: field.TypeString, Column: requestexecution.FieldFormat},
+			requestexecution.FieldReasoningEffort:            {Type: field.TypeString, Column: requestexecution.FieldReasoningEffort},
+			requestexecution.FieldChannelAPIKeySuffix:        {Type: field.TypeString, Column: requestexecution.FieldChannelAPIKeySuffix},
 			requestexecution.FieldRequestBody:                {Type: field.TypeJSON, Column: requestexecution.FieldRequestBody},
+			requestexecution.FieldResponseHeaders:            {Type: field.TypeJSON, Column: requestexecution.FieldResponseHeaders},
 			requestexecution.FieldResponseBody:               {Type: field.TypeJSON, Column: requestexecution.FieldResponseBody},
 			requestexecution.FieldResponseChunks:             {Type: field.TypeJSON, Column: requestexecution.FieldResponseChunks},
 			requestexecution.FieldErrorMessage:               {Type: field.TypeString, Column: requestexecution.FieldErrorMessage},
@@ -383,9 +463,11 @@ var schemaGraph = func() *sqlgraph.Schema {
 			requestexecution.FieldMetricsFirstTokenLatencyMs: {Type: field.TypeInt64, Column: requestexecution.FieldMetricsFirstTokenLatencyMs},
 			requestexecution.FieldMetricsReasoningDurationMs: {Type: field.TypeInt64, Column: requestexecution.FieldMetricsReasoningDurationMs},
 			requestexecution.FieldRequestHeaders:             {Type: field.TypeJSON, Column: requestexecution.FieldRequestHeaders},
+			requestexecution.FieldRequestURL:                 {Type: field.TypeString, Column: requestexecution.FieldRequestURL},
+			requestexecution.FieldPassThroughApplied:         {Type: field.TypeBool, Column: requestexecution.FieldPassThroughApplied},
 		},
 	}
-	graph.Nodes[14] = &sqlgraph.Node{
+	graph.Nodes[17] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   role.Table,
 			Columns: role.Columns,
@@ -405,7 +487,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			role.FieldScopes:    {Type: field.TypeJSON, Column: role.FieldScopes},
 		},
 	}
-	graph.Nodes[15] = &sqlgraph.Node{
+	graph.Nodes[18] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   system.Table,
 			Columns: system.Columns,
@@ -423,7 +505,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			system.FieldValue:     {Type: field.TypeString, Column: system.FieldValue},
 		},
 	}
-	graph.Nodes[16] = &sqlgraph.Node{
+	graph.Nodes[19] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   thread.Table,
 			Columns: thread.Columns,
@@ -438,9 +520,10 @@ var schemaGraph = func() *sqlgraph.Schema {
 			thread.FieldUpdatedAt: {Type: field.TypeTime, Column: thread.FieldUpdatedAt},
 			thread.FieldProjectID: {Type: field.TypeInt, Column: thread.FieldProjectID},
 			thread.FieldThreadID:  {Type: field.TypeString, Column: thread.FieldThreadID},
+			thread.FieldStatus:    {Type: field.TypeEnum, Column: thread.FieldStatus},
 		},
 	}
-	graph.Nodes[17] = &sqlgraph.Node{
+	graph.Nodes[20] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   trace.Table,
 			Columns: trace.Columns,
@@ -456,9 +539,10 @@ var schemaGraph = func() *sqlgraph.Schema {
 			trace.FieldProjectID: {Type: field.TypeInt, Column: trace.FieldProjectID},
 			trace.FieldTraceID:   {Type: field.TypeString, Column: trace.FieldTraceID},
 			trace.FieldThreadID:  {Type: field.TypeInt, Column: trace.FieldThreadID},
+			trace.FieldStatus:    {Type: field.TypeEnum, Column: trace.FieldStatus},
 		},
 	}
-	graph.Nodes[18] = &sqlgraph.Node{
+	graph.Nodes[21] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   usagelog.Table,
 			Columns: usagelog.Columns,
@@ -495,7 +579,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			usagelog.FieldCostPriceReferenceID:               {Type: field.TypeString, Column: usagelog.FieldCostPriceReferenceID},
 		},
 	}
-	graph.Nodes[19] = &sqlgraph.Node{
+	graph.Nodes[22] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   user.Table,
 			Columns: user.Columns,
@@ -520,7 +604,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			user.FieldScopes:         {Type: field.TypeJSON, Column: user.FieldScopes},
 		},
 	}
-	graph.Nodes[20] = &sqlgraph.Node{
+	graph.Nodes[23] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   userproject.Table,
 			Columns: userproject.Columns,
@@ -539,7 +623,7 @@ var schemaGraph = func() *sqlgraph.Schema {
 			userproject.FieldScopes:    {Type: field.TypeJSON, Column: userproject.FieldScopes},
 		},
 	}
-	graph.Nodes[21] = &sqlgraph.Node{
+	graph.Nodes[24] = &sqlgraph.Node{
 		NodeSpec: sqlgraph.NodeSpec{
 			Table:   userrole.Table,
 			Columns: userrole.Columns,
@@ -591,6 +675,18 @@ var schemaGraph = func() *sqlgraph.Schema {
 		},
 		"APIKey",
 		"Request",
+	)
+	graph.MustAddE(
+		"project",
+		&sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: true,
+			Table:   apikeyprofiletemplate.ProjectTable,
+			Columns: []string{apikeyprofiletemplate.ProjectColumn},
+			Bidi:    false,
+		},
+		"APIKeyProfileTemplate",
+		"Project",
 	)
 	graph.MustAddE(
 		"requests",
@@ -749,6 +845,30 @@ var schemaGraph = func() *sqlgraph.Schema {
 		"RequestExecution",
 	)
 	graph.MustAddE(
+		"project",
+		&sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: true,
+			Table:   invitation.ProjectTable,
+			Columns: []string{invitation.ProjectColumn},
+			Bidi:    false,
+		},
+		"Invitation",
+		"Project",
+	)
+	graph.MustAddE(
+		"user",
+		&sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: false,
+			Table:   oidcidentity.UserTable,
+			Columns: []string{oidcidentity.UserColumn},
+			Bidi:    false,
+		},
+		"OIDCIdentity",
+		"User",
+	)
+	graph.MustAddE(
 		"users",
 		&sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.M2M,
@@ -759,6 +879,18 @@ var schemaGraph = func() *sqlgraph.Schema {
 		},
 		"Project",
 		"User",
+	)
+	graph.MustAddE(
+		"invitations",
+		&sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.InvitationsTable,
+			Columns: []string{project.InvitationsColumn},
+			Bidi:    false,
+		},
+		"Project",
+		"Invitation",
 	)
 	graph.MustAddE(
 		"roles",
@@ -835,14 +967,26 @@ var schemaGraph = func() *sqlgraph.Schema {
 	graph.MustAddE(
 		"prompts",
 		&sqlgraph.EdgeSpec{
-			Rel:     sqlgraph.M2M,
+			Rel:     sqlgraph.O2M,
 			Inverse: false,
 			Table:   project.PromptsTable,
-			Columns: project.PromptsPrimaryKey,
+			Columns: []string{project.PromptsColumn},
 			Bidi:    false,
 		},
 		"Project",
 		"Prompt",
+	)
+	graph.MustAddE(
+		"api_key_profile_templates",
+		&sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.APIKeyProfileTemplatesTable,
+			Columns: []string{project.APIKeyProfileTemplatesColumn},
+			Bidi:    false,
+		},
+		"Project",
+		"APIKeyProfileTemplate",
 	)
 	graph.MustAddE(
 		"project_users",
@@ -857,12 +1001,12 @@ var schemaGraph = func() *sqlgraph.Schema {
 		"UserProject",
 	)
 	graph.MustAddE(
-		"projects",
+		"project",
 		&sqlgraph.EdgeSpec{
-			Rel:     sqlgraph.M2M,
+			Rel:     sqlgraph.M2O,
 			Inverse: true,
-			Table:   prompt.ProjectsTable,
-			Columns: prompt.ProjectsPrimaryKey,
+			Table:   prompt.ProjectTable,
+			Columns: []string{prompt.ProjectColumn},
 			Bidi:    false,
 		},
 		"Prompt",
@@ -1181,6 +1325,18 @@ var schemaGraph = func() *sqlgraph.Schema {
 		"ChannelOverrideTemplate",
 	)
 	graph.MustAddE(
+		"oidc_identities",
+		&sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: true,
+			Table:   user.OidcIdentitiesTable,
+			Columns: []string{user.OidcIdentitiesColumn},
+			Bidi:    false,
+		},
+		"User",
+		"OIDCIdentity",
+	)
+	graph.MustAddE(
 		"project_users",
 		&sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.O2M,
@@ -1356,6 +1512,11 @@ func (f *APIKeyFilter) WhereProfiles(p entql.BytesP) {
 	f.Where(p.Field(apikey.FieldProfiles))
 }
 
+// WhereAllowedIps applies the entql json.RawMessage predicate on the allowed_ips field.
+func (f *APIKeyFilter) WhereAllowedIps(p entql.BytesP) {
+	f.Where(p.Field(apikey.FieldAllowedIps))
+}
+
 // WhereHasUser applies a predicate to check if query has an edge user.
 func (f *APIKeyFilter) WhereHasUser() {
 	f.Where(entql.HasEdge("user"))
@@ -1399,6 +1560,95 @@ func (f *APIKeyFilter) WhereHasRequestsWith(preds ...predicate.Request) {
 }
 
 // addPredicate implements the predicateAdder interface.
+func (_q *APIKeyProfileTemplateQuery) addPredicate(pred func(s *sql.Selector)) {
+	_q.predicates = append(_q.predicates, pred)
+}
+
+// Filter returns a Filter implementation to apply filters on the APIKeyProfileTemplateQuery builder.
+func (_q *APIKeyProfileTemplateQuery) Filter() *APIKeyProfileTemplateFilter {
+	return &APIKeyProfileTemplateFilter{config: _q.config, predicateAdder: _q}
+}
+
+// addPredicate implements the predicateAdder interface.
+func (m *APIKeyProfileTemplateMutation) addPredicate(pred func(s *sql.Selector)) {
+	m.predicates = append(m.predicates, pred)
+}
+
+// Filter returns an entql.Where implementation to apply filters on the APIKeyProfileTemplateMutation builder.
+func (m *APIKeyProfileTemplateMutation) Filter() *APIKeyProfileTemplateFilter {
+	return &APIKeyProfileTemplateFilter{config: m.config, predicateAdder: m}
+}
+
+// APIKeyProfileTemplateFilter provides a generic filtering capability at runtime for APIKeyProfileTemplateQuery.
+type APIKeyProfileTemplateFilter struct {
+	predicateAdder
+	config
+}
+
+// Where applies the entql predicate on the query filter.
+func (f *APIKeyProfileTemplateFilter) Where(p entql.P) {
+	f.addPredicate(func(s *sql.Selector) {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[1].Type, p, s); err != nil {
+			s.AddError(err)
+		}
+	})
+}
+
+// WhereID applies the entql int predicate on the id field.
+func (f *APIKeyProfileTemplateFilter) WhereID(p entql.IntP) {
+	f.Where(p.Field(apikeyprofiletemplate.FieldID))
+}
+
+// WhereCreatedAt applies the entql time.Time predicate on the created_at field.
+func (f *APIKeyProfileTemplateFilter) WhereCreatedAt(p entql.TimeP) {
+	f.Where(p.Field(apikeyprofiletemplate.FieldCreatedAt))
+}
+
+// WhereUpdatedAt applies the entql time.Time predicate on the updated_at field.
+func (f *APIKeyProfileTemplateFilter) WhereUpdatedAt(p entql.TimeP) {
+	f.Where(p.Field(apikeyprofiletemplate.FieldUpdatedAt))
+}
+
+// WhereDeletedAt applies the entql int predicate on the deleted_at field.
+func (f *APIKeyProfileTemplateFilter) WhereDeletedAt(p entql.IntP) {
+	f.Where(p.Field(apikeyprofiletemplate.FieldDeletedAt))
+}
+
+// WhereName applies the entql string predicate on the name field.
+func (f *APIKeyProfileTemplateFilter) WhereName(p entql.StringP) {
+	f.Where(p.Field(apikeyprofiletemplate.FieldName))
+}
+
+// WhereDescription applies the entql string predicate on the description field.
+func (f *APIKeyProfileTemplateFilter) WhereDescription(p entql.StringP) {
+	f.Where(p.Field(apikeyprofiletemplate.FieldDescription))
+}
+
+// WhereProjectID applies the entql int predicate on the project_id field.
+func (f *APIKeyProfileTemplateFilter) WhereProjectID(p entql.IntP) {
+	f.Where(p.Field(apikeyprofiletemplate.FieldProjectID))
+}
+
+// WhereProfile applies the entql json.RawMessage predicate on the profile field.
+func (f *APIKeyProfileTemplateFilter) WhereProfile(p entql.BytesP) {
+	f.Where(p.Field(apikeyprofiletemplate.FieldProfile))
+}
+
+// WhereHasProject applies a predicate to check if query has an edge project.
+func (f *APIKeyProfileTemplateFilter) WhereHasProject() {
+	f.Where(entql.HasEdge("project"))
+}
+
+// WhereHasProjectWith applies a predicate to check if query has an edge project with a given conditions (other predicates).
+func (f *APIKeyProfileTemplateFilter) WhereHasProjectWith(preds ...predicate.Project) {
+	f.Where(entql.HasEdgeWith("project", sqlgraph.WrapFunc(func(s *sql.Selector) {
+		for _, p := range preds {
+			p(s)
+		}
+	})))
+}
+
+// addPredicate implements the predicateAdder interface.
 func (_q *ChannelQuery) addPredicate(pred func(s *sql.Selector)) {
 	_q.predicates = append(_q.predicates, pred)
 }
@@ -1427,7 +1677,7 @@ type ChannelFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ChannelFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[1].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[2].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -1533,9 +1783,24 @@ func (f *ChannelFilter) WhereErrorMessage(p entql.StringP) {
 	f.Where(p.Field(channel.FieldErrorMessage))
 }
 
+// WhereAutoDisabledAt applies the entql time.Time predicate on the auto_disabled_at field.
+func (f *ChannelFilter) WhereAutoDisabledAt(p entql.TimeP) {
+	f.Where(p.Field(channel.FieldAutoDisabledAt))
+}
+
+// WhereAutoDisableExpiresAt applies the entql time.Time predicate on the auto_disable_expires_at field.
+func (f *ChannelFilter) WhereAutoDisableExpiresAt(p entql.TimeP) {
+	f.Where(p.Field(channel.FieldAutoDisableExpiresAt))
+}
+
 // WhereRemark applies the entql string predicate on the remark field.
 func (f *ChannelFilter) WhereRemark(p entql.StringP) {
 	f.Where(p.Field(channel.FieldRemark))
+}
+
+// WhereEndpoints applies the entql json.RawMessage predicate on the endpoints field.
+func (f *ChannelFilter) WhereEndpoints(p entql.BytesP) {
+	f.Where(p.Field(channel.FieldEndpoints))
 }
 
 // WhereHasRequests applies a predicate to check if query has an edge requests.
@@ -1651,7 +1916,7 @@ type ChannelModelPriceFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ChannelModelPriceFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[2].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[3].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -1754,7 +2019,7 @@ type ChannelModelPriceVersionFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ChannelModelPriceVersionFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[3].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[4].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -1858,7 +2123,7 @@ type ChannelOverrideTemplateFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ChannelOverrideTemplateFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[4].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[5].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -1962,7 +2227,7 @@ type ChannelProbeFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ChannelProbeFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[5].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[6].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -2046,7 +2311,7 @@ type DataStorageFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *DataStorageFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[6].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[7].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -2131,6 +2396,105 @@ func (f *DataStorageFilter) WhereHasExecutionsWith(preds ...predicate.RequestExe
 }
 
 // addPredicate implements the predicateAdder interface.
+func (_q *InvitationQuery) addPredicate(pred func(s *sql.Selector)) {
+	_q.predicates = append(_q.predicates, pred)
+}
+
+// Filter returns a Filter implementation to apply filters on the InvitationQuery builder.
+func (_q *InvitationQuery) Filter() *InvitationFilter {
+	return &InvitationFilter{config: _q.config, predicateAdder: _q}
+}
+
+// addPredicate implements the predicateAdder interface.
+func (m *InvitationMutation) addPredicate(pred func(s *sql.Selector)) {
+	m.predicates = append(m.predicates, pred)
+}
+
+// Filter returns an entql.Where implementation to apply filters on the InvitationMutation builder.
+func (m *InvitationMutation) Filter() *InvitationFilter {
+	return &InvitationFilter{config: m.config, predicateAdder: m}
+}
+
+// InvitationFilter provides a generic filtering capability at runtime for InvitationQuery.
+type InvitationFilter struct {
+	predicateAdder
+	config
+}
+
+// Where applies the entql predicate on the query filter.
+func (f *InvitationFilter) Where(p entql.P) {
+	f.addPredicate(func(s *sql.Selector) {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[8].Type, p, s); err != nil {
+			s.AddError(err)
+		}
+	})
+}
+
+// WhereID applies the entql int predicate on the id field.
+func (f *InvitationFilter) WhereID(p entql.IntP) {
+	f.Where(p.Field(invitation.FieldID))
+}
+
+// WhereCreatedAt applies the entql time.Time predicate on the created_at field.
+func (f *InvitationFilter) WhereCreatedAt(p entql.TimeP) {
+	f.Where(p.Field(invitation.FieldCreatedAt))
+}
+
+// WhereUpdatedAt applies the entql time.Time predicate on the updated_at field.
+func (f *InvitationFilter) WhereUpdatedAt(p entql.TimeP) {
+	f.Where(p.Field(invitation.FieldUpdatedAt))
+}
+
+// WhereDeletedAt applies the entql int predicate on the deleted_at field.
+func (f *InvitationFilter) WhereDeletedAt(p entql.IntP) {
+	f.Where(p.Field(invitation.FieldDeletedAt))
+}
+
+// WhereTokenHash applies the entql string predicate on the token_hash field.
+func (f *InvitationFilter) WhereTokenHash(p entql.StringP) {
+	f.Where(p.Field(invitation.FieldTokenHash))
+}
+
+// WhereProjectID applies the entql int predicate on the project_id field.
+func (f *InvitationFilter) WhereProjectID(p entql.IntP) {
+	f.Where(p.Field(invitation.FieldProjectID))
+}
+
+// WhereRoleID applies the entql int predicate on the role_id field.
+func (f *InvitationFilter) WhereRoleID(p entql.IntP) {
+	f.Where(p.Field(invitation.FieldRoleID))
+}
+
+// WhereExpiresAt applies the entql time.Time predicate on the expires_at field.
+func (f *InvitationFilter) WhereExpiresAt(p entql.TimeP) {
+	f.Where(p.Field(invitation.FieldExpiresAt))
+}
+
+// WhereMaxUses applies the entql int predicate on the max_uses field.
+func (f *InvitationFilter) WhereMaxUses(p entql.IntP) {
+	f.Where(p.Field(invitation.FieldMaxUses))
+}
+
+// WhereUsedCount applies the entql int predicate on the used_count field.
+func (f *InvitationFilter) WhereUsedCount(p entql.IntP) {
+	f.Where(p.Field(invitation.FieldUsedCount))
+}
+
+// WhereHasProject applies a predicate to check if query has an edge project.
+func (f *InvitationFilter) WhereHasProject() {
+	f.Where(entql.HasEdge("project"))
+}
+
+// WhereHasProjectWith applies a predicate to check if query has an edge project with a given conditions (other predicates).
+func (f *InvitationFilter) WhereHasProjectWith(preds ...predicate.Project) {
+	f.Where(entql.HasEdgeWith("project", sqlgraph.WrapFunc(func(s *sql.Selector) {
+		for _, p := range preds {
+			p(s)
+		}
+	})))
+}
+
+// addPredicate implements the predicateAdder interface.
 func (_q *ModelQuery) addPredicate(pred func(s *sql.Selector)) {
 	_q.predicates = append(_q.predicates, pred)
 }
@@ -2159,7 +2523,7 @@ type ModelFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ModelFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[7].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[9].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -2236,6 +2600,105 @@ func (f *ModelFilter) WhereRemark(p entql.StringP) {
 }
 
 // addPredicate implements the predicateAdder interface.
+func (_q *OIDCIdentityQuery) addPredicate(pred func(s *sql.Selector)) {
+	_q.predicates = append(_q.predicates, pred)
+}
+
+// Filter returns a Filter implementation to apply filters on the OIDCIdentityQuery builder.
+func (_q *OIDCIdentityQuery) Filter() *OIDCIdentityFilter {
+	return &OIDCIdentityFilter{config: _q.config, predicateAdder: _q}
+}
+
+// addPredicate implements the predicateAdder interface.
+func (m *OIDCIdentityMutation) addPredicate(pred func(s *sql.Selector)) {
+	m.predicates = append(m.predicates, pred)
+}
+
+// Filter returns an entql.Where implementation to apply filters on the OIDCIdentityMutation builder.
+func (m *OIDCIdentityMutation) Filter() *OIDCIdentityFilter {
+	return &OIDCIdentityFilter{config: m.config, predicateAdder: m}
+}
+
+// OIDCIdentityFilter provides a generic filtering capability at runtime for OIDCIdentityQuery.
+type OIDCIdentityFilter struct {
+	predicateAdder
+	config
+}
+
+// Where applies the entql predicate on the query filter.
+func (f *OIDCIdentityFilter) Where(p entql.P) {
+	f.addPredicate(func(s *sql.Selector) {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[10].Type, p, s); err != nil {
+			s.AddError(err)
+		}
+	})
+}
+
+// WhereID applies the entql int predicate on the id field.
+func (f *OIDCIdentityFilter) WhereID(p entql.IntP) {
+	f.Where(p.Field(oidcidentity.FieldID))
+}
+
+// WhereCreatedAt applies the entql time.Time predicate on the created_at field.
+func (f *OIDCIdentityFilter) WhereCreatedAt(p entql.TimeP) {
+	f.Where(p.Field(oidcidentity.FieldCreatedAt))
+}
+
+// WhereUpdatedAt applies the entql time.Time predicate on the updated_at field.
+func (f *OIDCIdentityFilter) WhereUpdatedAt(p entql.TimeP) {
+	f.Where(p.Field(oidcidentity.FieldUpdatedAt))
+}
+
+// WhereDeletedAt applies the entql int predicate on the deleted_at field.
+func (f *OIDCIdentityFilter) WhereDeletedAt(p entql.IntP) {
+	f.Where(p.Field(oidcidentity.FieldDeletedAt))
+}
+
+// WhereIssuer applies the entql string predicate on the issuer field.
+func (f *OIDCIdentityFilter) WhereIssuer(p entql.StringP) {
+	f.Where(p.Field(oidcidentity.FieldIssuer))
+}
+
+// WhereSubject applies the entql string predicate on the subject field.
+func (f *OIDCIdentityFilter) WhereSubject(p entql.StringP) {
+	f.Where(p.Field(oidcidentity.FieldSubject))
+}
+
+// WhereEmail applies the entql string predicate on the email field.
+func (f *OIDCIdentityFilter) WhereEmail(p entql.StringP) {
+	f.Where(p.Field(oidcidentity.FieldEmail))
+}
+
+// WhereIdpName applies the entql string predicate on the idp_name field.
+func (f *OIDCIdentityFilter) WhereIdpName(p entql.StringP) {
+	f.Where(p.Field(oidcidentity.FieldIdpName))
+}
+
+// WhereLastLoginAt applies the entql time.Time predicate on the last_login_at field.
+func (f *OIDCIdentityFilter) WhereLastLoginAt(p entql.TimeP) {
+	f.Where(p.Field(oidcidentity.FieldLastLoginAt))
+}
+
+// WhereUserID applies the entql int predicate on the user_id field.
+func (f *OIDCIdentityFilter) WhereUserID(p entql.IntP) {
+	f.Where(p.Field(oidcidentity.FieldUserID))
+}
+
+// WhereHasUser applies a predicate to check if query has an edge user.
+func (f *OIDCIdentityFilter) WhereHasUser() {
+	f.Where(entql.HasEdge("user"))
+}
+
+// WhereHasUserWith applies a predicate to check if query has an edge user with a given conditions (other predicates).
+func (f *OIDCIdentityFilter) WhereHasUserWith(preds ...predicate.User) {
+	f.Where(entql.HasEdgeWith("user", sqlgraph.WrapFunc(func(s *sql.Selector) {
+		for _, p := range preds {
+			p(s)
+		}
+	})))
+}
+
+// addPredicate implements the predicateAdder interface.
 func (_q *ProjectQuery) addPredicate(pred func(s *sql.Selector)) {
 	_q.predicates = append(_q.predicates, pred)
 }
@@ -2264,7 +2727,7 @@ type ProjectFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ProjectFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[8].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[11].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -2318,6 +2781,20 @@ func (f *ProjectFilter) WhereHasUsers() {
 // WhereHasUsersWith applies a predicate to check if query has an edge users with a given conditions (other predicates).
 func (f *ProjectFilter) WhereHasUsersWith(preds ...predicate.User) {
 	f.Where(entql.HasEdgeWith("users", sqlgraph.WrapFunc(func(s *sql.Selector) {
+		for _, p := range preds {
+			p(s)
+		}
+	})))
+}
+
+// WhereHasInvitations applies a predicate to check if query has an edge invitations.
+func (f *ProjectFilter) WhereHasInvitations() {
+	f.Where(entql.HasEdge("invitations"))
+}
+
+// WhereHasInvitationsWith applies a predicate to check if query has an edge invitations with a given conditions (other predicates).
+func (f *ProjectFilter) WhereHasInvitationsWith(preds ...predicate.Invitation) {
+	f.Where(entql.HasEdgeWith("invitations", sqlgraph.WrapFunc(func(s *sql.Selector) {
 		for _, p := range preds {
 			p(s)
 		}
@@ -2422,6 +2899,20 @@ func (f *ProjectFilter) WhereHasPromptsWith(preds ...predicate.Prompt) {
 	})))
 }
 
+// WhereHasAPIKeyProfileTemplates applies a predicate to check if query has an edge api_key_profile_templates.
+func (f *ProjectFilter) WhereHasAPIKeyProfileTemplates() {
+	f.Where(entql.HasEdge("api_key_profile_templates"))
+}
+
+// WhereHasAPIKeyProfileTemplatesWith applies a predicate to check if query has an edge api_key_profile_templates with a given conditions (other predicates).
+func (f *ProjectFilter) WhereHasAPIKeyProfileTemplatesWith(preds ...predicate.APIKeyProfileTemplate) {
+	f.Where(entql.HasEdgeWith("api_key_profile_templates", sqlgraph.WrapFunc(func(s *sql.Selector) {
+		for _, p := range preds {
+			p(s)
+		}
+	})))
+}
+
 // WhereHasProjectUsers applies a predicate to check if query has an edge project_users.
 func (f *ProjectFilter) WhereHasProjectUsers() {
 	f.Where(entql.HasEdge("project_users"))
@@ -2465,7 +2956,7 @@ type PromptFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *PromptFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[9].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[12].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -2531,14 +3022,14 @@ func (f *PromptFilter) WhereSettings(p entql.BytesP) {
 	f.Where(p.Field(prompt.FieldSettings))
 }
 
-// WhereHasProjects applies a predicate to check if query has an edge projects.
-func (f *PromptFilter) WhereHasProjects() {
-	f.Where(entql.HasEdge("projects"))
+// WhereHasProject applies a predicate to check if query has an edge project.
+func (f *PromptFilter) WhereHasProject() {
+	f.Where(entql.HasEdge("project"))
 }
 
-// WhereHasProjectsWith applies a predicate to check if query has an edge projects with a given conditions (other predicates).
-func (f *PromptFilter) WhereHasProjectsWith(preds ...predicate.Project) {
-	f.Where(entql.HasEdgeWith("projects", sqlgraph.WrapFunc(func(s *sql.Selector) {
+// WhereHasProjectWith applies a predicate to check if query has an edge project with a given conditions (other predicates).
+func (f *PromptFilter) WhereHasProjectWith(preds ...predicate.Project) {
+	f.Where(entql.HasEdgeWith("project", sqlgraph.WrapFunc(func(s *sql.Selector) {
 		for _, p := range preds {
 			p(s)
 		}
@@ -2574,7 +3065,7 @@ type PromptProtectionRuleFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *PromptProtectionRuleFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[10].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[13].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -2654,7 +3145,7 @@ type ProviderQuotaStatusFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ProviderQuotaStatusFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[11].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[14].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -2715,6 +3206,11 @@ func (f *ProviderQuotaStatusFilter) WhereNextCheckAt(p entql.TimeP) {
 	f.Where(p.Field(providerquotastatus.FieldNextCheckAt))
 }
 
+// WhereAccountKey applies the entql string predicate on the account_key field.
+func (f *ProviderQuotaStatusFilter) WhereAccountKey(p entql.StringP) {
+	f.Where(p.Field(providerquotastatus.FieldAccountKey))
+}
+
 // WhereHasChannel applies a predicate to check if query has an edge channel.
 func (f *ProviderQuotaStatusFilter) WhereHasChannel() {
 	f.Where(entql.HasEdge("channel"))
@@ -2758,7 +3254,7 @@ type RequestFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *RequestFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[12].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[15].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -2809,6 +3305,11 @@ func (f *RequestFilter) WhereModelID(p entql.StringP) {
 	f.Where(p.Field(request.FieldModelID))
 }
 
+// WhereReasoningEffort applies the entql string predicate on the reasoning_effort field.
+func (f *RequestFilter) WhereReasoningEffort(p entql.StringP) {
+	f.Where(p.Field(request.FieldReasoningEffort))
+}
+
 // WhereFormat applies the entql string predicate on the format field.
 func (f *RequestFilter) WhereFormat(p entql.StringP) {
 	f.Where(p.Field(request.FieldFormat))
@@ -2822,6 +3323,11 @@ func (f *RequestFilter) WhereRequestHeaders(p entql.BytesP) {
 // WhereRequestBody applies the entql json.RawMessage predicate on the request_body field.
 func (f *RequestFilter) WhereRequestBody(p entql.BytesP) {
 	f.Where(p.Field(request.FieldRequestBody))
+}
+
+// WhereResponseHeaders applies the entql json.RawMessage predicate on the response_headers field.
+func (f *RequestFilter) WhereResponseHeaders(p entql.BytesP) {
+	f.Where(p.Field(request.FieldResponseHeaders))
 }
 
 // WhereResponseBody applies the entql json.RawMessage predicate on the response_body field.
@@ -2857,6 +3363,11 @@ func (f *RequestFilter) WhereStream(p entql.BoolP) {
 // WhereClientIP applies the entql string predicate on the client_ip field.
 func (f *RequestFilter) WhereClientIP(p entql.StringP) {
 	f.Where(p.Field(request.FieldClientIP))
+}
+
+// WhereUserAgent applies the entql string predicate on the user_agent field.
+func (f *RequestFilter) WhereUserAgent(p entql.StringP) {
+	f.Where(p.Field(request.FieldUserAgent))
 }
 
 // WhereMetricsLatencyMs applies the entql int64 predicate on the metrics_latency_ms field.
@@ -3021,7 +3532,7 @@ type RequestExecutionFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *RequestExecutionFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[13].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[16].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -3057,6 +3568,11 @@ func (f *RequestExecutionFilter) WhereChannelID(p entql.IntP) {
 	f.Where(p.Field(requestexecution.FieldChannelID))
 }
 
+// WhereChannelAPIKeyIndex applies the entql int predicate on the channel_api_key_index field.
+func (f *RequestExecutionFilter) WhereChannelAPIKeyIndex(p entql.IntP) {
+	f.Where(p.Field(requestexecution.FieldChannelAPIKeyIndex))
+}
+
 // WhereDataStorageID applies the entql int predicate on the data_storage_id field.
 func (f *RequestExecutionFilter) WhereDataStorageID(p entql.IntP) {
 	f.Where(p.Field(requestexecution.FieldDataStorageID))
@@ -3072,14 +3588,34 @@ func (f *RequestExecutionFilter) WhereModelID(p entql.StringP) {
 	f.Where(p.Field(requestexecution.FieldModelID))
 }
 
+// WhereUpstreamModelID applies the entql string predicate on the upstream_model_id field.
+func (f *RequestExecutionFilter) WhereUpstreamModelID(p entql.StringP) {
+	f.Where(p.Field(requestexecution.FieldUpstreamModelID))
+}
+
 // WhereFormat applies the entql string predicate on the format field.
 func (f *RequestExecutionFilter) WhereFormat(p entql.StringP) {
 	f.Where(p.Field(requestexecution.FieldFormat))
 }
 
+// WhereReasoningEffort applies the entql string predicate on the reasoning_effort field.
+func (f *RequestExecutionFilter) WhereReasoningEffort(p entql.StringP) {
+	f.Where(p.Field(requestexecution.FieldReasoningEffort))
+}
+
+// WhereChannelAPIKeySuffix applies the entql string predicate on the channel_api_key_suffix field.
+func (f *RequestExecutionFilter) WhereChannelAPIKeySuffix(p entql.StringP) {
+	f.Where(p.Field(requestexecution.FieldChannelAPIKeySuffix))
+}
+
 // WhereRequestBody applies the entql json.RawMessage predicate on the request_body field.
 func (f *RequestExecutionFilter) WhereRequestBody(p entql.BytesP) {
 	f.Where(p.Field(requestexecution.FieldRequestBody))
+}
+
+// WhereResponseHeaders applies the entql json.RawMessage predicate on the response_headers field.
+func (f *RequestExecutionFilter) WhereResponseHeaders(p entql.BytesP) {
+	f.Where(p.Field(requestexecution.FieldResponseHeaders))
 }
 
 // WhereResponseBody applies the entql json.RawMessage predicate on the response_body field.
@@ -3130,6 +3666,16 @@ func (f *RequestExecutionFilter) WhereMetricsReasoningDurationMs(p entql.Int64P)
 // WhereRequestHeaders applies the entql json.RawMessage predicate on the request_headers field.
 func (f *RequestExecutionFilter) WhereRequestHeaders(p entql.BytesP) {
 	f.Where(p.Field(requestexecution.FieldRequestHeaders))
+}
+
+// WhereRequestURL applies the entql string predicate on the request_url field.
+func (f *RequestExecutionFilter) WhereRequestURL(p entql.StringP) {
+	f.Where(p.Field(requestexecution.FieldRequestURL))
+}
+
+// WherePassThroughApplied applies the entql bool predicate on the pass_through_applied field.
+func (f *RequestExecutionFilter) WherePassThroughApplied(p entql.BoolP) {
+	f.Where(p.Field(requestexecution.FieldPassThroughApplied))
 }
 
 // WhereHasRequest applies a predicate to check if query has an edge request.
@@ -3203,7 +3749,7 @@ type RoleFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *RoleFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[14].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[17].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -3320,7 +3866,7 @@ type SystemFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *SystemFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[15].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[18].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -3385,7 +3931,7 @@ type ThreadFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *ThreadFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[16].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[19].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -3414,6 +3960,11 @@ func (f *ThreadFilter) WhereProjectID(p entql.IntP) {
 // WhereThreadID applies the entql string predicate on the thread_id field.
 func (f *ThreadFilter) WhereThreadID(p entql.StringP) {
 	f.Where(p.Field(thread.FieldThreadID))
+}
+
+// WhereStatus applies the entql string predicate on the status field.
+func (f *ThreadFilter) WhereStatus(p entql.StringP) {
+	f.Where(p.Field(thread.FieldStatus))
 }
 
 // WhereHasProject applies a predicate to check if query has an edge project.
@@ -3473,7 +4024,7 @@ type TraceFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *TraceFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[17].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[20].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -3507,6 +4058,11 @@ func (f *TraceFilter) WhereTraceID(p entql.StringP) {
 // WhereThreadID applies the entql int predicate on the thread_id field.
 func (f *TraceFilter) WhereThreadID(p entql.IntP) {
 	f.Where(p.Field(trace.FieldThreadID))
+}
+
+// WhereStatus applies the entql string predicate on the status field.
+func (f *TraceFilter) WhereStatus(p entql.StringP) {
+	f.Where(p.Field(trace.FieldStatus))
 }
 
 // WhereHasProject applies a predicate to check if query has an edge project.
@@ -3580,7 +4136,7 @@ type UsageLogFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *UsageLogFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[18].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[21].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -3782,7 +4338,7 @@ type UserFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *UserFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[19].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[22].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -3909,6 +4465,20 @@ func (f *UserFilter) WhereHasChannelOverrideTemplatesWith(preds ...predicate.Cha
 	})))
 }
 
+// WhereHasOidcIdentities applies a predicate to check if query has an edge oidc_identities.
+func (f *UserFilter) WhereHasOidcIdentities() {
+	f.Where(entql.HasEdge("oidc_identities"))
+}
+
+// WhereHasOidcIdentitiesWith applies a predicate to check if query has an edge oidc_identities with a given conditions (other predicates).
+func (f *UserFilter) WhereHasOidcIdentitiesWith(preds ...predicate.OIDCIdentity) {
+	f.Where(entql.HasEdgeWith("oidc_identities", sqlgraph.WrapFunc(func(s *sql.Selector) {
+		for _, p := range preds {
+			p(s)
+		}
+	})))
+}
+
 // WhereHasProjectUsers applies a predicate to check if query has an edge project_users.
 func (f *UserFilter) WhereHasProjectUsers() {
 	f.Where(entql.HasEdge("project_users"))
@@ -3966,7 +4536,7 @@ type UserProjectFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *UserProjectFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[20].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[23].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})
@@ -4064,7 +4634,7 @@ type UserRoleFilter struct {
 // Where applies the entql predicate on the query filter.
 func (f *UserRoleFilter) Where(p entql.P) {
 	f.addPredicate(func(s *sql.Selector) {
-		if err := schemaGraph.EvalP(schemaGraph.Nodes[21].Type, p, s); err != nil {
+		if err := schemaGraph.EvalP(schemaGraph.Nodes[24].Type, p, s); err != nil {
 			s.AddError(err)
 		}
 	})

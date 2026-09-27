@@ -7,11 +7,12 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/samber/lo"
+
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
-	"github.com/samber/lo"
 )
 
 var _ transformer.Inbound = (*CompactInboundTransformer)(nil)
@@ -22,6 +23,11 @@ type CompactInboundTransformer struct{}
 // NewCompactInboundTransformer creates a new CompactInboundTransformer.
 func NewCompactInboundTransformer() *CompactInboundTransformer {
 	return &CompactInboundTransformer{}
+}
+
+// APIFormat returns the API format of the transformer.
+func (t *CompactInboundTransformer) APIFormat() llm.APIFormat {
+	return llm.APIFormatOpenAIResponseCompact
 }
 
 // TransformRequest transforms HTTP compact request to llm.Request.
@@ -48,8 +54,8 @@ func (t *CompactInboundTransformer) TransformRequest(ctx context.Context, httpRe
 		return nil, fmt.Errorf("%w: model is required", transformer.ErrInvalidRequest)
 	}
 
-	// Reuse convertInputToMessages to convert Input to []llm.Message
-	inputMessages, err := convertInputToMessages(&req.Input)
+	// Convert compact input to unified messages with flat function names.
+	inputMessages, err := convertCompactInputToMessages(&req.Input)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to convert input: %w", transformer.ErrInvalidRequest, err)
 	}
@@ -66,8 +72,28 @@ func (t *CompactInboundTransformer) TransformRequest(ctx context.Context, httpRe
 			PromptCacheKey: req.PromptCacheKey,
 		},
 	}
+	attachOpenAIResponsesRawRequestFields(llmReq, httpReq.Body, rawCompactRequestFields)
 
 	return llmReq, nil
+}
+
+// convertCompactInputToMessages encodes local call names at the compact boundary.
+// Compact shares item decoding with Responses, but has no tool declaration
+// validation step. Preserve that behavior for both compact input and output.
+func convertCompactInputToMessages(input *Input) ([]llm.Message, error) {
+	messages, err := convertInputToMessages(input)
+	if err != nil {
+		return nil, err
+	}
+	for i := range messages {
+		for j := range messages[i].ToolCalls {
+			call := &messages[i].ToolCalls[j]
+			if call.Type == llm.ToolTypeFunction || call.Type == "" {
+				call.Function.Name = flatFunctionName(call.Function.Namespace, call.Function.Name)
+			}
+		}
+	}
+	return messages, nil
 }
 
 // TransformResponse transforms llm.Response to HTTP compact response.
@@ -114,9 +140,7 @@ func convertCompactMessagesToItems(msgs []llm.Message) []Item {
 	items := make([]Item, 0, len(msgs))
 
 	for _, msg := range msgs {
-		if reasoningItem, ok := buildReasoningItem(msg); ok {
-			items = append(items, reasoningItem)
-		}
+		items = append(items, buildReasoningItems(msg)...)
 
 		items = append(items, convertCompactMessageToItems(msg)...)
 	}
@@ -132,6 +156,7 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 
 	var items []Item
 	var contentItems []Item
+	annotationsAttached := false
 
 	textItemType := "input_text"
 	if role == "assistant" {
@@ -141,6 +166,11 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 	flushMessage := func() {
 		if len(contentItems) == 0 {
 			return
+		}
+		if !annotationsAttached {
+			var attached bool
+			contentItems, attached = attachAnnotationsToFirstTextItem(contentItems, msg.Annotations)
+			annotationsAttached = attached
 		}
 		items = append(items, Item{
 			ID:      msg.ID,
@@ -181,6 +211,7 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 		case "compaction", "compaction_summary":
 			if part.Compact != nil {
 				flushMessage()
+
 				items = append(items, compactionItemFromPart(part, part.Type))
 			}
 		}

@@ -11,7 +11,8 @@ import (
 	"github.com/looplj/axonhub/llm/streams"
 )
 
-// withRateLimitTracking creates a middleware that tracks request counts per channel for rate limiting.
+// withRateLimitTracking creates a middleware that tracks token usage and
+// provider cooldown signals for rate limiting.
 func withRateLimitTracking(outbound *PersistentOutboundTransformer, tracker *ChannelRequestTracker) pipeline.Middleware {
 	if tracker == nil {
 		return &noopRateLimitTracking{}
@@ -23,7 +24,9 @@ func withRateLimitTracking(outbound *PersistentOutboundTransformer, tracker *Cha
 	}
 }
 
-// rateLimitTracking is a middleware that increments request count for rate limiting.
+// rateLimitTracking records TPM usage and provider Retry-After cooldowns. RPM
+// accounting is owned by rateLimitAdmissionMiddleware so request slots are
+// consumed atomically before an attempt reaches upstream.
 type rateLimitTracking struct {
 	pipeline.DummyMiddleware
 
@@ -33,25 +36,6 @@ type rateLimitTracking struct {
 
 func (m *rateLimitTracking) Name() string {
 	return "track-rate-limit"
-}
-
-func (m *rateLimitTracking) OnOutboundRawRequest(ctx context.Context, request *httpclient.Request) (*httpclient.Request, error) {
-	channel := m.outbound.GetCurrentChannel()
-	if channel == nil {
-		return request, nil
-	}
-
-	m.tracker.IncrementRequest(channel.ID)
-
-	if log.DebugEnabled(ctx) {
-		log.Debug(ctx, "Incremented rate limit request count",
-			log.Int("channel_id", channel.ID),
-			log.String("channel_name", channel.Name),
-			log.Int64("current_rpm", m.tracker.GetRequestCount(channel.ID)),
-		)
-	}
-
-	return request, nil
 }
 
 func (m *rateLimitTracking) OnOutboundLlmResponse(ctx context.Context, response *llm.Response) (*llm.Response, error) {
@@ -89,8 +73,12 @@ func (m *rateLimitTracking) OnOutboundLlmStream(ctx context.Context, stream stre
 // OnOutboundRawError handles raw HTTP errors, specifically capturing 429 Too Many Requests.
 // When a 429 is received, it parses the Retry-After header and sets a cooldown for the channel.
 func (m *rateLimitTracking) OnOutboundRawError(ctx context.Context, err error) {
-	// Safety check: outbound might be nil in edge cases
 	if m.outbound == nil {
+		return
+	}
+
+	// Local admission rejections never reached upstream — they must not trigger cooldown.
+	if isChannelQueueError(err) || isLocalRPMExhaustedError(err) {
 		return
 	}
 

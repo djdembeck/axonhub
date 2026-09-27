@@ -144,4 +144,53 @@ export const authApi = {
       method: 'POST',
       body: data,
     }),
+
+  getInvitation: (token: string): Promise<{
+    projectName: string;
+    expiresAt: string | null;
+    maxUses: number;
+    remainingUses: number;
+  }> => apiRequest(`/auth/invitations/${encodeURIComponent(token)}`),
+
+  registerInvitation: (
+    token: string,
+    data: { email: string; password: string; firstName: string; lastName: string }
+  ): Promise<{ user: AuthUser; token: string }> =>
+    apiRequest(`/auth/invitations/${encodeURIComponent(token)}/register`, {
+      method: 'POST',
+      body: data,
+    }),
+
+  getOIDCProviders: (): Promise<{
+    data: {
+      id: string;
+      name: string;
+      display_name: string;
+      jit_enabled: boolean;
+      icon_url: string;
+      button_color: string;
+      active?: boolean;
+      oidc_login_only: boolean;
+      is_linked: boolean;
+      linked_identity_id?: string;
+      linked_email?: string;
+    }[];
+  }> => apiRequest('/oauth/oidc/providers', { requireAuth: true }),
+
+  getOIDCAuthorizeURL: (provider: string): Promise<{ data: { url: string; state: string } }> =>
+    apiRequest(`/oauth/oidc/authorize/${provider}`),
+
+  getOIDCLinkAuthorizeURL: (provider: string): Promise<{ data: { url: string; state: string } }> =>
+    apiRequest(`/admin/oidc/link/${provider}`, { requireAuth: true }),
+
+  exchangeOIDCCode: (code: string): Promise<{
+    data: {
+      user: AuthUser;
+      token: string;
+    }
+  }> =>
+    apiRequest('/oauth/oidc/exchange', {
+      method: 'POST',
+      body: { code },
+    }),
 };

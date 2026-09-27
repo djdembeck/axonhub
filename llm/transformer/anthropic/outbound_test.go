@@ -15,7 +15,6 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
-	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestOutboundTransformer_TransformRequest(t *testing.T) {
@@ -181,6 +180,11 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 				require.Equal(t, tt.chatReq.Model, anthropicReq.Model)
 				require.Greater(t, anthropicReq.MaxTokens, int64(0))
 
+				if tt.chatReq.MaxTokens == nil && tt.chatReq.MaxCompletionTokens == nil &&
+					(tt.chatReq.TransformOptions.DefaultMaxTokens == nil || *tt.chatReq.TransformOptions.DefaultMaxTokens <= 0) {
+					require.Equal(t, int64(8192), anthropicReq.MaxTokens)
+				}
+
 				// Verify auth
 				if result.Auth != nil {
 					require.Equal(t, "api_key", result.Auth.Type)
@@ -189,6 +193,65 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOutboundTransformer_TransformRequest_UsesModelCardDefaultMaxTokens(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model: "glm-5.3",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+		TransformOptions: llm.TransformOptions{
+			DefaultMaxTokens: lo.ToPtr(int64(131072)),
+		},
+	})
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.Equal(t, int64(131072), anthropicReq.MaxTokens)
+}
+
+func TestOutboundTransformer_TransformRequest_DeepSeekReasoningEffortUsesOutputConfig(t *testing.T) {
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		Type:           PlatformDeepSeek,
+		BaseURL:        "https://api.deepseek.com",
+		APIKeyProvider: auth.NewStaticKeyProvider("test-api-key"),
+	})
+	require.NoError(t, err)
+
+	result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "deepseek-chat",
+		ReasoningEffort: "max",
+		MaxTokens:       lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	var anthropicReq MessageRequest
+
+	err = json.Unmarshal(result.Body, &anthropicReq)
+	require.NoError(t, err)
+
+	require.NotNil(t, anthropicReq.OutputConfig)
+	require.Equal(t, "max", anthropicReq.OutputConfig.Effort)
+	require.Nil(t, anthropicReq.Thinking)
 }
 
 func TestOutboundTransformer_TransformResponse(t *testing.T) {
@@ -290,12 +353,11 @@ func TestOutboundTransformer_TransformResponse(t *testing.T) {
 	}
 }
 
-func TestOutboundTransformer_TransformRequest_AccountIdentityFootprint(t *testing.T) {
+func TestOutboundTransformer_TransformRequest_AccountIdentity(t *testing.T) {
 	outbound, err := NewOutboundTransformerWithConfig(&Config{
-		Type:            PlatformDirect,
-		BaseURL:         "https://api.anthropic.com",
-		AccountIdentity: "channel-1",
-		APIKeyProvider:  auth.NewStaticKeyProvider("test-api-key"),
+		Type:           PlatformDirect,
+		BaseURL:        "https://api.anthropic.com",
+		APIKeyProvider: auth.NewStaticKeyProvider("test-api-key"),
 	})
 	require.NoError(t, err)
 
@@ -308,11 +370,7 @@ func TestOutboundTransformer_TransformRequest_AccountIdentityFootprint(t *testin
 
 	hreq, err := outbound.TransformRequest(t.Context(), req)
 	require.NoError(t, err)
-	require.NotNil(t, hreq.Metadata)
-
-	tp := outbound.(*OutboundTransformer)
-	require.Equal(t, tp.config.BaseURL, hreq.Metadata[shared.MetadataKeyBaseURL])
-	require.Equal(t, "channel-1", hreq.Metadata[shared.MetadataKeyAccountIdentity])
+	require.Nil(t, hreq.Metadata)
 }
 
 func TestOutboundTransformer_ErrorHandling(t *testing.T) {
@@ -1197,11 +1255,12 @@ func TestOutboundTransformer_WebSearchBetaHeader(t *testing.T) {
 
 func TestOutboundTransformer_NativeToolFiltering(t *testing.T) {
 	tests := []struct {
-		name              string
-		config            *Config
-		request           *llm.Request
-		expectedToolCount int
-		expectedToolNames []string
+		name                     string
+		config                   *Config
+		request                  *llm.Request
+		expectedToolCount        int
+		expectedToolNames        []string
+		expectedWebSearchMaxUses *int64
 	}{
 		{
 			name: "Direct platform preserves native tools",
@@ -1306,7 +1365,7 @@ func TestOutboundTransformer_NativeToolFiltering(t *testing.T) {
 			expectedToolNames: []string{"web_search", "calculator"},
 		},
 		{
-			name: "DeepSeek platform filters native tools",
+			name: "DeepSeek platform preserves native tools",
 			config: &Config{
 				Type:           PlatformDeepSeek,
 				BaseURL:        "https://api.deepseek.com",
@@ -1325,7 +1384,10 @@ func TestOutboundTransformer_NativeToolFiltering(t *testing.T) {
 				},
 				Tools: []llm.Tool{
 					{
-						Type: ToolTypeWebSearch20250305,
+						Type: llm.ToolTypeWebSearch,
+						WebSearch: &llm.WebSearch{
+							MaxUses: lo.ToPtr(int64(5)),
+						},
 					},
 					{
 						Type: "function",
@@ -1336,8 +1398,9 @@ func TestOutboundTransformer_NativeToolFiltering(t *testing.T) {
 					},
 				},
 			},
-			expectedToolCount: 1,
-			expectedToolNames: []string{"calculator"},
+			expectedToolCount:        2,
+			expectedToolNames:        []string{"web_search", "calculator"},
+			expectedWebSearchMaxUses: lo.ToPtr(int64(5)),
 		},
 		{
 			name: "Doubao platform filters native tools",
@@ -1374,7 +1437,7 @@ func TestOutboundTransformer_NativeToolFiltering(t *testing.T) {
 			expectedToolNames: []string{"get_weather"},
 		},
 		{
-			name: "Non-direct platform with only native tools results in empty tools",
+			name: "DeepSeek platform with only native tools preserves them",
 			config: &Config{
 				Type:           PlatformDeepSeek,
 				BaseURL:        "https://api.deepseek.com",
@@ -1393,12 +1456,12 @@ func TestOutboundTransformer_NativeToolFiltering(t *testing.T) {
 				},
 				Tools: []llm.Tool{
 					{
-						Type: ToolTypeWebSearch20250305,
+						Type: llm.ToolTypeWebSearch,
 					},
 				},
 			},
-			expectedToolCount: 0,
-			expectedToolNames: []string{},
+			expectedToolCount: 1,
+			expectedToolNames: []string{"web_search"},
 		},
 		{
 			name: "Direct platform with llm.ToolTypeWebSearch type converts to native tool",
@@ -1569,6 +1632,12 @@ func TestOutboundTransformer_NativeToolFiltering(t *testing.T) {
 				actualNames := make([]string, len(anthropicReq.Tools))
 				for i, tool := range anthropicReq.Tools {
 					actualNames[i] = tool.Name
+					if tool.Name == WebSearchFunctionName {
+						require.Equal(t, ToolTypeWebSearch20250305, tool.Type)
+						if tt.expectedWebSearchMaxUses != nil {
+							require.Equal(t, tt.expectedWebSearchMaxUses, tool.MaxUses)
+						}
+					}
 				}
 
 				require.Equal(t, tt.expectedToolNames, actualNames)
@@ -1730,4 +1799,76 @@ func TestOutboundTransformer_WebSearchParameters(t *testing.T) {
 			tt.validateTool(t, anthropicReq.Tools[0])
 		})
 	}
+}
+
+// TestOutboundTransformer_OllamaBearerAuth verifies that PlatformOllama uses Bearer
+// token authentication (Authorization header) instead of X-API-Key, matching the
+// LongCat Anthropic pattern. Ollama expects Authorization: Bearer <key> when a key
+// is configured; sending X-API-Key would be silently ignored.
+func TestOutboundTransformer_OllamaBearerAuth(t *testing.T) {
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		Type:           PlatformOllama,
+		BaseURL:        "http://localhost:11434",
+		APIKeyProvider: auth.NewStaticKeyProvider("ollama-secret-key"),
+	})
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model:     "llama3.2",
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	}
+
+	httpReq, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, httpReq)
+
+	// Ollama uses Bearer auth, not X-API-Key
+	require.NotNil(t, httpReq.Auth)
+	require.Equal(t, httpclient.AuthTypeBearer, httpReq.Auth.Type)
+	require.Equal(t, "ollama-secret-key", httpReq.Auth.APIKey)
+	require.Empty(t, httpReq.Auth.HeaderKey, "Ollama must not set X-API-Key header key")
+
+	// The request targets the Anthropic messages endpoint
+	require.Equal(t, "http://localhost:11434/v1/messages", httpReq.URL)
+	require.Equal(t, "2023-06-01", httpReq.Headers.Get("Anthropic-Version"))
+}
+
+// TestOutboundTransformer_OllamaNoAuthWhenKeyAbsent verifies that when no API key
+// is configured (the common local Ollama case), no auth header is sent at all
+// rather than an empty Bearer token.
+func TestOutboundTransformer_OllamaNoAuthWhenKeyAbsent(t *testing.T) {
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		Type:    PlatformOllama,
+		BaseURL: "http://localhost:11434",
+		// APIKeyProvider intentionally left nil — mirrors local no-auth Ollama
+	})
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model:     "llama3.2",
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	}
+
+	httpReq, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, httpReq)
+
+	// No auth config should be produced when there is no key to send.
+	require.Nil(t, httpReq.Auth, "no Authorization header should be set without an API key")
 }

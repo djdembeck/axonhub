@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -172,6 +173,70 @@ func (s *TraceService) GetFirstText(ctx context.Context, traceID int) (*string, 
 	}
 
 	return segment.FirstText(), nil
+}
+
+// Archive sets the trace status to archived. Current status must be active.
+func (s *TraceService) Archive(ctx context.Context, id int) error {
+	client := s.entFromContext(ctx)
+	_, err := client.Trace.UpdateOneID(id).
+		Where(trace.StatusEQ(trace.StatusActive)).
+		SetStatus(trace.StatusArchived).
+		Save(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return fmt.Errorf("cannot archive trace: current status is not active or trace not found")
+		}
+		return fmt.Errorf("failed to archive trace: %w", err)
+	}
+	return nil
+}
+
+// Unarchive sets the trace status to active. Current status must be archived.
+func (s *TraceService) Unarchive(ctx context.Context, id int) error {
+	client := s.entFromContext(ctx)
+	_, err := client.Trace.UpdateOneID(id).
+		Where(trace.StatusEQ(trace.StatusArchived)).
+		SetStatus(trace.StatusActive).
+		Save(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return fmt.Errorf("cannot unarchive trace: current status is not archived or trace not found")
+		}
+		return fmt.Errorf("failed to unarchive trace: %w", err)
+	}
+	return nil
+}
+
+// Retain sets the trace status to retained. Current status must be active.
+func (s *TraceService) Retain(ctx context.Context, id int) error {
+	client := s.entFromContext(ctx)
+	_, err := client.Trace.UpdateOneID(id).
+		Where(trace.StatusEQ(trace.StatusActive)).
+		SetStatus(trace.StatusRetained).
+		Save(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return fmt.Errorf("cannot retain trace: current status is not active or trace not found")
+		}
+		return fmt.Errorf("failed to retain trace: %w", err)
+	}
+	return nil
+}
+
+// Unretain sets the trace status to active. Current status must be retained.
+func (s *TraceService) Unretain(ctx context.Context, id int) error {
+	client := s.entFromContext(ctx)
+	_, err := client.Trace.UpdateOneID(id).
+		Where(trace.StatusEQ(trace.StatusRetained)).
+		SetStatus(trace.StatusActive).
+		Save(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return fmt.Errorf("cannot unretain trace: current status is not retained or trace not found")
+		}
+		return fmt.Errorf("failed to unretain trace: %w", err)
+	}
+	return nil
 }
 
 func (s *TraceService) UsageMetadata(ctx context.Context, traceID int) (*UsageMetadata, error) {
@@ -592,6 +657,10 @@ func requestToSegment(ctx context.Context, req *ent.Request) (*Segment, error) {
 			requestSpans = append(requestSpans, extractSpansFromCompactRequestBody(req.RequestBody, fmt.Sprintf("request-%d", req.ID))...)
 		} else if isImageFormat(apiFormat) {
 			requestSpans = append(requestSpans, extractSpansFromImageRequestBody(req.RequestBody, fmt.Sprintf("request-%d", req.ID))...)
+		} else if isModerationFormat(apiFormat) {
+			requestSpans = append(requestSpans, extractSpansFromModerationRequestBody(req.RequestBody, fmt.Sprintf("request-%d", req.ID))...)
+		} else if isAlphaSearchFormat(apiFormat) {
+			// Alpha search is an opaque provider payload; it is not message-shaped.
 		} else {
 			httpReq := &httpclient.Request{
 				Body: req.RequestBody,
@@ -605,21 +674,25 @@ func requestToSegment(ctx context.Context, req *ent.Request) (*Segment, error) {
 
 			inbound, err := getInboundTransformer(apiFormat)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get inbound transformer: %w", err)
-			}
+				// Format has no message-shaped request body (e.g. embeddings);
+				// skip it instead of failing the whole trace.
+				log.Warn(ctx, "No inbound transformer for format, skipping request spans", log.Cause(err), log.Int("request_id", req.ID))
+			} else {
+				llmReq, err := inbound.TransformRequest(ctx, httpReq)
+				if err != nil {
+					log.Warn(ctx, "Failed to transform request body", log.Cause(err), log.Int("request_id", req.ID))
+					return segment, nil
+				}
 
-			llmReq, err := inbound.TransformRequest(ctx, httpReq)
-			if err != nil {
-				log.Warn(ctx, "Failed to transform request body", log.Cause(err), log.Int("request_id", req.ID))
-				return segment, nil
+				requestSpans = append(requestSpans, extractSpansFromMessages(llmReq.Messages, fmt.Sprintf("request-%d", req.ID))...)
 			}
-
-			requestSpans = append(requestSpans, extractSpansFromMessages(llmReq.Messages, fmt.Sprintf("request-%d", req.ID))...)
 		}
 	}
 
 	if len(req.ResponseBody) > 0 {
-		if llm.APIFormat(req.Format) == llm.APIFormatOpenAIResponseCompact {
+		apiFormat := llm.APIFormat(req.Format)
+
+		if apiFormat == llm.APIFormatOpenAIResponseCompact {
 			var (
 				usage *llm.Usage
 				err   error
@@ -632,29 +705,45 @@ func requestToSegment(ctx context.Context, req *ent.Request) (*Segment, error) {
 			}
 
 			segment.Metadata = extractMetadataFromUsage(usage)
+		} else if isModerationFormat(apiFormat) {
+			responseSpans = append(responseSpans, extractSpansFromModerationResponseBody(req.ResponseBody, fmt.Sprintf("response-%d", req.ID))...)
+		} else if isAlphaSearchFormat(apiFormat) {
+			// Alpha search responses are provider-defined JSON and have no usage/messages.
 		} else {
-			outbound, err := getOutboundTransformer(llm.APIFormat(req.Format))
+			outbound, err := getOutboundTransformer(apiFormat)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get outbound transformer: %w", err)
-			}
+				// Format has no message-shaped response body (e.g. embeddings);
+				// skip it instead of failing the whole trace.
+				log.Warn(ctx, "No outbound transformer for format, skipping response spans", log.Cause(err), log.Int("request_id", req.ID))
+			} else {
+				httpReq := &httpclient.Request{
+					APIFormat: req.Format,
+				}
+				if isImageFormat(apiFormat) {
+					httpReq.TransformerMetadata = map[string]any{
+						"model": req.ModelID,
+					}
+				}
 
-			httpResp := &httpclient.Response{
-				Body:       req.ResponseBody,
-				StatusCode: http.StatusOK,
-				Headers: http.Header{
-					"Content-Type": {"application/json"},
-				},
-			}
+				httpResp := &httpclient.Response{
+					Body:       req.ResponseBody,
+					StatusCode: http.StatusOK,
+					Headers: http.Header{
+						"Content-Type": {"application/json"},
+					},
+					Request: httpReq,
+				}
 
-			unifiedResp, err := outbound.TransformResponse(ctx, httpResp)
-			if err != nil {
-				log.Warn(ctx, "Failed to transform response body", log.Cause(err), log.Int("request_id", req.ID))
-				return segment, nil
-			}
+				unifiedResp, err := outbound.TransformResponse(ctx, httpResp)
+				if err != nil {
+					log.Warn(ctx, "Failed to transform response body", log.Cause(err), log.Int("request_id", req.ID))
+					return segment, nil
+				}
 
-			segment.Metadata = extractMetadataFromResponse(unifiedResp)
-			if len(unifiedResp.Choices) > 0 && unifiedResp.Choices[0].Message != nil {
-				responseSpans = append(responseSpans, extractSpansFromMessage(unifiedResp.Choices[0].Message, fmt.Sprintf("response-%d", req.ID))...)
+				segment.Metadata = extractMetadataFromResponse(unifiedResp)
+				if len(unifiedResp.Choices) > 0 && unifiedResp.Choices[0].Message != nil {
+					responseSpans = append(responseSpans, extractSpansFromMessage(unifiedResp.Choices[0].Message, fmt.Sprintf("response-%d", req.ID))...)
+				}
 			}
 		}
 	}
@@ -675,6 +764,145 @@ func isImageFormat(format llm.APIFormat) bool {
 	default:
 		return false
 	}
+}
+
+func isModerationFormat(format llm.APIFormat) bool {
+	return format == llm.APIFormatOpenAIModeration
+}
+
+func isAlphaSearchFormat(format llm.APIFormat) bool {
+	return format == llm.APIFormatOpenAIAlphaSearch
+}
+
+// extractSpansFromModerationRequestBody extracts display spans from a /v1/moderations request body.
+// Moderations are not message-based, so they bypass getInboundTransformer.
+func extractSpansFromModerationRequestBody(body []byte, idPrefix string) []Span {
+	var parsed struct {
+		Model string          `json:"model"`
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
+	}
+
+	summary := moderationInputSummary(parsed.Input)
+	if summary == "" {
+		return nil
+	}
+
+	if parsed.Model != "" {
+		summary = parsed.Model + ": " + summary
+	}
+
+	now := time.Now()
+
+	return []Span{{
+		ID:        fmt.Sprintf("%s-moderation-input", idPrefix),
+		Type:      "user_query",
+		StartTime: now,
+		EndTime:   now,
+		Value: &SpanValue{
+			UserQuery: &SpanUserQuery{Text: summary},
+		},
+	}}
+}
+
+// extractSpansFromModerationResponseBody extracts display spans from a /v1/moderations response body.
+func extractSpansFromModerationResponseBody(body []byte, idPrefix string) []Span {
+	var parsed struct {
+		Model   string `json:"model"`
+		Results []struct {
+			Flagged    bool               `json:"flagged"`
+			Categories map[string]bool    `json:"categories"`
+			Scores     map[string]float64 `json:"category_scores"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
+	}
+
+	if len(parsed.Results) == 0 {
+		return nil
+	}
+
+	parts := make([]string, 0, len(parsed.Results))
+	for i, result := range parsed.Results {
+		flaggedCats := make([]string, 0)
+		for name, flagged := range result.Categories {
+			if flagged {
+				flaggedCats = append(flaggedCats, name)
+			}
+		}
+
+		sort.Strings(flaggedCats)
+
+		line := fmt.Sprintf("result[%d] flagged=%v", i, result.Flagged)
+		if len(flaggedCats) > 0 {
+			line += " categories=" + strings.Join(flaggedCats, ",")
+		}
+
+		parts = append(parts, line)
+	}
+
+	summary := strings.Join(parts, "; ")
+	if parsed.Model != "" {
+		summary = parsed.Model + ": " + summary
+	}
+
+	now := time.Now()
+
+	return []Span{{
+		ID:        fmt.Sprintf("%s-moderation-output", idPrefix),
+		Type:      "text",
+		StartTime: now,
+		EndTime:   now,
+		Value: &SpanValue{
+			Text: &SpanText{Text: summary},
+		},
+	}}
+}
+
+func moderationInputSummary(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
+	}
+
+	var texts []string
+	if err := json.Unmarshal(raw, &texts); err == nil {
+		return strings.Join(texts, " | ")
+	}
+
+	var parts []struct {
+		Type     string `json:"type"`
+		Text     string `json:"text,omitempty"`
+		ImageURL *struct {
+			URL string `json:"url"`
+		} `json:"image_url,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			if part.Text != "" {
+				items = append(items, part.Text)
+			}
+		case "image_url":
+			if part.ImageURL != nil && part.ImageURL.URL != "" {
+				items = append(items, "image:"+part.ImageURL.URL)
+			}
+		}
+	}
+
+	return strings.Join(items, " | ")
 }
 
 // extractSpansFromImageRequestBody extracts spans from an image edit/variation JSON request body.
@@ -1290,7 +1518,7 @@ func getInboundTransformer(format llm.APIFormat) (transformer.Inbound, error) {
 	switch format {
 	case llm.APIFormatOpenAIChatCompletion:
 		return openai.NewInboundTransformer(), nil
-	case llm.APIFormatOpenAIResponse:
+	case llm.APIFormatOpenAIResponse, llm.APIFormatOpenAIResponseWebSocket:
 		return responses.NewInboundTransformer(), nil
 	case llm.APIFormatAnthropicMessage:
 		return anthropic.NewInboundTransformer(), nil
@@ -1304,7 +1532,10 @@ func getInboundTransformer(format llm.APIFormat) (transformer.Inbound, error) {
 func getOutboundTransformer(format llm.APIFormat) (transformer.Outbound, error) {
 	//nolint:exhaustive // Checked
 	switch format {
-	case llm.APIFormatOpenAIChatCompletion:
+	case llm.APIFormatOpenAIChatCompletion,
+		llm.APIFormatOpenAIImageGeneration,
+		llm.APIFormatOpenAIImageEdit,
+		llm.APIFormatOpenAIImageVariation:
 		config := &openai.Config{
 			PlatformType:   openai.PlatformOpenAI,
 			BaseURL:        "https://api.openai.com/v1",
@@ -1312,7 +1543,7 @@ func getOutboundTransformer(format llm.APIFormat) (transformer.Outbound, error) 
 		}
 
 		return openai.NewOutboundTransformerWithConfig(config)
-	case llm.APIFormatOpenAIResponse:
+	case llm.APIFormatOpenAIResponse, llm.APIFormatOpenAIResponseWebSocket:
 		return responses.NewOutboundTransformer("https://api.openai.com/v1", "dummy")
 	case llm.APIFormatAnthropicMessage:
 		config := &anthropic.Config{
@@ -1495,6 +1726,22 @@ func deduplicateSpansWithParent(current, parent []Span) []Span {
 	return result
 }
 
+// normalizeJSON re-parses and re-serializes JSON to produce a canonical form,
+// eliminating whitespace differences between compact and pretty-printed JSON.
+func normalizeJSON(s string) string {
+	var v any
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return s
+	}
+
+	b, err := json.Marshal(v)
+	if err != nil {
+		return s
+	}
+
+	return string(b)
+}
+
 // spanToKey generates a unique key for a span based on its content.
 func spanToKey(span Span) string {
 	if span.Value == nil {
@@ -1502,6 +1749,10 @@ func spanToKey(span Span) string {
 	}
 
 	switch span.Type {
+	case "system_instruction":
+		if span.Value.SystemInstruction != nil {
+			return fmt.Sprintf("%s:%s", span.Type, span.Value.SystemInstruction.Instruction)
+		}
 	case "user_query":
 		if span.Value.UserQuery != nil {
 			return fmt.Sprintf("%s:%s", span.Type, span.Value.UserQuery.Text)
@@ -1546,7 +1797,7 @@ func spanToKey(span Span) string {
 		if span.Value.ToolUse != nil {
 			args := ""
 			if span.Value.ToolUse.Arguments != nil {
-				args = *span.Value.ToolUse.Arguments
+				args = normalizeJSON(*span.Value.ToolUse.Arguments)
 			}
 
 			return fmt.Sprintf("%s:%s:%s:%s", span.Type, span.Value.ToolUse.ID, span.Value.ToolUse.Name, args)

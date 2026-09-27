@@ -58,6 +58,24 @@ func (_u *RequestUpdate) ClearRequestHeaders() *RequestUpdate {
 	return _u
 }
 
+// SetResponseHeaders sets the "response_headers" field.
+func (_u *RequestUpdate) SetResponseHeaders(v objects.JSONRawMessage) *RequestUpdate {
+	_u.mutation.SetResponseHeaders(v)
+	return _u
+}
+
+// AppendResponseHeaders appends value to the "response_headers" field.
+func (_u *RequestUpdate) AppendResponseHeaders(v objects.JSONRawMessage) *RequestUpdate {
+	_u.mutation.AppendResponseHeaders(v)
+	return _u
+}
+
+// ClearResponseHeaders clears the value of the "response_headers" field.
+func (_u *RequestUpdate) ClearResponseHeaders() *RequestUpdate {
+	_u.mutation.ClearResponseHeaders()
+	return _u
+}
+
 // SetResponseBody sets the "response_body" field.
 func (_u *RequestUpdate) SetResponseBody(v objects.JSONRawMessage) *RequestUpdate {
 	_u.mutation.SetResponseBody(v)
@@ -442,6 +460,11 @@ func (_u *RequestUpdate) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *RequestUpdate) check() error {
+	if v, ok := _u.mutation.ExternalID(); ok {
+		if err := request.ExternalIDValidator(v); err != nil {
+			return &ValidationError{Name: "external_id", err: fmt.Errorf(`ent: validator failed for field "Request.external_id": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := request.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Request.status": %w`, err)}
@@ -474,6 +497,9 @@ func (_u *RequestUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(request.FieldUpdatedAt, field.TypeTime, value)
 	}
+	if _u.mutation.ReasoningEffortCleared() {
+		_spec.ClearField(request.FieldReasoningEffort, field.TypeString)
+	}
 	if value, ok := _u.mutation.RequestHeaders(); ok {
 		_spec.SetField(request.FieldRequestHeaders, field.TypeJSON, value)
 	}
@@ -484,6 +510,17 @@ func (_u *RequestUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.RequestHeadersCleared() {
 		_spec.ClearField(request.FieldRequestHeaders, field.TypeJSON)
+	}
+	if value, ok := _u.mutation.ResponseHeaders(); ok {
+		_spec.SetField(request.FieldResponseHeaders, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedResponseHeaders(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, request.FieldResponseHeaders, value)
+		})
+	}
+	if _u.mutation.ResponseHeadersCleared() {
+		_spec.ClearField(request.FieldResponseHeaders, field.TypeJSON)
 	}
 	if value, ok := _u.mutation.ResponseBody(); ok {
 		_spec.SetField(request.FieldResponseBody, field.TypeJSON, value)
@@ -729,6 +766,24 @@ func (_u *RequestUpdateOne) AppendRequestHeaders(v objects.JSONRawMessage) *Requ
 // ClearRequestHeaders clears the value of the "request_headers" field.
 func (_u *RequestUpdateOne) ClearRequestHeaders() *RequestUpdateOne {
 	_u.mutation.ClearRequestHeaders()
+	return _u
+}
+
+// SetResponseHeaders sets the "response_headers" field.
+func (_u *RequestUpdateOne) SetResponseHeaders(v objects.JSONRawMessage) *RequestUpdateOne {
+	_u.mutation.SetResponseHeaders(v)
+	return _u
+}
+
+// AppendResponseHeaders appends value to the "response_headers" field.
+func (_u *RequestUpdateOne) AppendResponseHeaders(v objects.JSONRawMessage) *RequestUpdateOne {
+	_u.mutation.AppendResponseHeaders(v)
+	return _u
+}
+
+// ClearResponseHeaders clears the value of the "response_headers" field.
+func (_u *RequestUpdateOne) ClearResponseHeaders() *RequestUpdateOne {
+	_u.mutation.ClearResponseHeaders()
 	return _u
 }
 
@@ -1129,6 +1184,11 @@ func (_u *RequestUpdateOne) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *RequestUpdateOne) check() error {
+	if v, ok := _u.mutation.ExternalID(); ok {
+		if err := request.ExternalIDValidator(v); err != nil {
+			return &ValidationError{Name: "external_id", err: fmt.Errorf(`ent: validator failed for field "Request.external_id": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := request.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Request.status": %w`, err)}
@@ -1178,6 +1238,9 @@ func (_u *RequestUpdateOne) sqlSave(ctx context.Context) (_node *Request, err er
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(request.FieldUpdatedAt, field.TypeTime, value)
 	}
+	if _u.mutation.ReasoningEffortCleared() {
+		_spec.ClearField(request.FieldReasoningEffort, field.TypeString)
+	}
 	if value, ok := _u.mutation.RequestHeaders(); ok {
 		_spec.SetField(request.FieldRequestHeaders, field.TypeJSON, value)
 	}
@@ -1188,6 +1251,17 @@ func (_u *RequestUpdateOne) sqlSave(ctx context.Context) (_node *Request, err er
 	}
 	if _u.mutation.RequestHeadersCleared() {
 		_spec.ClearField(request.FieldRequestHeaders, field.TypeJSON)
+	}
+	if value, ok := _u.mutation.ResponseHeaders(); ok {
+		_spec.SetField(request.FieldResponseHeaders, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedResponseHeaders(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, request.FieldResponseHeaders, value)
+		})
+	}
+	if _u.mutation.ResponseHeadersCleared() {
+		_spec.ClearField(request.FieldResponseHeaders, field.TypeJSON)
 	}
 	if value, ok := _u.mutation.ResponseBody(); ok {
 		_spec.SetField(request.FieldResponseBody, field.TypeJSON, value)

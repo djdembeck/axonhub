@@ -1,6 +1,7 @@
 # ModelCard represents model capabilities and metadata
 type ModelCard {
   reasoning: ModelCardReasoning!
+  reasoningEfforts: [String!]
   toolCall: Boolean!
   temperature: Boolean!
   modalities: ModelCardModalities!
@@ -36,7 +37,10 @@ type ModelCardLimit {
 
 # ModelSettings represents model Association configuration
 type ModelSettings {
+  disableDeveloperSettingsInheritance: Boolean!
   associations: [ModelAssociation!]!
+  loadBalancerStrategy: String!
+  traceStickyMode: String!
 }
 
 type ModelAssociation {
@@ -96,6 +100,7 @@ type ChannelTagsRegexAssociation {
 # Input types for mutations
 input ModelCardInput {
   reasoning: ModelCardReasoningInput
+  reasoningEfforts: [String!]
   toolCall: Boolean
   temperature: Boolean
   modalities: ModelCardModalitiesInput
@@ -130,7 +135,10 @@ input ModelCardLimitInput {
 }
 
 input ModelSettingsInput {
+  disableDeveloperSettingsInheritance: Boolean
   associations: [ModelAssociationInput!]!
+  loadBalancerStrategy: String
+  traceStickyMode: String
 }
 
 input ModelAssociationInput {

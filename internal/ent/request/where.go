@@ -90,6 +90,11 @@ func ModelID(v string) predicate.Request {
 	return predicate.Request(sql.FieldEQ(FieldModelID, v))
 }
 
+// ReasoningEffort applies equality check predicate on the "reasoning_effort" field. It's identical to ReasoningEffortEQ.
+func ReasoningEffort(v string) predicate.Request {
+	return predicate.Request(sql.FieldEQ(FieldReasoningEffort, v))
+}
+
 // Format applies equality check predicate on the "format" field. It's identical to FormatEQ.
 func Format(v string) predicate.Request {
 	return predicate.Request(sql.FieldEQ(FieldFormat, v))
@@ -113,6 +118,11 @@ func Stream(v bool) predicate.Request {
 // ClientIP applies equality check predicate on the "client_ip" field. It's identical to ClientIPEQ.
 func ClientIP(v string) predicate.Request {
 	return predicate.Request(sql.FieldEQ(FieldClientIP, v))
+}
+
+// UserAgent applies equality check predicate on the "user_agent" field. It's identical to UserAgentEQ.
+func UserAgent(v string) predicate.Request {
+	return predicate.Request(sql.FieldEQ(FieldUserAgent, v))
 }
 
 // MetricsLatencyMs applies equality check predicate on the "metrics_latency_ms" field. It's identical to MetricsLatencyMsEQ.
@@ -425,6 +435,81 @@ func ModelIDContainsFold(v string) predicate.Request {
 	return predicate.Request(sql.FieldContainsFold(FieldModelID, v))
 }
 
+// ReasoningEffortEQ applies the EQ predicate on the "reasoning_effort" field.
+func ReasoningEffortEQ(v string) predicate.Request {
+	return predicate.Request(sql.FieldEQ(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortNEQ applies the NEQ predicate on the "reasoning_effort" field.
+func ReasoningEffortNEQ(v string) predicate.Request {
+	return predicate.Request(sql.FieldNEQ(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortIn applies the In predicate on the "reasoning_effort" field.
+func ReasoningEffortIn(vs ...string) predicate.Request {
+	return predicate.Request(sql.FieldIn(FieldReasoningEffort, vs...))
+}
+
+// ReasoningEffortNotIn applies the NotIn predicate on the "reasoning_effort" field.
+func ReasoningEffortNotIn(vs ...string) predicate.Request {
+	return predicate.Request(sql.FieldNotIn(FieldReasoningEffort, vs...))
+}
+
+// ReasoningEffortGT applies the GT predicate on the "reasoning_effort" field.
+func ReasoningEffortGT(v string) predicate.Request {
+	return predicate.Request(sql.FieldGT(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortGTE applies the GTE predicate on the "reasoning_effort" field.
+func ReasoningEffortGTE(v string) predicate.Request {
+	return predicate.Request(sql.FieldGTE(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortLT applies the LT predicate on the "reasoning_effort" field.
+func ReasoningEffortLT(v string) predicate.Request {
+	return predicate.Request(sql.FieldLT(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortLTE applies the LTE predicate on the "reasoning_effort" field.
+func ReasoningEffortLTE(v string) predicate.Request {
+	return predicate.Request(sql.FieldLTE(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortContains applies the Contains predicate on the "reasoning_effort" field.
+func ReasoningEffortContains(v string) predicate.Request {
+	return predicate.Request(sql.FieldContains(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortHasPrefix applies the HasPrefix predicate on the "reasoning_effort" field.
+func ReasoningEffortHasPrefix(v string) predicate.Request {
+	return predicate.Request(sql.FieldHasPrefix(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortHasSuffix applies the HasSuffix predicate on the "reasoning_effort" field.
+func ReasoningEffortHasSuffix(v string) predicate.Request {
+	return predicate.Request(sql.FieldHasSuffix(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortIsNil applies the IsNil predicate on the "reasoning_effort" field.
+func ReasoningEffortIsNil() predicate.Request {
+	return predicate.Request(sql.FieldIsNull(FieldReasoningEffort))
+}
+
+// ReasoningEffortNotNil applies the NotNil predicate on the "reasoning_effort" field.
+func ReasoningEffortNotNil() predicate.Request {
+	return predicate.Request(sql.FieldNotNull(FieldReasoningEffort))
+}
+
+// ReasoningEffortEqualFold applies the EqualFold predicate on the "reasoning_effort" field.
+func ReasoningEffortEqualFold(v string) predicate.Request {
+	return predicate.Request(sql.FieldEqualFold(FieldReasoningEffort, v))
+}
+
+// ReasoningEffortContainsFold applies the ContainsFold predicate on the "reasoning_effort" field.
+func ReasoningEffortContainsFold(v string) predicate.Request {
+	return predicate.Request(sql.FieldContainsFold(FieldReasoningEffort, v))
+}
+
 // FormatEQ applies the EQ predicate on the "format" field.
 func FormatEQ(v string) predicate.Request {
 	return predicate.Request(sql.FieldEQ(FieldFormat, v))
@@ -498,6 +583,16 @@ func RequestHeadersIsNil() predicate.Request {
 // RequestHeadersNotNil applies the NotNil predicate on the "request_headers" field.
 func RequestHeadersNotNil() predicate.Request {
 	return predicate.Request(sql.FieldNotNull(FieldRequestHeaders))
+}
+
+// ResponseHeadersIsNil applies the IsNil predicate on the "response_headers" field.
+func ResponseHeadersIsNil() predicate.Request {
+	return predicate.Request(sql.FieldIsNull(FieldResponseHeaders))
+}
+
+// ResponseHeadersNotNil applies the NotNil predicate on the "response_headers" field.
+func ResponseHeadersNotNil() predicate.Request {
+	return predicate.Request(sql.FieldNotNull(FieldResponseHeaders))
 }
 
 // ResponseBodyIsNil applies the IsNil predicate on the "response_body" field.
@@ -718,6 +813,71 @@ func ClientIPEqualFold(v string) predicate.Request {
 // ClientIPContainsFold applies the ContainsFold predicate on the "client_ip" field.
 func ClientIPContainsFold(v string) predicate.Request {
 	return predicate.Request(sql.FieldContainsFold(FieldClientIP, v))
+}
+
+// UserAgentEQ applies the EQ predicate on the "user_agent" field.
+func UserAgentEQ(v string) predicate.Request {
+	return predicate.Request(sql.FieldEQ(FieldUserAgent, v))
+}
+
+// UserAgentNEQ applies the NEQ predicate on the "user_agent" field.
+func UserAgentNEQ(v string) predicate.Request {
+	return predicate.Request(sql.FieldNEQ(FieldUserAgent, v))
+}
+
+// UserAgentIn applies the In predicate on the "user_agent" field.
+func UserAgentIn(vs ...string) predicate.Request {
+	return predicate.Request(sql.FieldIn(FieldUserAgent, vs...))
+}
+
+// UserAgentNotIn applies the NotIn predicate on the "user_agent" field.
+func UserAgentNotIn(vs ...string) predicate.Request {
+	return predicate.Request(sql.FieldNotIn(FieldUserAgent, vs...))
+}
+
+// UserAgentGT applies the GT predicate on the "user_agent" field.
+func UserAgentGT(v string) predicate.Request {
+	return predicate.Request(sql.FieldGT(FieldUserAgent, v))
+}
+
+// UserAgentGTE applies the GTE predicate on the "user_agent" field.
+func UserAgentGTE(v string) predicate.Request {
+	return predicate.Request(sql.FieldGTE(FieldUserAgent, v))
+}
+
+// UserAgentLT applies the LT predicate on the "user_agent" field.
+func UserAgentLT(v string) predicate.Request {
+	return predicate.Request(sql.FieldLT(FieldUserAgent, v))
+}
+
+// UserAgentLTE applies the LTE predicate on the "user_agent" field.
+func UserAgentLTE(v string) predicate.Request {
+	return predicate.Request(sql.FieldLTE(FieldUserAgent, v))
+}
+
+// UserAgentContains applies the Contains predicate on the "user_agent" field.
+func UserAgentContains(v string) predicate.Request {
+	return predicate.Request(sql.FieldContains(FieldUserAgent, v))
+}
+
+// UserAgentHasPrefix applies the HasPrefix predicate on the "user_agent" field.
+func UserAgentHasPrefix(v string) predicate.Request {
+	return predicate.Request(sql.FieldHasPrefix(FieldUserAgent, v))
+}
+
+// UserAgentHasSuffix applies the HasSuffix predicate on the "user_agent" field.
+func UserAgentHasSuffix(v string) predicate.Request {
+	return predicate.Request(sql.FieldHasSuffix(FieldUserAgent, v))
+}
+
+// UserAgentEqualFold applies the EqualFold predicate on the "user_agent" field.
+func UserAgentEqualFold(v string) predicate.Request {
+	return predicate.Request(sql.FieldEqualFold(FieldUserAgent, v))
+}
+
+// UserAgentContainsFold applies the ContainsFold predicate on the "user_agent" field.
+func UserAgentContainsFold(v string) predicate.Request {
+	return predicate.Request(sql.FieldContainsFold(FieldUserAgent, v))
 }
 
 // MetricsLatencyMsEQ applies the EQ predicate on the "metrics_latency_ms" field.

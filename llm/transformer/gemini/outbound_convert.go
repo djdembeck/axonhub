@@ -17,13 +17,11 @@ import (
 
 // convertLLMToGeminiRequest converts unified Request to Gemini GenerateContentRequest.
 func convertLLMToGeminiRequest(chatReq *llm.Request) *GenerateContentRequest {
-	return convertLLMToGeminiRequestWithConfig(chatReq, nil, shared.TransportScope{})
+	return convertLLMToGeminiRequestWithConfig(chatReq, nil)
 }
 
-// convertLLMToGeminiRequestWithConfig converts unified Request to Gemini GenerateContentRequest with config.
-//
 //nolint:maintidx // Checked.
-func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config, scope shared.TransportScope) *GenerateContentRequest {
+func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config) *GenerateContentRequest {
 	req := &GenerateContentRequest{}
 
 	// Convert generation config
@@ -225,7 +223,7 @@ func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config, s
 			}
 
 		default:
-			content := convertLLMMessageToGeminiContent(&msg, scope)
+			content := convertLLMMessageToGeminiContent(&msg)
 			if content != nil {
 				contents = append(contents, content)
 			}
@@ -263,10 +261,11 @@ func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config, s
 					tools = append(tools, functionTool)
 				}
 
-			case llm.ToolTypeGoogleSearch:
-				if tool.Google != nil && tool.Google.Search != nil {
-					tools = append(tools, &Tool{GoogleSearch: &GoogleSearch{}})
+			case llm.ToolTypeGoogleSearch, llm.ToolTypeWebSearch:
+				if tool.Type == llm.ToolTypeGoogleSearch && (tool.Google == nil || tool.Google.Search == nil) {
+					break
 				}
+				tools = append(tools, &Tool{GoogleSearch: &GoogleSearch{}})
 
 			case llm.ToolTypeGoogleCodeExecution:
 				if tool.Google != nil && tool.Google.CodeExecution != nil {
@@ -312,7 +311,7 @@ func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config, s
 }
 
 // convertLLMMessageToGeminiContent converts an LLM Message to Gemini Content.
-func convertLLMMessageToGeminiContent(msg *llm.Message, scope shared.TransportScope) *Content {
+func convertLLMMessageToGeminiContent(msg *llm.Message) *Content {
 	if msg == nil {
 		return nil
 	}
@@ -357,7 +356,7 @@ func convertLLMMessageToGeminiContent(msg *llm.Message, scope shared.TransportSc
 			case "image_url":
 				// Handle image_url type
 				if part.ImageURL != nil && part.ImageURL.URL != "" {
-					geminiPart := convertImageURLToGeminiPart(part.ImageURL.URL)
+					geminiPart := convertImageURLToGeminiPart(part.ImageURL)
 					if geminiPart != nil {
 						parts = append(parts, geminiPart)
 						lastPart = geminiPart
@@ -381,7 +380,7 @@ func convertLLMMessageToGeminiContent(msg *llm.Message, scope shared.TransportSc
 					}
 				}
 			case "input_audio":
-				if part.InputAudio != nil && part.InputAudio.Data != "" {
+				if part.InputAudio != nil && (part.InputAudio.Data != "" || part.InputAudio.URL != "") {
 					geminiPart := convertAudioToGeminiPart(part.InputAudio)
 					if geminiPart != nil {
 						parts = append(parts, geminiPart)
@@ -419,7 +418,7 @@ func convertLLMMessageToGeminiContent(msg *llm.Message, scope shared.TransportSc
 				Args: args,
 			},
 		}
-		if signature := getOutbountGeminiToolCallThoughtSignature(toolCall, scope); signature != nil {
+		if signature := getOutbountGeminiToolCallThoughtSignature(toolCall); signature != nil {
 			part.ThoughtSignature = *signature
 			hasToolCallThoughtSignature = true
 		}
@@ -438,14 +437,12 @@ func convertLLMMessageToGeminiContent(msg *llm.Message, scope shared.TransportSc
 		// This field is not compatible with OpenAI sdk, so we use the default value.
 		// We try the best to support this fields to keep this fields in the chat conversions, so we use the ReasoningSignature to hold the field,
 		// And this field will be preserved during claude code trace, will not degrade the gemini model performance.
-		msgThoughtSignature := shared.DecodeGeminiThoughtSignatureInScope(msg.ReasoningSignature, scope)
-		if msgThoughtSignature == nil && scope.Footprint() == "" && msg.ReasoningSignature != nil && *msg.ReasoningSignature != "" {
-			msgThoughtSignature = msg.ReasoningSignature
-		}
+		msgThoughtSignature := shared.DecodeGeminiThoughtSignature(msg.ReasoningSignature)
 
 		if (len(msg.ToolCalls) > 0 || msg.ReasoningContent != nil) && msgThoughtSignature == nil {
 			msgThoughtSignature = lo.ToPtr(ContextEngineeringThoughtSignature)
 		}
+
 		if msgThoughtSignature != nil && (firstFunctionCallPart != nil || lastPart != nil) {
 			if firstFunctionCallPart != nil {
 				firstFunctionCallPart.ThoughtSignature = *msgThoughtSignature
@@ -518,26 +515,108 @@ func isPreviousContentToolResponse(contents []*Content) bool {
 	if len(contents) == 0 {
 		return false
 	}
+
 	lastContent := contents[len(contents)-1]
 	if lastContent.Role != "user" || len(lastContent.Parts) == 0 {
 		return false
 	}
+
 	return lastContent.Parts[0].FunctionResponse != nil
 }
 
 // convertGeminiToLLMResponse converts Gemini GenerateContentResponse to unified Response.
 // When isStream is true, it sets Delta instead of Message in choices.
-func convertGeminiToLLMResponse(geminiResp *GenerateContentResponse, isStream bool, scope shared.TransportScope) *llm.Response {
-	resp, _ := convertGeminiToLLMResponseWithState(geminiResp, isStream, 0, scope)
+func convertGeminiToLLMResponse(geminiResp *GenerateContentResponse, isStream bool) *llm.Response {
+	resp, _ := convertGeminiToLLMResponseWithState(geminiResp, isStream, 0)
 	return resp
 }
 
 // TransformerMetadataKeyGroundingMetadata is the key for storing GroundingMetadata in TransformerMetadata.
 const TransformerMetadataKeyGroundingMetadata = "gemini_grounding_metadata"
 
+func deriveGeminiAnnotations(candidate *Candidate) []llm.Annotation {
+	if candidate == nil {
+		return nil
+	}
+
+	if candidate.CitationMetadata != nil && len(candidate.CitationMetadata.Citations) > 0 {
+		annotations := make([]llm.Annotation, 0, len(candidate.CitationMetadata.Citations))
+		for _, citation := range candidate.CitationMetadata.Citations {
+			if citation == nil {
+				continue
+			}
+
+			annotations = append(annotations, llm.Annotation{
+				Type:       "url_citation",
+				StartIndex: lo.ToPtr(citation.StartIndex),
+				EndIndex:   lo.ToPtr(citation.EndIndex),
+				URLCitation: &llm.URLCitation{
+					URL:   citation.URI,
+					Title: citation.Title,
+				},
+			})
+		}
+
+		if len(annotations) > 0 {
+			return annotations
+		}
+	}
+
+	if candidate.GroundingMetadata == nil {
+		return nil
+	}
+
+	annotations := make([]llm.Annotation, 0)
+	for _, support := range candidate.GroundingMetadata.GroundingSupports {
+		if support == nil || support.Segment == nil {
+			continue
+		}
+
+		for _, idx := range support.GroundingChunkIndices {
+			if idx < 0 || int(idx) >= len(candidate.GroundingMetadata.GroundingChunks) {
+				continue
+			}
+
+			chunk := candidate.GroundingMetadata.GroundingChunks[idx]
+			if chunk == nil {
+				continue
+			}
+
+			url := ""
+			title := ""
+			switch {
+			case chunk.Web != nil:
+				url = chunk.Web.URI
+				title = chunk.Web.Title
+			case chunk.RetrievedContext != nil:
+				url = chunk.RetrievedContext.URI
+				title = chunk.RetrievedContext.Title
+			default:
+				continue
+			}
+
+			annotations = append(annotations, llm.Annotation{
+				Type:       "url_citation",
+				StartIndex: lo.ToPtr(int64(support.Segment.StartIndex)),
+				EndIndex:   lo.ToPtr(int64(support.Segment.EndIndex)),
+				URLCitation: &llm.URLCitation{
+					URL:   url,
+					Title: title,
+				},
+			})
+		}
+	}
+
+	if len(annotations) == 0 {
+		return nil
+	}
+
+	return annotations
+}
+
 // convertGeminiToLLMResponseWithState converts Gemini response with tool call index tracking.
 // Returns the response and the next tool call index to use.
-func convertGeminiToLLMResponseWithState(geminiResp *GenerateContentResponse, isStream bool, toolCallIndexOffset int, scope shared.TransportScope) (*llm.Response, int) {
+func convertGeminiToLLMResponseWithState(geminiResp *GenerateContentResponse, isStream bool, toolCallIndexOffset int) (*llm.Response, int) {
 	resp := &llm.Response{
 		ID:          geminiResp.ResponseID,
 		Model:       geminiResp.ModelVersion,
@@ -565,7 +644,7 @@ func convertGeminiToLLMResponseWithState(geminiResp *GenerateContentResponse, is
 	for _, candidate := range geminiResp.Candidates {
 		var choice llm.Choice
 
-		choice, nextToolCallIndex = convertGeminiCandidateToLLMChoiceWithState(candidate, isStream, nextToolCallIndex, scope)
+		choice, nextToolCallIndex = convertGeminiCandidateToLLMChoiceWithState(candidate, isStream, nextToolCallIndex)
 
 		// Store GroundingMetadata in Choice.TransformerMetadata if present
 		if candidate.GroundingMetadata != nil {
@@ -587,7 +666,7 @@ func convertGeminiToLLMResponseWithState(geminiResp *GenerateContentResponse, is
 
 // convertGeminiCandidateToLLMChoiceWithState converts a Gemini Candidate to an LLM Choice with tool call index tracking.
 // Returns the choice and the next tool call index to use.
-func convertGeminiCandidateToLLMChoiceWithState(candidate *Candidate, isStream bool, toolCallIndexOffset int, scope shared.TransportScope) (llm.Choice, int) {
+func convertGeminiCandidateToLLMChoiceWithState(candidate *Candidate, isStream bool, toolCallIndexOffset int) (llm.Choice, int) {
 	choice := llm.Choice{
 		Index: int(candidate.Index),
 	}
@@ -610,7 +689,7 @@ func convertGeminiCandidateToLLMChoiceWithState(candidate *Candidate, isStream b
 
 		for _, part := range candidate.Content.Parts {
 			if msg.ReasoningSignature == nil && part.ThoughtSignature != "" {
-				msg.ReasoningSignature = shared.EncodeGeminiThoughtSignatureInScope(&part.ThoughtSignature, scope)
+				msg.ReasoningSignature = shared.EncodeGeminiThoughtSignature(&part.ThoughtSignature)
 			}
 
 			switch {
@@ -660,7 +739,7 @@ func convertGeminiCandidateToLLMChoiceWithState(candidate *Candidate, isStream b
 					tc.ID = fmt.Sprintf("tc_%s", uuid.NewString())
 				}
 
-				setOutboundToolCallThoughtSignature(&tc, part.ThoughtSignature, scope)
+				setOutboundToolCallThoughtSignature(&tc, part.ThoughtSignature)
 				toolCalls = append(toolCalls, tc)
 				nextToolCallIndex++
 			}
@@ -697,6 +776,10 @@ func convertGeminiCandidateToLLMChoiceWithState(candidate *Candidate, isStream b
 			msg.ReasoningContent = &reasoningContent
 		}
 
+		if annotations := deriveGeminiAnnotations(candidate); len(annotations) > 0 {
+			msg.Annotations = annotations
+		}
+
 		// Set Delta for streaming, Message for non-streaming
 		if isStream {
 			choice.Delta = msg
@@ -721,5 +804,6 @@ func extractJSONSchema(raw json.RawMessage) json.RawMessage {
 	if err := json.Unmarshal(raw, &wrapper); err == nil && len(wrapper.Schema) > 0 {
 		return wrapper.Schema
 	}
+
 	return raw
 }

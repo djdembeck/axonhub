@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -46,11 +47,31 @@ func (t *testOutbound) TransformRequest(ctx context.Context, request *llm.Reques
 	return &httpclient.Request{}, nil
 }
 
+// testOutboundWithHeaders is used when the pipeline needs a non-nil header map
+// so inbound header merging can proceed without panicking.
+type testOutboundWithHeaders struct{}
+
+func (t *testOutboundWithHeaders) APIFormat() llm.APIFormat {
+	return "test/format"
+}
+
+func (t *testOutboundWithHeaders) TransformRequest(ctx context.Context, request *llm.Request) (*httpclient.Request, error) {
+	return &httpclient.Request{Headers: http.Header{}}, nil
+}
+
 func (t *testOutbound) TransformResponse(ctx context.Context, response *httpclient.Response) (*llm.Response, error) {
 	return &llm.Response{}, nil
 }
 
-func (t *testOutbound) TransformStream(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
+func (t *testOutboundWithHeaders) TransformResponse(ctx context.Context, response *httpclient.Response) (*llm.Response, error) {
+	return &llm.Response{}, nil
+}
+
+func (t *testOutbound) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
+	return streams.SliceStream([]*llm.Response{}), nil
+}
+
+func (t *testOutboundWithHeaders) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
 	return streams.SliceStream([]*llm.Response{}), nil
 }
 
@@ -58,7 +79,15 @@ func (t *testOutbound) TransformError(ctx context.Context, err *httpclient.Error
 	return &llm.ResponseError{}
 }
 
-func (t *testOutbound) AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
+func (t *testOutboundWithHeaders) TransformError(ctx context.Context, err *httpclient.Error) *llm.ResponseError {
+	return &llm.ResponseError{}
+}
+
+func (t *testOutbound) AggregateStreamChunks(ctx context.Context, _ *httpclient.Request, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
+	return []byte(`{}`), llm.ResponseMeta{}, nil
+}
+
+func (t *testOutboundWithHeaders) AggregateStreamChunks(ctx context.Context, _ *httpclient.Request, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
 	return []byte(`{}`), llm.ResponseMeta{}, nil
 }
 
@@ -75,6 +104,7 @@ type trackingMiddleware struct {
 	outboundRawStreamCalled   bool
 	outboundLlmStreamCalled   bool
 	outboundRawErrorCalled    bool
+	sawRawRequestOnInbound    bool
 	shouldFailOnLlmRequest    bool
 	shouldFailOnRawRequest    bool
 	shouldFailOnRawResponse   bool
@@ -96,6 +126,7 @@ func (m *trackingMiddleware) Name() string {
 
 func (m *trackingMiddleware) OnInboundLlmRequest(ctx context.Context, request *llm.Request) (*llm.Request, error) {
 	m.inboundRequestCalled = true
+	m.sawRawRequestOnInbound = request != nil && request.RawRequest != nil
 
 	*m.callOrder = append(*m.callOrder, m.name+":OnInboundLlmRequest")
 	if m.shouldFailOnLlmRequest {
@@ -116,6 +147,7 @@ func (m *trackingMiddleware) OnInboundRawResponse(ctx context.Context, response 
 func (m *trackingMiddleware) OnInboundRawStream(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*httpclient.StreamEvent], error) {
 	m.inboundRawStreamCalled = true
 	*m.callOrder = append(*m.callOrder, m.name+":OnInboundRawStream")
+
 	return stream, nil
 }
 
@@ -719,4 +751,63 @@ func (f *failingExecutor) Do(ctx context.Context, request *httpclient.Request) (
 
 func (f *failingExecutor) DoStream(ctx context.Context, request *httpclient.Request) (streams.Stream[*httpclient.StreamEvent], error) {
 	return nil, errors.New("executor stream error")
+}
+
+func TestMiddleware_RawRequest_Error_CleanupMiddlewares(t *testing.T) {
+	ctx := context.Background()
+	callOrder := []string{}
+
+	m1 := newTrackingMiddleware("M1", &callOrder)
+	m2 := newTrackingMiddleware("M2", &callOrder)
+	m2.shouldFailOnRawRequest = true
+	m3 := newTrackingMiddleware("M3", &callOrder)
+
+	exec := &testExecutor{}
+	factory := NewFactory(exec)
+
+	p := factory.Pipeline(
+		&testInbound{},
+		&testOutbound{},
+		WithMiddlewares(m1, m2, m3),
+	)
+
+	request := &httpclient.Request{}
+	result, err := p.Process(ctx, request)
+
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.Contains(t, err.Error(), "raw request middleware error")
+
+	require.True(t, m1.outboundRequestCalled)
+	require.True(t, m2.outboundRequestCalled)
+	require.False(t, m3.outboundRequestCalled)
+
+	require.True(t, m1.outboundRawErrorCalled,
+		"already-executed middleware must receive OnOutboundRawError for cleanup")
+	require.True(t, m2.outboundRawErrorCalled)
+	require.True(t, m3.outboundRawErrorCalled,
+		"unexecuted middleware must receive OnOutboundRawError for unconditional cleanup")
+}
+
+func TestProcess_SetsRawRequestBeforeInboundLlmMiddlewares(t *testing.T) {
+	ctx := context.Background()
+	callOrder := []string{}
+
+	m1 := newTrackingMiddleware("M1", &callOrder)
+	m2 := newTrackingMiddleware("M2", &callOrder)
+
+	exec := &testExecutor{}
+	factory := NewFactory(exec)
+	p := factory.Pipeline(
+		&testInbound{},
+		&testOutboundWithHeaders{},
+		WithMiddlewares(m1, m2),
+	)
+
+	request := &httpclient.Request{Headers: http.Header{"X-Test": []string{"1"}}}
+	result, err := p.Process(ctx, request)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, m1.sawRawRequestOnInbound)
+	require.True(t, m2.sawRawRequestOnInbound)
 }

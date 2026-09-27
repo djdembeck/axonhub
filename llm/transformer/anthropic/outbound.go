@@ -16,7 +16,6 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm/transformer"
-	"github.com/looplj/axonhub/llm/transformer/shared"
 	"github.com/looplj/axonhub/llm/vertex"
 )
 
@@ -28,16 +27,18 @@ func init() {
 type PlatformType string
 
 const (
-	PlatformDirect     PlatformType = "direct"     // Direct Anthropic API
-	PlatformBedrock    PlatformType = "bedrock"    // AWS Bedrock
-	PlatformVertex     PlatformType = "vertex"     // Google Vertex AI
-	PlatformDeepSeek   PlatformType = "deepseek"   // DeepSeek with Anthropic format
-	PlatformDoubao     PlatformType = "doubao"     // Doubao with Anthropic format
-	PlatformMoonshot   PlatformType = "moonshot"   // Moonshot with Anthropic format
-	PlatformZhipu      PlatformType = "zhipu"      // Zhipu with Anthropic format
-	PlatformZai        PlatformType = "zai"        // Zai with Anthropic format
-	PlatformLongCat    PlatformType = "longcat"    // LongCat with Anthropic format (Bearer auth)
-	PlatformClaudeCode PlatformType = "claudecode" // Claude Code CLI
+	PlatformDirect      PlatformType = "direct"      // Direct Anthropic API
+	PlatformBedrock     PlatformType = "bedrock"     // AWS Bedrock
+	PlatformVertex      PlatformType = "vertex"      // Google Vertex AI
+	PlatformDeepSeek    PlatformType = "deepseek"    // DeepSeek with Anthropic format
+	PlatformDoubao      PlatformType = "doubao"      // Doubao with Anthropic format
+	PlatformMoonshot    PlatformType = "moonshot"    // Moonshot with Anthropic format
+	PlatformZhipu       PlatformType = "zhipu"       // Zhipu with Anthropic format
+	PlatformZai         PlatformType = "zai"         // Zai with Anthropic format
+	PlatformLongCat     PlatformType = "longcat"     // LongCat with Anthropic format (Bearer auth)
+	PlatformClaudeCode  PlatformType = "claudecode"  // Claude Code CLI
+	PlatformOllama      PlatformType = "ollama"      // Ollama with Anthropic format (Bearer auth)
+	PlatformCommandCode PlatformType = "commandcode" // Command Code provider (Bearer auth)
 )
 
 // Config holds all configuration for the Anthropic outbound transformer.
@@ -54,10 +55,13 @@ type Config struct {
 	// BaseURL is the base URL for the Anthropic API, required.
 	BaseURL string `json:"base_url,omitempty"`
 
-	AccountIdentity string `json:"account_identity,omitempty"`
-
 	// APIKeyProvider provides API keys for authentication, required.
 	APIKeyProvider auth.APIKeyProvider `json:"-"`
+
+	// EndpointPath is an optional custom path override for this endpoint.
+	// When set, it replaces the default API path (e.g., "/messages").
+	// Must start with "/". Skips default version normalization when set.
+	EndpointPath string `json:"endpoint_path,omitempty"`
 
 	// Thinking configuration
 	// Maps ReasoningEffort values to Anthropic thinking budget tokens
@@ -105,7 +109,11 @@ func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, err
 	case PlatformVertex, PlatformBedrock:
 		config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "")
 	default:
-		config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "v1")
+		if config.EndpointPath != "" {
+			config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "")
+		} else {
+			config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "v1")
+		}
 	}
 
 	return t, nil
@@ -155,15 +163,37 @@ func (t *OutboundTransformer) TransformRequest(
 		return nil, fmt.Errorf("%w: max_tokens must be positive", transformer.ErrInvalidRequest)
 	}
 
-	// Convert to Anthropic request format
-	scope := shared.TransportScope{
-		BaseURL:         t.config.BaseURL,
-		AccountIdentity: t.config.AccountIdentity,
+	if err := validateUnsupportedContentParts(llmReq.Messages); err != nil {
+		return nil, err
 	}
-	anthropicReq := convertToAnthropicRequestWithConfig(llmReq, t.config, scope)
 
-	// Apply cache_control breakpoint policy to optimize cache control if client requests with cache_control.
-	if countCacheControls(anthropicReq) > 0 {
+	// Content parts without an Anthropic equivalent are dropped during the
+	// conversion below. Reject a message left without any content instead of
+	// forwarding "content": null, which Anthropic rejects with an error that
+	// never names the unsupported part.
+	if err := validateDroppedContentParts(llmReq.Messages); err != nil {
+		return nil, err
+	}
+
+	// Convert to Anthropic request format
+	anthropicReq := convertToAnthropicRequestWithConfig(llmReq, t.config)
+
+	// System and developer messages are extracted into the top-level system
+	// prompt. When the request carries nothing else there is no conversation
+	// turn left, and Anthropic rejects the empty messages array with an error
+	// that does not mention the developer role. Fail here with a clear reason.
+	if len(anthropicReq.Messages) == 0 {
+		return nil, fmt.Errorf("%w: messages must contain at least one user or assistant message; system and developer messages are converted to the system prompt", transformer.ErrInvalidRequest)
+	}
+
+	// Anthropic supports two prompt-caching modes (see
+	// https://docs.claude.com/en/docs/build-with-claude/prompt-caching):
+	//   1. Automatic caching: a single top-level cache_control field. Anthropic
+	//      itself manages the breakpoint placement, so we forward it untouched
+	//      and intentionally skip our own breakpoint optimization pipeline.
+	//   2. Explicit cache breakpoints: per-block cache_control fields. We run
+	//      our optimization pipeline only in this mode.
+	if anthropicReq.CacheControl == nil && countCacheControls(anthropicReq) > 0 {
 		optimizeCacheControl(anthropicReq)
 	}
 
@@ -217,8 +247,8 @@ func (t *OutboundTransformer) TransformRequest(
 	var authConfig *httpclient.AuthConfig
 
 	if apiKey != "" {
-		// LongCat uses Bearer token authentication instead of X-API-Key
-		if t.config.Type == PlatformLongCat || t.config.Type == PlatformBedrock {
+		// LongCat and Ollama use Bearer token authentication instead of X-API-Key
+		if t.config.Type == PlatformLongCat || t.config.Type == PlatformOllama || t.config.Type == PlatformBedrock || t.config.Type == PlatformCommandCode {
 			authConfig = &httpclient.AuthConfig{
 				Type:   httpclient.AuthTypeBearer,
 				APIKey: apiKey,
@@ -239,7 +269,7 @@ func (t *OutboundTransformer) TransformRequest(
 		Body:      body,
 		Auth:      authConfig,
 		APIFormat: string(llm.APIFormatAnthropicMessage),
-		Metadata:  scope.Metadata(),
+		Metadata:  nil,
 	}, nil
 }
 
@@ -282,6 +312,10 @@ func (t *OutboundTransformer) buildFullRequestURL(chatReq *llm.Request) (string,
 
 	default:
 		// BaseURL is already normalized with version in NewOutboundTransformerWithConfig
+		if t.config.EndpointPath != "" {
+			return t.config.BaseURL + t.config.EndpointPath, nil
+		}
+
 		return t.config.BaseURL + "/messages", nil
 	}
 }
@@ -313,15 +347,14 @@ func (t *OutboundTransformer) TransformResponse(
 	}
 
 	// Convert to ChatCompletionResponse
-	scope, _ := shared.GetTransportScope(ctx)
-	chatResp := convertToLlmResponse(&anthropicResp, t.config.Type, scope)
+	chatResp := convertToLlmResponse(&anthropicResp, t.config.Type)
 
 	return chatResp, nil
 }
 
 // AggregateStreamChunks aggregates Anthropic streaming response chunks into a complete response.
 func (t *OutboundTransformer) AggregateStreamChunks(
-	ctx context.Context,
+	ctx context.Context, _ *httpclient.Request,
 	chunks []*httpclient.StreamEvent,
 ) ([]byte, llm.ResponseMeta, error) {
 	return AggregateStreamChunks(ctx, chunks, t.config.Type)

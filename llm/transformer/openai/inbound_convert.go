@@ -93,19 +93,7 @@ func (r *Request) ToLLMRequest() *llm.Request {
 	})
 
 	// Convert ToolChoice
-	if r.ToolChoice != nil {
-		req.ToolChoice = &llm.ToolChoice{
-			ToolChoice: r.ToolChoice.ToolChoice,
-		}
-		if r.ToolChoice.NamedToolChoice != nil {
-			req.ToolChoice.NamedToolChoice = &llm.NamedToolChoice{
-				Type: r.ToolChoice.NamedToolChoice.Type,
-				Function: llm.ToolFunction{
-					Name: r.ToolChoice.NamedToolChoice.Function.Name,
-				},
-			}
-		}
-	}
+	req.ToolChoice = r.ToolChoice.ToLLMToolChoice()
 
 	// Convert ResponseFormat
 	if r.ResponseFormat != nil {
@@ -115,7 +103,43 @@ func (r *Request) ToLLMRequest() *llm.Request {
 		}
 	}
 
+	// Convert Thinking to ReasoningEffort
+	if r.Thinking != nil && r.Thinking.Type == "disabled" {
+		req.ReasoningEffort = "none"
+	}
+
 	return req
+}
+
+// ToLLMToolChoice converts OpenAI ToolChoice to unified llm.ToolChoice.
+func (t *ToolChoice) ToLLMToolChoice() *llm.ToolChoice {
+	if t == nil {
+		return nil
+	}
+
+	choice := &llm.ToolChoice{
+		ToolChoice: t.ToolChoice,
+	}
+
+	if t.NamedToolChoice != nil {
+		choice.NamedToolChoice = &llm.NamedToolChoice{
+			Type: t.NamedToolChoice.Type,
+			Function: llm.ToolFunction{
+				Name: t.NamedToolChoice.Function.Name,
+			},
+		}
+	}
+
+	// An allowed_tools choice carries its mode in llm.ToolChoice.ToolChoice and
+	// its tool subset in llm.ToolChoice.Tools, matching the Responses convention.
+	if t.AllowedTools != nil {
+		choice.ToolChoice = t.AllowedTools.Mode
+		choice.Tools = lo.Map(t.AllowedTools.Tools, func(tool NamedToolChoice, _ int) llm.ToolOption {
+			return llm.ToolOption{Type: tool.Type, Name: tool.Function.Name}
+		})
+	}
+
+	return choice
 }
 
 // ToLLMMessage converts OpenAI Message to unified llm.Message.
@@ -138,9 +162,13 @@ func (m Message) ToLLMMessage() llm.Message {
 		}
 	}
 
-	// Fallback: if ReasoningContent is empty but Reasoning has value, use Reasoning
+	// Sync reasoning fields: if one field has value and the other is nil, copy the value
 	if msg.ReasoningContent == nil && m.Reasoning != nil && *m.Reasoning != "" {
 		msg.ReasoningContent = m.Reasoning
+	}
+
+	if msg.Reasoning == nil && msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+		msg.Reasoning = msg.ReasoningContent
 	}
 
 	// Convert Content
@@ -175,7 +203,9 @@ func (m Message) ToLLMMessage() llm.Message {
 // ToLLMAnnotation converts OpenAI Annotation to unified llm.Annotation.
 func (a Annotation) ToLLMAnnotation() llm.Annotation {
 	annotation := llm.Annotation{
-		Type: a.Type,
+		Type:       a.Type,
+		StartIndex: a.StartIndex,
+		EndIndex:   a.EndIndex,
 	}
 
 	if a.URLCitation != nil {
@@ -227,6 +257,15 @@ func (p MessageContentPart) ToLLMPart() llm.MessageContentPart {
 		part.InputAudio = &llm.InputAudio{
 			Format: p.InputAudio.Format,
 			Data:   p.InputAudio.Data,
+		}
+	}
+
+	if p.File != nil {
+		part.Type = "document"
+		part.Document = &llm.DocumentURL{
+			URL:      p.File.FileData,
+			FileID:   p.File.FileID,
+			Filename: p.File.Filename,
 		}
 	}
 

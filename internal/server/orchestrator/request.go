@@ -2,6 +2,9 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/looplj/axonhub/internal/ent/request"
@@ -11,6 +14,8 @@ import (
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
+	"github.com/looplj/axonhub/llm/streams"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 type persistRequestMiddleware struct {
@@ -39,7 +44,7 @@ func (m *persistRequestMiddleware) OnInboundLlmRequest(ctx context.Context, llmR
 		ctx,
 		llmRequest,
 		m.inbound.state.RawRequest,
-		llmRequest.APIFormat,
+		persistedRequestAPIFormat(ctx, llmRequest.APIFormat),
 	)
 	if err != nil {
 		return nil, err
@@ -48,6 +53,16 @@ func (m *persistRequestMiddleware) OnInboundLlmRequest(ctx context.Context, llmR
 	m.inbound.state.Request = request
 
 	return llmRequest, nil
+}
+
+// persistedRequestAPIFormat distinguishes the downstream WebSocket protocol in
+// request metadata without changing the Responses API format used by endpoint
+// selection and transformers.
+func persistedRequestAPIFormat(ctx context.Context, format llm.APIFormat) llm.APIFormat {
+	if shared.IsResponsesWebSocket(ctx) && format == llm.APIFormatOpenAIResponse {
+		return llm.APIFormatOpenAIResponseWebSocket
+	}
+	return format
 }
 
 func (m *persistRequestMiddleware) OnOutboundLlmResponse(ctx context.Context, llmResp *llm.Response) (*llm.Response, error) {
@@ -65,6 +80,7 @@ func (m *persistRequestMiddleware) OnOutboundLlmResponse(ctx context.Context, ll
 
 	// Determine usage to log - unified in Response.Usage for all request types.
 	usageToLog := llmResp.Usage
+	m.injectUsageCost(ctx, llmResp)
 
 	_, err := state.UsageLogService.CreateUsageLogFromRequest(persistCtx, state.Request, state.RequestExec, usageToLog)
 	if err != nil {
@@ -72,6 +88,64 @@ func (m *persistRequestMiddleware) OnOutboundLlmResponse(ctx context.Context, ll
 	}
 
 	return llmResp, nil
+}
+
+func (m *persistRequestMiddleware) OnOutboundLlmStream(ctx context.Context, stream streams.Stream[*llm.Response]) (streams.Stream[*llm.Response], error) {
+	return &usageCostStream{
+		stream: stream,
+		inject: func(resp *llm.Response) {
+			m.injectUsageCost(ctx, resp)
+		},
+	}, nil
+}
+
+func (m *persistRequestMiddleware) injectUsageCost(ctx context.Context, resp *llm.Response) {
+	if resp == nil || resp.Usage == nil {
+		return
+	}
+
+	state := m.inbound.state
+	if state == nil || state.UsageLogService == nil || state.RequestExec == nil {
+		return
+	}
+
+	if state.SystemService != nil {
+		enabled, err := state.SystemService.InjectUsageCostEnabled(ctx)
+		if err != nil {
+			log.Warn(ctx, "failed to get inject usage cost setting", log.Cause(err))
+			return
+		}
+
+		if !enabled {
+			return
+		}
+	}
+
+	state.UsageLogService.InjectUsageCost(ctx, state.RequestExec.ChannelID, state.RequestExec.ModelID, resp.Usage)
+}
+
+type usageCostStream struct {
+	stream streams.Stream[*llm.Response]
+	inject func(*llm.Response)
+}
+
+func (s *usageCostStream) Next() bool {
+	return s.stream.Next()
+}
+
+func (s *usageCostStream) Current() *llm.Response {
+	resp := s.stream.Current()
+	s.inject(resp)
+
+	return resp
+}
+
+func (s *usageCostStream) Err() error {
+	return s.stream.Err()
+}
+
+func (s *usageCostStream) Close() error {
+	return s.stream.Close()
 }
 
 func (m *persistRequestMiddleware) OnInboundRawResponse(ctx context.Context, httpResp *httpclient.Response) (*httpclient.Response, error) {
@@ -122,10 +196,96 @@ func (m *persistRequestMiddleware) OnInboundRawResponse(ctx context.Context, htt
 		return httpResp, nil
 	}
 
-	err := state.RequestService.UpdateRequestCompleted(persistCtx, state.Request.ID, llmResp.ID, httpResp.Body, metrics)
+	// Speech (TTS) responses are binary audio. xjson.Marshal stores []byte verbatim, so raw
+	// audio bytes would corrupt the JSON response_body column. Store a compact metadata
+	// placeholder there and offload the audio payload to external storage (when configured),
+	// mirroring how video artifacts are stored.
+	if llmResp.RequestType == llm.RequestTypeSpeech {
+		contentType := httpResp.Headers.Get("Content-Type")
+		placeholder := audioSafeResponseBody(llm.RequestTypeSpeech, contentType, httpResp.Body)
+		filename := audioFilenameForContentType(contentType)
+
+		err := state.RequestService.UpdateRequestCompletedWithAudio(
+			persistCtx,
+			state.Request.ID,
+			llmResp.ID,
+			placeholder,
+			httpResp.Body,
+			filename,
+			metrics,
+		)
+		if err != nil {
+			log.Warn(persistCtx, "Failed to update speech request status to completed", log.Cause(err))
+		}
+
+		return httpResp, nil
+	}
+
+	// STT text/srt/vtt responses are non-JSON; wrap them so the JSON response_body column accepts them.
+	respBody := audioSafeResponseBody(llmResp.RequestType, httpResp.Headers.Get("Content-Type"), httpResp.Body)
+
+	err := state.RequestService.UpdateRequestFinalized(persistCtx, state.Request.ID, request.StatusCompleted, llmResp.ID, respBody, metrics)
 	if err != nil {
 		log.Warn(persistCtx, "Failed to update request status to completed", log.Cause(err))
 	}
 
 	return httpResp, nil
+}
+
+// audioSafeResponseBody converts audio response bodies into JSON-safe payloads for persistence:
+// binary TTS audio becomes a compact metadata placeholder, and non-JSON STT bodies (text/srt/vtt)
+// are wrapped into a JSON object. Other request types are returned unchanged.
+func audioSafeResponseBody(requestType llm.RequestType, contentType string, body []byte) []byte {
+	switch requestType {
+	case llm.RequestTypeSpeech:
+		return fmt.Appendf(nil, `{"object":"audio.speech","content_type":%q,"bytes":%d}`, contentType, len(body))
+	case llm.RequestTypeTranscription, llm.RequestTypeTranslation:
+		// Prefer the declared Content-Type, consistent with the outbound response parsing:
+		// a text/srt/vtt transcript may coincidentally be valid JSON (e.g. "true", "123")
+		// and must still be wrapped. Only sniff when Content-Type is absent.
+		isJSON := strings.Contains(strings.ToLower(contentType), "application/json")
+		if !isJSON && contentType == "" {
+			isJSON = json.Valid(body)
+		}
+
+		if isJSON {
+			return body
+		}
+
+		wrapped, err := json.Marshal(map[string]string{
+			"object":       "audio.transcription",
+			"content_type": contentType,
+			"text":         string(body),
+		})
+		if err != nil {
+			return body
+		}
+
+		return wrapped
+	default:
+		return body
+	}
+}
+
+// audioFilenameForContentType derives a storage filename (with extension) from the audio
+// response Content-Type, defaulting to mp3.
+func audioFilenameForContentType(contentType string) string {
+	ext := "mp3"
+
+	switch {
+	case strings.Contains(contentType, "wav"):
+		ext = "wav"
+	case strings.Contains(contentType, "opus"):
+		ext = "opus"
+	case strings.Contains(contentType, "aac"):
+		ext = "aac"
+	case strings.Contains(contentType, "flac"):
+		ext = "flac"
+	case strings.Contains(contentType, "pcm"):
+		ext = "pcm"
+	case strings.Contains(contentType, "mpeg"), strings.Contains(contentType, "mp3"):
+		ext = "mp3"
+	}
+
+	return "audio." + ext
 }
