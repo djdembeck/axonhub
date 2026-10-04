@@ -105,6 +105,7 @@ type ChannelSuccessRate {
   channelId: ID!
   channelName: String!
   channelType: String!
+  channelDisabled: Boolean!
   successCount: Int!
   failedCount: Int!
   totalCount: Int!
@@ -164,6 +165,7 @@ input FastestChannelsInput {
 Token usage statistics grouped by channel
 """
 type TokenStatsByChannel {
+  channelId: ID!
   channelName: String!
   inputTokens: Int!
   outputTokens: Int!
@@ -209,6 +211,17 @@ type CostStatsByAPIKey {
   cost: Float!
 }
 
+"""
+Usage statistics grouped by user
+"""
+type UsageStatsByUser {
+  userId: ID!
+  userName: String!
+  requestCount: Int!
+  totalTokens: Int!
+  totalCost: Float!
+}
+
 extend type Query {
   dashboardOverview: DashboardOverview!
   requestStats: RequestStats!
@@ -222,7 +235,7 @@ extend type Query {
   dailyRequestStats: [DailyRequestStats!]!
   topRequestsProjects: [TopRequestsProjects!]!
   tokenStats: TokenStats!
-  channelSuccessRates: [ChannelSuccessRate!]!
+  channelSuccessRates(timeWindow: String, limit: Int): [ChannelSuccessRate!]!
   fastestChannels(input: FastestChannelsInput!): [FastestChannel!]!
   fastestModels(input: FastestChannelsInput!): [FastestModel!]!
   """
@@ -238,4 +251,5 @@ extend type Query {
   costStatsByChannel(timeWindow: String): [CostStatsByChannel!]!
   costStatsByModel(timeWindow: String): [CostStatsByModel!]!
   costStatsByAPIKey(timeWindow: String): [CostStatsByAPIKey!]!
+  usageStatsByUser(timeWindow: String): [UsageStatsByUser!]!
 }

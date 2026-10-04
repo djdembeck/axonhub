@@ -9,7 +9,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
-	"github.com/zhenzou/executors"
 
 	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
@@ -21,6 +20,7 @@ import (
 	"github.com/looplj/axonhub/internal/tracing"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer/anthropic/claudecode"
+	"github.com/looplj/axonhub/llm/transformer/opencode"
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
@@ -39,12 +39,11 @@ func setupTestTraceMiddleware(t *testing.T) (*gin.Engine, *ent.Client, *biz.Trac
 		Client:        client,
 		SystemService: systemService,
 		CacheConfig:   xcache.Config{},
-		Executor:      executors.NewPoolScheduleExecutor(),
 	})
 	channelService := biz.NewChannelServiceForTest(client)
 	usageLogService := biz.NewUsageLogService(client, systemService, channelService)
 	traceService := biz.NewTraceService(biz.TraceServiceParams{
-		RequestService: biz.NewRequestService(client, systemService, usageLogService, dataStorageService, biz.NewLiveStreamRegistry()),
+		RequestService: biz.NewRequestService(client, systemService.CacheConfig, systemService, usageLogService, dataStorageService, biz.NewLiveStreamRegistry()),
 		Ent:            client,
 	})
 
@@ -326,6 +325,209 @@ func TestWithTrace_ClaudeCodePreservesExistingTraceHeader(t *testing.T) {
 	require.Equal(t, existingTraceID, capturedTraceID)
 	require.Equal(t, "user_123", capturedUserID)
 	require.JSONEq(t, string(expectedBody), string(capturedBody))
+}
+
+func TestWithTrace_OpenCodeDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	config := tracing.Config{
+		TraceHeader:          "AH-Trace-Id",
+		OpenCodeTraceEnabled: false,
+	}
+
+	router, client, traceService := setupTestTraceMiddleware(t)
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
+	ctx = ent.NewContext(ctx, client)
+
+	// Create a test project
+	testProject, err := client.Project.Create().
+		SetName("test-project").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	router.Use(func(c *gin.Context) {
+		ctx := authz.WithTestBypass(c.Request.Context())
+		ctx = ent.NewContext(ctx, client)
+		ctx = contexts.WithProjectID(ctx, testProject.ID)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	})
+	router.Use(WithTrace(config, traceService))
+
+	var hasTrace bool
+
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		_, ok := contexts.GetTrace(c.Request.Context())
+		hasTrace = ok
+
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte("{}")))
+	req.Header.Set("X-Session-Affinity", "opencode-session-123")
+
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.False(t, hasTrace)
+}
+
+func TestTryExtractTraceIDFromOpenCodeRequest(t *testing.T) {
+	tests := []struct {
+		name     string
+		headers  http.Header
+		expected string
+	}{
+		{
+			name:     "OpenCode session header",
+			headers:  http.Header{opencode.SessionHeader: []string{"opencode-session"}},
+			expected: "opencode-session",
+		},
+		{
+			name:     "session ID header",
+			headers:  http.Header{opencode.SessionIDHeader: []string{"session-id"}},
+			expected: "session-id",
+		},
+		{
+			name:     "legacy session affinity header",
+			headers:  http.Header{opencode.SessionAffinityHeader: []string{"affinity-session"}},
+			expected: "affinity-session",
+		},
+		{
+			name: "current header takes priority",
+			headers: http.Header{
+				opencode.SessionHeader:         []string{"opencode-session"},
+				opencode.SessionIDHeader:       []string{"session-id"},
+				opencode.SessionAffinityHeader: []string{"affinity-session"},
+			},
+			expected: "opencode-session",
+		},
+		{name: "missing header", headers: http.Header{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			c.Request.Header = tt.headers
+
+			require.Equal(t, tt.expected, tryExtractTraceIDFromOpenCodeRequest(c))
+		})
+	}
+}
+
+func TestWithTrace_OpenCodeHeaderSetsTrace(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	config := tracing.Config{
+		TraceHeader:          "AH-Trace-Id",
+		OpenCodeTraceEnabled: true,
+	}
+
+	router, client, traceService := setupTestTraceMiddleware(t)
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
+	ctx = ent.NewContext(ctx, client)
+
+	// Create a test project
+	testProject, err := client.Project.Create().
+		SetName("test-project").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	router.Use(func(c *gin.Context) {
+		ctx := authz.WithTestBypass(c.Request.Context())
+		ctx = ent.NewContext(ctx, client)
+		ctx = contexts.WithProjectID(ctx, testProject.ID)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	})
+	router.Use(WithTrace(config, traceService))
+
+	var (
+		capturedTraceID   string
+		capturedSessionID string
+	)
+
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		trace, ok := contexts.GetTrace(c.Request.Context())
+		require.True(t, ok)
+
+		capturedTraceID = trace.TraceID
+
+		sessionID, ok := shared.GetSessionID(c.Request.Context())
+		require.True(t, ok)
+		capturedSessionID = sessionID
+
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte("{}")))
+	req.Header.Set("X-Session-Affinity", "opencode-session-123")
+
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "opencode-session-123", capturedTraceID)
+	require.Equal(t, "opencode-session-123", capturedSessionID)
+}
+
+func TestWithTrace_OpenCodeHeaderHasLowerPriorityThanPrimaryTraceHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	config := tracing.Config{
+		TraceHeader:          "AH-Trace-Id",
+		OpenCodeTraceEnabled: true,
+	}
+
+	router, client, traceService := setupTestTraceMiddleware(t)
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
+	ctx = ent.NewContext(ctx, client)
+
+	// Create a test project
+	testProject, err := client.Project.Create().
+		SetName("test-project").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	router.Use(func(c *gin.Context) {
+		ctx := authz.WithTestBypass(c.Request.Context())
+		ctx = ent.NewContext(ctx, client)
+		ctx = contexts.WithProjectID(ctx, testProject.ID)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	})
+	router.Use(WithTrace(config, traceService))
+
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		trace, ok := contexts.GetTrace(c.Request.Context())
+		require.True(t, ok)
+		require.Equal(t, "primary-trace-789", trace.TraceID)
+
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte("{}")))
+	req.Header.Set("Ah-Trace-Id", "primary-trace-789")
+	req.Header.Set("X-Session-Affinity", "opencode-session-456")
+
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
 }
 
 func TestWithTrace_CodexDisabled(t *testing.T) {
@@ -1117,4 +1319,276 @@ func TestWithTrace_ExtraTraceBodyFields_InvalidJSON(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestWithTrace_DoesNotPersistLoggingTraceWithoutExplicitSource(t *testing.T) {
+	config := tracing.Config{
+		ResponseTraceHeaders: []string{"AH-Trace-Id", "X-Oneapi-Request-Id", "  "},
+	}
+
+	router, client, traceService := setupTestTraceMiddleware(t)
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
+	ctx = ent.NewContext(ctx, client)
+	testProject, err := client.Project.Create().
+		SetName("test-project").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	router.Use(WithLoggingTracing(config))
+	router.Use(func(c *gin.Context) {
+		requestCtx := authz.WithTestBypass(c.Request.Context())
+		requestCtx = ent.NewContext(requestCtx, client)
+		requestCtx = contexts.WithProjectID(requestCtx, testProject.ID)
+		c.Request = c.Request.WithContext(requestCtx)
+		c.Next()
+	})
+	router.Use(WithTrace(config, traceService))
+
+	var (
+		hasPersistedTrace bool
+		loggingTraceID    string
+	)
+	router.GET("/stream", func(c *gin.Context) {
+		_, hasPersistedTrace = contexts.GetTrace(c.Request.Context())
+		loggingTraceID, _ = tracing.GetTraceID(c.Request.Context())
+
+		// A logging-only trace ID must not be exposed as a persisted trace alias.
+		require.Empty(t, c.Writer.Header().Get("Ah-Trace-Id"))
+		c.Header("Content-Type", "text/event-stream")
+		_, err := c.Writer.WriteString("data: complete\n\n")
+		require.NoError(t, err)
+	})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/stream", nil))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.False(t, hasPersistedTrace)
+	require.Regexp(t, `^at-`, loggingTraceID)
+	require.Empty(t, w.Header().Get("Ah-Trace-Id"))
+	require.Empty(t, w.Header().Get("X-Oneapi-Request-Id"))
+
+	traceCount, err := client.Trace.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, traceCount)
+}
+
+func TestWithTrace_UsesExtraHeaderForResponseAlias(t *testing.T) {
+	config := tracing.Config{
+		TraceHeader:          "AH-Trace-Id",
+		ExtraTraceHeaders:    []string{"X-Oneapi-Request-Id"},
+		ResponseTraceHeaders: []string{"AH-Trace-Id", "X-Oneapi-Request-Id"},
+	}
+
+	router, client, traceService := setupTestTraceMiddleware(t)
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
+	ctx = ent.NewContext(ctx, client)
+	testProject, err := client.Project.Create().
+		SetName("test-project").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	router.Use(WithLoggingTracing(config))
+	router.Use(func(c *gin.Context) {
+		requestCtx := authz.WithTestBypass(c.Request.Context())
+		requestCtx = ent.NewContext(requestCtx, client)
+		requestCtx = contexts.WithProjectID(requestCtx, testProject.ID)
+		c.Request = c.Request.WithContext(requestCtx)
+		c.Next()
+	})
+	router.Use(WithTrace(config, traceService))
+
+	router.GET("/test", func(c *gin.Context) {
+		traceID, ok := tracing.GetTraceID(c.Request.Context())
+		require.True(t, ok)
+		require.Equal(t, "new-api-trace-123", traceID)
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("X-Oneapi-Request-Id", "new-api-trace-123")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "new-api-trace-123", w.Header().Get("Ah-Trace-Id"))
+	require.Equal(t, "new-api-trace-123", w.Header().Get("X-Oneapi-Request-Id"))
+
+	storedTrace, err := client.Trace.Query().Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "new-api-trace-123", storedTrace.TraceID)
+}
+
+func TestWithTrace_WritesResponseAliasesForExplicitTraceWithoutProject(t *testing.T) {
+	config := tracing.Config{
+		TraceHeader:          "AH-Trace-Id",
+		ResponseTraceHeaders: []string{"AH-Trace-Id", "X-Oneapi-Request-Id"},
+	}
+
+	router := gin.New()
+	router.Use(WithTrace(config, nil))
+	router.GET("/test", func(c *gin.Context) {
+		traceID, ok := tracing.GetTraceID(c.Request.Context())
+		require.True(t, ok)
+		require.Equal(t, "client-trace-123", traceID)
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Ah-Trace-Id", "client-trace-123")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "client-trace-123", w.Header().Get("Ah-Trace-Id"))
+	require.Equal(t, "client-trace-123", w.Header().Get("X-Oneapi-Request-Id"))
+}
+
+func TestWithTrace_SkipsPersistedTraceForEmbeddingEndpoint(t *testing.T) {
+	config := tracing.Config{
+		TraceHeader:          "AH-Trace-Id",
+		ResponseTraceHeaders: []string{"AH-Trace-Id"},
+	}
+
+	router, client, traceService := setupTestTraceMiddleware(t)
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
+	ctx = ent.NewContext(ctx, client)
+
+	testProject, err := client.Project.Create().
+		SetName("test-project").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	router.Use(func(c *gin.Context) {
+		ctx := authz.WithTestBypass(c.Request.Context())
+		ctx = ent.NewContext(ctx, client)
+		ctx = contexts.WithProjectID(ctx, testProject.ID)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	})
+	router.Use(WithTrace(config, traceService))
+
+	router.POST("/v1/embeddings", func(c *gin.Context) {
+		_, ok := contexts.GetTrace(c.Request.Context())
+		require.False(t, ok, "embeddings requests must not carry a persisted trace")
+
+		traceID, ok := tracing.GetTraceID(c.Request.Context())
+		require.True(t, ok)
+		require.Equal(t, "client-trace-123", traceID)
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader([]byte(`{"model":"text-embedding-3-small","input":"hello"}`)))
+	req.Header.Set("Ah-Trace-Id", "client-trace-123")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "client-trace-123", w.Header().Get("Ah-Trace-Id"))
+	traceCount, err := client.Trace.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, traceCount, "embedding requests must not create persisted traces")
+}
+
+func TestWithTrace_PersistsTraceForChatEndpoint(t *testing.T) {
+	config := tracing.Config{
+		TraceHeader: "AH-Trace-Id",
+	}
+
+	router, client, traceService := setupTestTraceMiddleware(t)
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
+	ctx = ent.NewContext(ctx, client)
+
+	testProject, err := client.Project.Create().
+		SetName("test-project").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	router.Use(func(c *gin.Context) {
+		ctx := authz.WithTestBypass(c.Request.Context())
+		ctx = ent.NewContext(ctx, client)
+		ctx = contexts.WithProjectID(ctx, testProject.ID)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	})
+	router.Use(WithTrace(config, traceService))
+
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		trace, ok := contexts.GetTrace(c.Request.Context())
+		require.True(t, ok)
+		require.Equal(t, "client-trace-123", trace.TraceID)
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)))
+	req.Header.Set("Ah-Trace-Id", "client-trace-123")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	storedTrace, err := client.Trace.Query().Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "client-trace-123", storedTrace.TraceID)
+}
+
+func TestIsNonMessageEndpoint(t *testing.T) {
+	testCases := []struct {
+		path string
+		want bool
+	}{
+		{path: "/v1/embeddings", want: true},
+		{path: "/jina/v1/embeddings", want: true},
+		{path: "/gemini/v1beta/models/text-embedding-004:embedContent", want: true},
+		{path: "/gemini/v1beta/models/text-embedding-004:batchEmbedContents", want: true},
+		{path: "/v1/chat/completions", want: false},
+		{path: "/anthropic/v1/messages", want: false},
+		{path: "/v1/responses", want: false},
+	}
+
+	for _, tc := range testCases {
+		require.Equal(t, tc.want, isNonMessageEndpoint(tc.path), tc.path)
+	}
+}
+
+func TestWithTrace_WritesResponseAliasesWhenTracePersistenceFails(t *testing.T) {
+	config := tracing.Config{
+		TraceHeader:          "AH-Trace-Id",
+		ResponseTraceHeaders: []string{"AH-Trace-Id", "X-Oneapi-Request-Id"},
+	}
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Request = c.Request.WithContext(contexts.WithProjectID(c.Request.Context(), 1))
+		c.Next()
+	})
+	router.Use(WithTrace(config, biz.NewTraceService(biz.TraceServiceParams{})))
+	router.GET("/test", func(c *gin.Context) {
+		traceID, ok := tracing.GetTraceID(c.Request.Context())
+		require.True(t, ok)
+		require.Equal(t, "client-trace-123", traceID)
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Ah-Trace-Id", "client-trace-123")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "client-trace-123", w.Header().Get("Ah-Trace-Id"))
+	require.Equal(t, "client-trace-123", w.Header().Get("X-Oneapi-Request-Id"))
 }

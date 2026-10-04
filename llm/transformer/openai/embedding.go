@@ -32,8 +32,9 @@ type EmbeddingData struct {
 }
 
 type EmbeddingUsage struct {
-	PromptTokens int64 `json:"prompt_tokens"`
-	TotalTokens  int64 `json:"total_tokens"`
+	PromptTokens int64    `json:"prompt_tokens"`
+	TotalTokens  int64    `json:"total_tokens"`
+	Cost         *float64 `json:"cost,omitempty"`
 }
 
 // transformEmbeddingRequest transforms unified llm.Request to HTTP embedding request.
@@ -95,6 +96,10 @@ func (t *OutboundTransformer) transformEmbeddingRequest(
 
 // buildEmbeddingURL constructs the embedding API URL.
 func (t *OutboundTransformer) buildEmbeddingURL() string {
+	if t.config.EndpointPath != "" {
+		return t.config.BaseURL + t.config.EndpointPath
+	}
+
 	return t.config.BaseURL + "/embeddings"
 }
 

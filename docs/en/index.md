@@ -23,6 +23,7 @@ Welcome to the AxonHub documentation center! This index will help you quickly fi
 | [Cost Tracking](guides/cost-tracking.md) | Real-time monitoring and usage analytics |
 | [Request Tracing](guides/tracing.md) | Complete request traceability |
 | [Request Override](guides/request-override.md) | Dynamically modify request parameters |
+| [Security](guides/security.md) | IP access control, IP blocklist, and API key IP restriction |
 | [Prompt Protection Rules](guides/prompt-protection-rules.md) | Sensitive information filtering and protection |
 | [Antigravity](guides/antigravity.md) | Advanced routing and optimization features |
 
@@ -44,13 +45,7 @@ Welcome to the AxonHub documentation center! This index will help you quickly fi
 | [Image Generation API](api-reference/image-generation.md) | Image generation interface documentation |
 | [Embedding API](api-reference/embedding-api.md) | Vector embedding interface documentation |
 | [Rerank API](api-reference/rerank-api.md) | Reranking interface documentation |
-
-### 🚀 Deployment Guides
-
-| Document | Description |
-|----------|-------------|
-| [Docker Deployment](deployment/docker.md) | Deploy using Docker and Docker Compose |
-| [Configuration](deployment/configuration.md) | Detailed configuration options |
+| [System One API](api-reference/systemone-api.md) | Native decision inference interface documentation |
 
 ### 🛠️ Development
 

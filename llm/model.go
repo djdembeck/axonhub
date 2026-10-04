@@ -18,11 +18,30 @@ var (
 	DoneResponse = &Response{
 		Object: "[DONE]",
 	}
+
+	// ErrStreamIncomplete means a streaming response ended without a protocol
+	// terminal event. Pipelines may retry it only before meaningful output is
+	// committed to the caller.
+	ErrStreamIncomplete = errors.New("stream ended without terminal event")
 )
 
 // Request is the unified llm request model for AxonHub, to keep compatibility with major app and framework.
 // It choose to base on the OpenAI chat completion request, but add some extra fields to support more features.
 // All the fields except `Embedding`, `Rerank`, and other helper fields is for chat type request.
+//
+// Common fields used by all request types (chat, completion, embedding, etc.):
+//   - Model: the model ID (required for all requests)
+//   - Stream: whether to stream the response
+//   - StreamOptions: options for streaming responses
+//   - User: end-user identifier for abuse detection
+//
+// Request-type-specific fields are stored in dedicated sub-structs:
+//   - Embedding: EmbeddingRequest for embedding requests
+//   - Rerank: RerankRequest for rerank requests
+//   - Image: ImageRequest for image generation requests
+//   - Video: VideoRequest for video generation requests
+//   - Compact: CompactRequest for compact requests
+//   - Completion: CompletionRequest for legacy completion requests
 type Request struct {
 	// Messages is a list of messages to send to the llm model.
 	Messages []Message `json:"messages" validator:"required,min=1"`
@@ -159,7 +178,10 @@ type Request struct {
 	// Any of "text", "audio", "image".
 	Modalities []string `json:"modalities,omitempty"`
 
-	// Controls effort on reasoning for reasoning models. It can be set to "none", "low", "medium", or "high".
+	// Controls effort on reasoning for reasoning models. Unified levels: "none",
+	// "minimal", "low", "medium", "high", "xhigh", "max" (see llm/reasoning.go).
+	// Outbound transformers map these to their native representation; unknown
+	// values pass through verbatim so unsupported levels surface upstream errors.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 
 	// Reasoning budget for reasoning models.
@@ -179,7 +201,12 @@ type Request struct {
 	// returned text will not contain the stop sequence.
 	Stop *Stop `json:"stop,omitempty"` // string or []string
 
-	Stream        *bool          `json:"stream,omitempty"`
+	// Stream indicates whether to stream the response.
+	// This is a common field used by all request types (chat, completion, etc.).
+	Stream *bool `json:"stream,omitempty"`
+
+	// StreamOptions specifies options for streaming responses.
+	// This is a common field used by all request types (chat, completion, etc.).
 	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
 
 	// Static predicted output content, such as the content of a text file that is
@@ -215,6 +242,9 @@ type Request struct {
 	// Rerank is the rerank request, will be set if the request is rerank request.
 	Rerank *RerankRequest `json:"rerank,omitempty"`
 
+	// SystemOne is the System One request, will be set if the request is System One request.
+	SystemOne *SystemOneRequest `json:"systemone,omitempty"`
+
 	// Image is the image request, will be set if the request is image request.
 	Image *ImageRequest `json:"image,omitempty"`
 
@@ -223,6 +253,24 @@ type Request struct {
 
 	// Compact is the compact request, will be set if the request is compact request.
 	Compact *CompactRequest `json:"compact,omitempty"`
+
+	// Completion is the completion request, will be set if the request is completion request.
+	Completion *CompletionRequest `json:"completion,omitempty"`
+
+	// Speech is the text-to-speech (TTS) request, will be set if the request is a speech request.
+	Speech *SpeechRequest `json:"speech,omitempty"`
+
+	// Transcription is the speech-to-text (STT) transcription request, will be set if the request is a transcription request.
+	Transcription *TranscriptionRequest `json:"transcription,omitempty"`
+
+	// Translation is the speech-to-text (STT) translation request, will be set if the request is a translation request.
+	Translation *TranslationRequest `json:"translation,omitempty"`
+
+	// Moderation is the standalone /v1/moderations request payload.
+	Moderation *ModerationRequest `json:"moderation_request,omitempty"`
+
+	// AlphaSearch is the raw Codex/CPA /v1/alpha/search request payload.
+	AlphaSearch *AlphaSearchRequest `json:"alpha_search_request,omitempty"`
 
 	// RawRequest is the raw request from the client.
 	RawRequest *httpclient.Request `json:"raw_request,omitempty"`
@@ -250,6 +298,10 @@ type Request struct {
 	// - "truncation": *string - truncation strategy ("auto", "disabled")
 	// - "include_obfuscation": *bool - whether to enable stream obfuscation (Responses API specific)
 	TransformerMetadata map[string]any `json:"transformer_metadata,omitempty"`
+
+	// ProviderExtensions stores provider/API-format private sidecar data.
+	// It is intentionally excluded from normal JSON output to avoid leaking raw prompts or tool outputs.
+	ProviderExtensions *ProviderExtensions `json:"-"`
 }
 
 type StreamOptions struct {
@@ -286,6 +338,7 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		s.Stop = &str
 		s.MultipleStop = nil
+
 		return nil
 	}
 
@@ -295,6 +348,7 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		s.Stop = nil
 		s.MultipleStop = strs
+
 		return nil
 	}
 
@@ -344,6 +398,10 @@ type Message struct {
 	// 3. OpenAI Responses encrypted content： https://platform.openai.com/docs/api-reference/responses/object#responses-object-output-reasoning-encrypted_content
 	ReasoningSignature *string `json:"reasoning_signature,omitempty"`
 
+	// ReasoningItems preserves item-scoped reasoning data when an upstream
+	// protocol exposes multiple reasoning items in one message.
+	ReasoningItems []ReasoningItem `json:"reasoning_items,omitempty"`
+
 	// Help field, will not be sent to the llm service, to adapt the anthropic think signature.
 	// https://platform.claude.com/docs/en/build-with-claude/extended-thinking
 	// This field will be ignore when convert anthropic to other API format.
@@ -362,12 +420,58 @@ type Message struct {
 
 	// Copilot-only: X-Initiator quota tracking. Ignored by other providers.
 	Attribution string `json:"attribution,omitempty"`
+
+	// InlineToolResults carries assistant-inlined tool results (e.g. Anthropic
+	// *_tool_result blocks produced during a server-side tool turn). Downstream
+	// inbound transformers that can represent inline tool outputs (OpenAI
+	// Responses function_call_output, Anthropic *_tool_result content block)
+	// should emit them in place; others (OpenAI Chat Completions, plain text
+	// UIs) can safely drop the field.
+	InlineToolResults []InlineToolResult `json:"inline_tool_results,omitempty"`
+}
+
+// ReasoningItem is an ordered, provider-neutral reasoning item.
+// Signature is opaque provider data and must not be concatenated or modified.
+type ReasoningItem struct {
+	ID        string `json:"id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
+// InlineToolResult represents a tool result that is emitted inline within the
+// assistant turn, rather than as a separate tool-role message. Used to carry
+// Anthropic server-side tool results (web_search_tool_result,
+// code_execution_tool_result, mcp_tool_result, ...) without losing the
+// information that is otherwise not representable in OpenAI Chat Completions
+// format. OpenAI Responses inbound transformers may render these as
+// `function_call_output` output items.
+type InlineToolResult struct {
+	// ToolCallID is the originating *_tool_use id this result corresponds to.
+	ToolCallID string `json:"tool_call_id,omitempty"`
+
+	// Output is a best-effort text serialization of the tool result content,
+	// suitable for OpenAI Responses `function_call_output.output`.
+	Output string `json:"output,omitempty"`
+
+	// IsError indicates that the tool result represents an error.
+	IsError bool `json:"is_error,omitempty"`
+
+	// TransformerMetadata carries provider-specific fields. Anthropic uses:
+	//   anthropic_type                 — original block type (e.g.
+	//                                    "web_search_tool_result")
+	//   anthropic_caller               — raw JSON caller object (optional)
+	//   anthropic_tool_result_content  — raw JSON of the original content
+	TransformerMetadata map[string]any `json:"transformer_metadata,omitempty"`
 }
 
 // Annotation represents a citation or reference annotation in a message.
 type Annotation struct {
 	// Type is the type of annotation, e.g., "url_citation"
 	Type string `json:"type,omitempty"`
+	// StartIndex is the start Unicode code-point (rune) offset of the annotated span in the message content.
+	StartIndex *int64 `json:"start_index,omitempty"`
+	// EndIndex is the end Unicode code-point (rune) offset of the annotated span in the message content.
+	EndIndex *int64 `json:"end_index,omitempty"`
 	// URLCitation contains URL citation details when Type is "url_citation"
 	URLCitation *URLCitation `json:"url_citation,omitempty"`
 }
@@ -406,6 +510,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		c.Content = &str
 		c.MultipleContent = nil
+
 		return nil
 	}
 
@@ -415,6 +520,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		c.Content = nil
 		c.MultipleContent = parts
+
 		return nil
 	}
 
@@ -463,6 +569,9 @@ type ImageURL struct {
 	// URL is the URL of the image.
 	URL string `json:"url"`
 
+	// MIMEType is the MIME type of the image when provided by the source protocol.
+	MIMEType string `json:"mime_type,omitempty"`
+
 	// Specifies the detail level of the image. Learn more in the
 	// [Vision guide](https://platform.openai.com/docs/guides/vision#low-or-high-fidelity-image-understanding).
 	//
@@ -474,12 +583,19 @@ type ImageURL struct {
 type VideoURL struct {
 	// URL is the URL of the video.
 	URL string `json:"url"`
+
+	// MIMEType is the MIME type of the video when provided by the source protocol.
+	MIMEType string `json:"mime_type,omitempty"`
 }
 
 // DocumentURL represents a document URL (PDF, Word, etc.)
 type DocumentURL struct {
 	// URL is the URL of the document (data URL or regular URL).
 	URL string `json:"url"`
+	// FileID is the provider file identifier when the document was uploaded separately.
+	FileID string `json:"file_id,omitempty"`
+	// Filename is the document name used for inline file data.
+	Filename string `json:"filename,omitempty"`
 
 	// MIMEType is the MIME type of the document.
 	// e.g. "application/pdf", "application/msword"
@@ -494,6 +610,12 @@ type InputAudio struct {
 
 	// Base64 encoded audio data.
 	Data string `json:"data"`
+
+	// URL is the URL of remote audio data.
+	URL string `json:"url,omitempty"`
+
+	// MIMEType is the MIME type of the audio when provided by the source protocol.
+	MIMEType string `json:"mime_type,omitempty"`
 }
 
 // CompactContent represents compact content from OpenAI Responses API compaction.
@@ -532,6 +654,21 @@ type ResponseFormat struct {
 // And other llm provider should convert the response to this format.
 // NOTE: the OpenAI stream and non-stream response reuse same struct.
 // All the fields except `Embedding`, `Rerank`, and other helper fields is for chat type request.
+//
+// Common fields used by all response types (chat, completion, embedding, etc.):
+//   - ID: the response identifier
+//   - Model: the model used to generate the response
+//   - Usage: token usage statistics (for all request types)
+//   - Object: the object type
+//   - Created: timestamp when the response was created
+//
+// Response-type-specific fields are stored in dedicated sub-structs:
+//   - Embedding: EmbeddingResponse for embedding responses
+//   - Rerank: RerankResponse for rerank responses
+//   - Image: ImageResponse for image generation responses
+//   - Video: VideoResponse for video generation responses
+//   - Compact: CompactResponse for compact responses
+//   - Completion: CompletionResponse for legacy completion responses
 type Response struct {
 	ID string `json:"id"`
 
@@ -552,7 +689,8 @@ type Response struct {
 	// The unique ID of the previous response for multi-turn Responses API responses.
 	PreviousResponseID *string `json:"previous_response_id,omitempty"`
 
-	// Usage is the unified token usage field for all request types (chat, embedding, rerank, image, video).
+	// Usage is the unified token usage field for all request types (chat, embedding, rerank, image, video, compact, completion).
+	// This is a common field used by all response types.
 	// For streaming chat requests, it will only be present in the last chunk when stream_options: {"include_usage": true} is set.
 	Usage *Usage `json:"usage,omitempty"`
 
@@ -575,6 +713,9 @@ type Response struct {
 	// Rerank is the rerank response, will present if the request is rerank request.
 	Rerank *RerankResponse `json:"rerank,omitempty"`
 
+	// SystemOne is the System One response, will present if the request is System One request.
+	SystemOne *SystemOneResponse `json:"systemone,omitempty"`
+
 	// Image is the image response, will present if the request is image request.
 	Image *ImageResponse `json:"image,omitempty"`
 
@@ -583,6 +724,31 @@ type Response struct {
 
 	// Compact is the compact response, will present if the request is compact request.
 	Compact *CompactResponse `json:"compact,omitempty"`
+
+	// Completion is the completion response, will present if the request is completion request.
+	Completion *CompletionResponse `json:"completion,omitempty"`
+
+	// Speech is the text-to-speech (TTS) response, will present if the request is a speech request.
+	Speech *SpeechResponse `json:"speech,omitempty"`
+
+	// Transcription is the speech-to-text (STT) response, will present if the request is a transcription or translation request.
+	Transcription *TranscriptionResponse `json:"transcription,omitempty"`
+
+	// SpeechStreamEvent carries one SSE event of a streaming TTS response (stream_format="sse").
+	SpeechStreamEvent *SpeechStreamEvent `json:"speech_stream_event,omitempty"`
+
+	// SpeechAudioChunk carries one raw binary chunk of a streaming TTS response
+	// when the provider returns chunked audio instead of SSE.
+	SpeechAudioChunk *SpeechAudioChunk `json:"-"`
+
+	// TranscriptionStreamEvent carries one SSE event of a streaming STT response (stream=true).
+	TranscriptionStreamEvent *TranscriptionStreamEvent `json:"transcription_stream_event,omitempty"`
+
+	// Moderation is the standalone /v1/moderations response payload.
+	Moderation *ModerationResponse `json:"moderation,omitempty"`
+
+	// AlphaSearch is the raw Codex/CPA /v1/alpha/search response payload.
+	AlphaSearch *AlphaSearchResponse `json:"alpha_search_response,omitempty"`
 
 	// RequestType is the outbound request type from the llm service.
 	// e.g. the request from the chat/completions endpoint is in the chat type.
@@ -643,8 +809,9 @@ type TopLogprob struct {
 }
 
 type ResponseMeta struct {
-	ID    string `json:"id"`
-	Usage *Usage `json:"usage"`
+	ID        string `json:"id"`
+	Usage     *Usage `json:"usage"`
+	Completed bool   `json:"completed,omitempty"`
 }
 
 // Usage Represents the total token usage per request to OpenAI.
@@ -671,6 +838,10 @@ type Usage struct {
 	// Output only. A detailed breakdown of the token count for each modality in the candidates.
 	// For gemini models only.
 	CompletionModalityTokenDetails []ModalityTokenCount `json:"completion_modality_token_details,omitempty"`
+
+	// Cost is the request cost calculated by AxonHub from channel model prices.
+	// Omitted when no matching price is configured or usage-cost injection is disabled.
+	Cost *float64 `json:"cost,omitempty"`
 }
 
 func (u *Usage) GetCompletionTokens() *int64 {
@@ -723,12 +894,24 @@ type PromptTokensDetails struct {
 type ResponseError struct {
 	StatusCode int         `json:"-"`
 	Detail     ErrorDetail `json:"error"`
+
+	// Cause keeps the underlying error (for example a transport failure) so callers
+	// can still match it with errors.Is / errors.As after classification.
+	Cause error `json:"-"`
+}
+
+// Unwrap exposes the underlying cause, if any.
+func (e *ResponseError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 func (e ResponseError) Error() string {
 	sb := strings.Builder{}
 	if e.StatusCode != 0 {
-		sb.WriteString(fmt.Sprintf("Request failed: %s, ", http.StatusText(e.StatusCode)))
+		fmt.Fprintf(&sb, "Request failed: %s, ", http.StatusText(e.StatusCode))
 	}
 
 	if e.Detail.Message != "" {

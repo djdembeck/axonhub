@@ -157,6 +157,26 @@ func TestUsesResponsesAPI(t *testing.T) {
 			model:    "claude-3-5-sonnet",
 			expected: false,
 		},
+		{
+			name:     "grok-4.6 uses responses API",
+			model:    "grok-4.6",
+			expected: true,
+		},
+		{
+			name:     "grok-4.5 uses responses API",
+			model:    "grok-4.5",
+			expected: true,
+		},
+		{
+			name:     "Grok-4.6 uses responses API",
+			model:    "Grok-4.6",
+			expected: true,
+		},
+		{
+			name:     "non-grok non-gpt-5 model does not use responses API",
+			model:    "o4-mini",
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -227,6 +247,7 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 
 				// Validate body is valid JSON
 				var body map[string]any
+
 				err := json.Unmarshal(req.Body, &body)
 				assert.NoError(t, err)
 				assert.Equal(t, "gpt-4o", body["model"])
@@ -320,6 +341,25 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 				assert.Equal(t, DefaultCopilotBaseURL+"/v1/responses", req.URL)
 			},
 		},
+		{
+			name: "grok-4.6 uses responses API endpoint",
+			params: OutboundTransformerParams{
+				TokenProvider: &mockTokenProvider{token: mockToken},
+			},
+			request: &llm.Request{
+				Model: "grok-4.6",
+				Messages: []llm.Message{
+					{
+						Role:    "user",
+						Content: llm.MessageContent{Content: lo.ToPtr("Hello, Copilot!")},
+					},
+				},
+			},
+			wantErr: false,
+			validate: func(t *testing.T, req *httpclient.Request) {
+				assert.Equal(t, DefaultCopilotBaseURL+"/v1/responses", req.URL)
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -335,6 +375,7 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 				assert.NotNil(t, httpReq)
+
 				if tt.validate != nil {
 					tt.validate(t, httpReq)
 				}
@@ -501,6 +542,7 @@ func TestXInitiatorDefault(t *testing.T) {
 	// With message-based inference, user message means initiator is "user"
 	assert.Equal(t, "user", httpReq.Headers.Get(InitiatorHeader))
 }
+
 func TestXInitiatorForwarding(t *testing.T) {
 	ctx := context.Background()
 	mockToken := "ghu_testtoken123"
@@ -976,9 +1018,11 @@ func TestOutboundTransformer_TransformResponse(t *testing.T) {
 				assert.Equal(t, "gpt-4o", resp.Model)
 				assert.Len(t, resp.Choices, 1)
 				assert.Equal(t, "assistant", resp.Choices[0].Message.Role)
+
 				if resp.Choices[0].Message.Content.Content != nil {
 					assert.Equal(t, "Hello! How can I help you today?", *resp.Choices[0].Message.Content.Content)
 				}
+
 				if resp.Choices[0].FinishReason != nil {
 					assert.Equal(t, "stop", *resp.Choices[0].FinishReason)
 				}
@@ -996,6 +1040,7 @@ func TestOutboundTransformer_TransformResponse(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 				assert.NotNil(t, resp)
+
 				if tt.validate != nil {
 					tt.validate(t, resp)
 				}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/llm"
@@ -522,6 +523,36 @@ func TestEmbeddingInboundTransformer_TransformResponse(t *testing.T) {
 		require.Len(t, returnedEmbResp.Data, 1)
 	})
 
+	t.Run("includes usage cost", func(t *testing.T) {
+		llmResp := &llm.Response{
+			Object: "list",
+			Model:  "text-embedding-ada-002",
+			Embedding: &llm.EmbeddingResponse{
+				Object: "list",
+				Data: []llm.EmbeddingData{
+					{
+						Object:    "embedding",
+						Index:     0,
+						Embedding: llm.Embedding{Embedding: []float64{0.1, 0.2, 0.3}},
+					},
+				},
+			},
+			Usage: &llm.Usage{
+				PromptTokens: 5,
+				TotalTokens:  5,
+				Cost:         lo.ToPtr(0.000005),
+			},
+		}
+
+		httpResp, err := transformer.TransformResponse(context.Background(), llmResp)
+		require.NoError(t, err)
+
+		var returnedEmbResp EmbeddingResponse
+		require.NoError(t, json.Unmarshal(httpResp.Body, &returnedEmbResp))
+		require.NotNil(t, returnedEmbResp.Usage.Cost)
+		require.InDelta(t, 0.000005, *returnedEmbResp.Usage.Cost, 1e-12)
+	})
+
 	t.Run("valid response without usage", func(t *testing.T) {
 		embResp := &EmbeddingResponse{
 			Object: "list",
@@ -768,4 +799,28 @@ func TestOutboundTransformer_RawURL_Embedding(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEmbeddingOutboundTransformer_CustomEndpointPath(t *testing.T) {
+	config := &Config{
+		PlatformType:   PlatformOpenAI,
+		BaseURL:        "https://custom.api.com",
+		APIKeyProvider: auth.NewStaticKeyProvider("test-key"),
+		EndpointPath:   "/custom/embeddings",
+	}
+
+	transformer, err := NewOutboundTransformerWithConfig(config)
+	require.NoError(t, err)
+
+	llmReq := &llm.Request{
+		Model:       "text-embedding-3-large",
+		RequestType: llm.RequestTypeEmbedding,
+		Embedding: &llm.EmbeddingRequest{
+			Input: llm.EmbeddingInput{String: "Hello world"},
+		},
+	}
+
+	httpReq, err := transformer.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+	require.Equal(t, "https://custom.api.com/custom/embeddings", httpReq.URL)
 }

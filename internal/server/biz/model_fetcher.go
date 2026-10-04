@@ -15,23 +15,28 @@ import (
 
 	"github.com/samber/lo"
 
+	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channel"
+	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer/anthropic/claudecode"
 	"github.com/looplj/axonhub/llm/transformer/antigravity"
+	"github.com/looplj/axonhub/llm/transformer/cline"
 	"github.com/looplj/axonhub/llm/transformer/gemini/vertex"
 	"github.com/looplj/axonhub/llm/transformer/openai/codex"
 	"github.com/looplj/axonhub/llm/transformer/openai/copilot"
+	"github.com/looplj/axonhub/llm/transformer/xai/subscription"
 )
 
 const providerConfCacheDuration = 1 * time.Hour
 
 // ModelFetcher handles fetching models from provider APIs.
 type ModelFetcher struct {
-	httpClient          *httpclient.HttpClient
-	channelService      *ChannelService
-	copilotFetcher      *providerConfFetcher
-	geminiVertexFetcher *providerConfFetcher
+	httpClient                *httpclient.HttpClient
+	channelService            *ChannelService
+	clineRecommendedModelsURL string
+	copilotFetcher            *providerConfFetcher
+	geminiVertexFetcher       *providerConfFetcher
 }
 
 // providerConfFetcher handles fetching models from PublicProviderConf with caching.
@@ -139,8 +144,9 @@ func (f *providerConfFetcher) fetchFromSource(ctx context.Context, httpClient *h
 // NewModelFetcher creates a new ModelFetcher instance.
 func NewModelFetcher(httpClient *httpclient.HttpClient, channelService *ChannelService) *ModelFetcher {
 	return &ModelFetcher{
-		httpClient:     httpClient,
-		channelService: channelService,
+		httpClient:                httpClient,
+		channelService:            channelService,
+		clineRecommendedModelsURL: cline.RecommendedModelsURL,
 		copilotFetcher: &providerConfFetcher{
 			cacheDuration: providerConfCacheDuration,
 			providerURL:   copilot.ProviderConfURL,
@@ -163,8 +169,40 @@ type FetchModelsInput struct {
 
 // FetchModelsResult represents the result of fetching models.
 type FetchModelsResult struct {
-	Models []ModelIdentify
-	Error  *string
+	Models   []ModelIdentify
+	Error    *string
+	Fallback bool
+}
+
+var qiniuFallbackModels = []ModelIdentify{{ID: "deepseek-v3"}}
+
+func isQiniuChannelType(channelType channel.Type) bool {
+	return channelType == channel.TypeQiniu || channelType == channel.TypeQiniuAnthropic
+}
+
+func isCommandCodeChannelType(channelType channel.Type) bool {
+	return channelType == channel.TypeCommandcode || channelType == channel.TypeCommandcodeAnthropic
+}
+
+// Command Code exposes model IDs without protocol metadata. Its Anthropic
+// models currently use the Claude family prefixes, so route those models to
+// the Anthropic channel and keep the remaining models on the OpenAI channel.
+func isCommandCodeAnthropicModel(modelID string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(modelID))
+	return normalized == "claude" ||
+		strings.HasPrefix(normalized, "claude-") ||
+		strings.HasPrefix(normalized, "anthropic/claude-")
+}
+
+func filterCommandCodeModels(channelType channel.Type, models []ModelIdentify) []ModelIdentify {
+	if !isCommandCodeChannelType(channelType) {
+		return models
+	}
+
+	wantAnthropic := channelType == channel.TypeCommandcodeAnthropic
+	return lo.Filter(models, func(model ModelIdentify, _ int) bool {
+		return isCommandCodeAnthropicModel(model.ID) == wantAnthropic
+	})
 }
 
 func (f *ModelFetcher) getDefaultModelsByType(ctx context.Context, typ channel.Type) []ModelIdentify {
@@ -176,6 +214,8 @@ func (f *ModelFetcher) getDefaultModelsByType(ctx context.Context, typ channel.T
 		return lo.Map(codex.DefaultModels(), func(id string, _ int) ModelIdentify { return ModelIdentify{ID: id} })
 	case channel.TypeClaudecode:
 		return lo.Map(claudecode.DefaultModels(), func(id string, _ int) ModelIdentify { return ModelIdentify{ID: id} })
+	case channel.TypeXaiSubscription:
+		return lo.Map(subscription.DefaultModels(), func(id string, _ int) ModelIdentify { return ModelIdentify{ID: id} })
 	case channel.TypeGithubCopilot:
 		return f.fetchCopilotModels(ctx)
 	case channel.TypeGeminiVertex:
@@ -189,7 +229,7 @@ func (f *ModelFetcher) getDefaultModelsByType(ctx context.Context, typ channel.T
 // only be returned for official (OAuth) channels. Non-official channels of these
 // types should fetch models from the provider API instead.
 func isOfficialOnlyType(typ channel.Type) bool {
-	return typ == channel.TypeClaudecode || typ == channel.TypeCodex
+	return typ == channel.TypeClaudecode || typ == channel.TypeCodex || typ == channel.TypeXaiSubscription
 }
 
 // fetchCopilotModels fetches GitHub Copilot models from PublicProviderConf with caching.
@@ -200,6 +240,98 @@ func (f *ModelFetcher) fetchCopilotModels(ctx context.Context) []ModelIdentify {
 // fetchGeminiVertexModels fetches Gemini Vertex models from PublicProviderConf with caching.
 func (f *ModelFetcher) fetchGeminiVertexModels(ctx context.Context) []ModelIdentify {
 	return f.geminiVertexFetcher.fetch(ctx, f.httpClient)
+}
+
+// clineRecommendedModel identifies a model returned by Cline's recommended-models endpoint.
+type clineRecommendedModel struct {
+	ID string `json:"id"`
+}
+
+// clineRecommendedModelsResponse groups Cline models by recommendation and billing category.
+type clineRecommendedModelsResponse struct {
+	Recommended []clineRecommendedModel `json:"recommended"`
+	Free        []clineRecommendedModel `json:"free"`
+	ClinePass   []clineRecommendedModel `json:"clinePass"`
+}
+
+// clineFallbackModels returns the static Cline Pass models used when discovery is degraded.
+func clineFallbackModels() []ModelIdentify {
+	return lo.Map(cline.DefaultModels(), func(id string, _ int) ModelIdentify {
+		return ModelIdentify{ID: id}
+	})
+}
+
+// appendUniqueClineModels appends non-empty model IDs while preserving their first-seen order.
+func appendUniqueClineModels(models []ModelIdentify, seen map[string]struct{}, entries []clineRecommendedModel) []ModelIdentify {
+	for _, entry := range entries {
+		id := strings.TrimSpace(entry.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+
+		seen[id] = struct{}{}
+		models = append(models, ModelIdentify{ID: id})
+	}
+
+	return models
+}
+
+// hasUsableClineModel reports whether a model group contains at least one non-empty ID.
+func hasUsableClineModel(entries []clineRecommendedModel) bool {
+	return lo.SomeBy(entries, func(entry clineRecommendedModel) bool {
+		return strings.TrimSpace(entry.ID) != ""
+	})
+}
+
+// fetchClineRecommendedModels fetches the public Cline catalog and reports whether static fallback data was used.
+func (f *ModelFetcher) fetchClineRecommendedModels(ctx context.Context, httpClient *httpclient.HttpClient) ([]ModelIdentify, bool) {
+	fallback := clineFallbackModels()
+	req := &httpclient.Request{
+		Method: http.MethodGet,
+		URL:    f.clineRecommendedModelsURL,
+		Headers: http.Header{
+			"Accept": []string{"application/json"},
+		},
+	}
+
+	resp, err := httpClient.Do(ctx, req)
+	if err != nil {
+		slog.Warn("failed to fetch Cline recommended models", "error", err)
+		return fallback, true
+	}
+	if resp.StatusCode != http.StatusOK {
+		slog.Warn("failed to fetch Cline recommended models", "statusCode", resp.StatusCode)
+		return fallback, true
+	}
+
+	var response clineRecommendedModelsResponse
+	if err := json.Unmarshal(resp.Body, &response); err != nil {
+		slog.Warn("failed to parse Cline recommended models", "error", err)
+		return fallback, true
+	}
+
+	models := make([]ModelIdentify, 0, len(response.Recommended)+len(response.Free)+len(response.ClinePass))
+	seen := make(map[string]struct{}, cap(models))
+	models = appendUniqueClineModels(models, seen, response.Recommended)
+	models = appendUniqueClineModels(models, seen, response.Free)
+
+	models = appendUniqueClineModels(models, seen, response.ClinePass)
+	usedFallback := !hasUsableClineModel(response.ClinePass)
+	if usedFallback {
+		fallbackEntries := lo.Map(fallback, func(model ModelIdentify, _ int) clineRecommendedModel {
+			return clineRecommendedModel(model)
+		})
+		models = appendUniqueClineModels(models, seen, fallbackEntries)
+	}
+
+	if len(models) == 0 {
+		return fallback, true
+	}
+
+	return models, usedFallback
 }
 
 func (f *ModelFetcher) tryReturnDefaultModels(ctx context.Context, channelType string) (*FetchModelsResult, bool) {
@@ -219,6 +351,15 @@ func (f *ModelFetcher) tryReturnDefaultModels(ctx context.Context, channelType s
 	return nil, false
 }
 
+func fetchModelsInputMatchesChannel(input FetchModelsInput, ch *ent.Channel) bool {
+	if ch == nil {
+		return false
+	}
+
+	return input.ChannelType == ch.Type.String() &&
+		strings.TrimRight(input.BaseURL, "/") == strings.TrimRight(ch.BaseURL, "/")
+}
+
 func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) (*FetchModelsResult, error) {
 	if input.ChannelType == channel.TypeVolcengine.String() {
 		return &FetchModelsResult{
@@ -226,13 +367,34 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 		}, nil
 	}
 
+	if input.ChannelType == channel.TypeCline.String() {
+		httpClient := f.httpClient
+		if input.ChannelID != nil {
+			ch, err := f.channelService.entFromContext(ctx).Channel.Get(ctx, *input.ChannelID)
+			if err != nil {
+				return &FetchModelsResult{
+					Models: []ModelIdentify{},
+					Error:  lo.ToPtr(fmt.Sprintf("failed to get channel: %v", err)),
+				}, nil
+			}
+			if ch.Settings != nil && ch.Settings.Proxy != nil {
+				httpClient = f.httpClient.WithProxy(ch.Settings.Proxy)
+			}
+		}
+
+		models, fallback := f.fetchClineRecommendedModels(ctx, httpClient)
+		return &FetchModelsResult{Models: models, Fallback: fallback}, nil
+	}
+
 	if result, ok := f.tryReturnDefaultModels(ctx, input.ChannelType); ok {
 		return result, nil
 	}
 
 	var (
-		apiKey      string
-		proxyConfig *httpclient.ProxyConfig
+		apiKey            string
+		proxyConfig       *httpclient.ProxyConfig
+		headerOverrideOps []objects.OverrideOperation
+		codexChannel      *ent.Channel
 	)
 
 	if input.APIKey != nil && *input.APIKey != "" {
@@ -248,45 +410,89 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 			}, nil
 		}
 
-		if ch.Credentials.IsOAuth() {
-			if models := f.getDefaultModelsByType(ctx, ch.Type); models != nil {
+		if ch.Credentials.IsOAuth() && (ch.Type != channel.TypeCodex ||
+			(apiKey == "" && fetchModelsInputMatchesChannel(input, ch))) {
+			if ch.Type == channel.TypeCodex && codex.SupportsModelCatalog(ch.BaseURL) {
+				codexChannel = ch
+			} else if models := f.getDefaultModelsByType(ctx, ch.Type); models != nil {
 				return &FetchModelsResult{Models: models}, nil
 			}
 		}
 
 		if apiKey == "" {
+			if !fetchModelsInputMatchesChannel(input, ch) {
+				return &FetchModelsResult{
+					Models: []ModelIdentify{},
+					Error:  lo.ToPtr("API key is required when channel type or base URL is changed"),
+				}, nil
+			}
+
 			apiKey = ch.Credentials.APIKey
 			if apiKey == "" && len(ch.Credentials.APIKeys) > 0 {
 				apiKey = ch.Credentials.APIKeys[0]
 			}
+			input.ChannelType = ch.Type.String()
+			input.BaseURL = ch.BaseURL
 		}
 
 		if ch.Settings != nil {
 			proxyConfig = ch.Settings.Proxy
+
+			// The new schema field takes precedence; the legacy OverrideHeaders list is
+			// converted when the new field is absent (same precedence as
+			// (*Channel).GetHeaderOverrideOperations).
+			if ch.Settings.HeaderOverrideOperations != nil {
+				headerOverrideOps = ch.Settings.HeaderOverrideOperations
+			} else {
+				headerOverrideOps = objects.HeaderEntriesToOverrideOperations(ch.Settings.OverrideHeaders)
+			}
 		}
 	}
 
-	if apiKey == "" {
+	channelType := channel.Type(input.ChannelType)
+
+	if apiKey == "" && codexChannel == nil {
+		if isQiniuChannelType(channelType) {
+			return &FetchModelsResult{
+				Models: qiniuFallbackModels,
+			}, nil
+		}
+		if isOfficialOnlyType(channelType) {
+			if models := f.getDefaultModelsByType(ctx, channelType); models != nil {
+				return &FetchModelsResult{Models: models}, nil
+			}
+		}
 		return &FetchModelsResult{
 			Models: []ModelIdentify{},
 			Error:  lo.ToPtr("API key is required"),
 		}, nil
 	}
 
-	if isOAuthJSON(apiKey) {
-		// OAuth credentials indicate an official channel; return default models directly.
-		if models := f.getDefaultModelsByType(ctx, channel.Type(input.ChannelType)); models != nil {
+	if codexChannel == nil && isOAuthJSON(apiKey) {
+		if channelType == channel.TypeCodex && codex.SupportsModelCatalog(input.BaseURL) {
+			codexChannel = &ent.Channel{
+				Type: channelType, BaseURL: input.BaseURL,
+				Credentials: objects.ChannelCredentials{APIKey: apiKey},
+			}
+		} else if models := f.getDefaultModelsByType(ctx, channelType); models != nil {
 			return &FetchModelsResult{Models: models}, nil
 		}
 	}
 
 	// Validate channel type
-	channelType := channel.Type(input.ChannelType)
 	if err := channel.TypeValidator(channelType); err != nil {
 		return &FetchModelsResult{
 			Models: []ModelIdentify{},
 			Error:  lo.ToPtr(fmt.Sprintf("invalid channel type: %v", err)),
 		}, nil
+	}
+	if isCommandCodeChannelType(channelType) {
+		if err := validateCommandCodeBaseURL(input.BaseURL); err != nil {
+			return &FetchModelsResult{
+				Models: []ModelIdentify{},
+				Error:  lo.ToPtr(err.Error()),
+			}, nil
+		}
 	}
 
 	modelsURL, authHeaders := f.prepareModelsEndpoint(channelType, input.BaseURL)
@@ -311,8 +517,29 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 		URL:     modelsURL,
 		Headers: authHeaders,
 	}
+	httpClient := f.httpClient
+	if proxyConfig != nil {
+		httpClient = httpClient.WithProxy(proxyConfig)
+	}
+	if isCommandCodeChannelType(channelType) || codexChannel != nil {
+		httpClient = httpClient.WithRejectHTTPSDowngrade()
+	}
 
-	if channelType.UsesAnthropicModelAPI() {
+	parse := f.parseModelsResponse
+	if codexChannel != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		var err error
+		req, err = f.prepareCodexModelsRequest(ctx, codexChannel, httpClient)
+		if err != nil {
+			return &FetchModelsResult{Models: f.getDefaultModelsByType(ctx, channel.TypeCodex), Fallback: true}, nil
+		}
+		parse = parseCodexModels
+	} else if isCommandCodeChannelType(channelType) {
+		// Command Code authenticates with a Bearer API key, never X-Api-Key.
+		req.Headers.Set("Authorization", "Bearer "+apiKey)
+	} else if channelType.UsesAnthropicModelAPI() {
 		req.Headers.Set("X-Api-Key", apiKey)
 	} else if channelType.IsGemini() {
 		req.Headers.Set("X-Goog-Api-Key", apiKey)
@@ -320,10 +547,12 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 		req.Headers.Set("Authorization", "Bearer "+apiKey)
 	}
 
-	httpClient := f.httpClient
-	if proxyConfig != nil {
-		httpClient = f.httpClient.WithProxy(proxyConfig)
+	if req.Headers == nil {
+		req.Headers = make(http.Header)
 	}
+	// Channel header overrides win over the standard auth headers, matching the
+	// chat/completion path.
+	ApplyModelFetchHeaderOverrides(req.Headers, headerOverrideOps)
 
 	if channelType.IsGemini() {
 		models, err := f.fetchGeminiModels(ctx, httpClient, req)
@@ -340,48 +569,82 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 		}, nil
 	}
 
-	var (
-		resp *httpclient.Response
-		err  error
-	)
-
-	if channelType.UsesAnthropicModelAPI() {
-		resp, err = httpClient.Do(ctx, req)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			req.Headers.Del("X-Api-Key")
-			req.Headers.Set("Authorization", "Bearer "+apiKey)
-			resp, err = httpClient.Do(ctx, req)
+	execute := httpClient.Do
+	if channelType.UsesAnthropicModelAPI() && !isCommandCodeChannelType(channelType) {
+		execute = func(ctx context.Context, req *httpclient.Request) (*httpclient.Response, error) {
+			resp, err := httpClient.Do(ctx, req)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				req.Headers.Del("X-Api-Key")
+				req.Headers.Set("Authorization", "Bearer "+apiKey)
+				return httpClient.Do(ctx, req)
+			}
+			return resp, nil
 		}
-	} else {
-		resp, err = httpClient.Do(ctx, req)
 	}
-
+	models, err := fetchModels(ctx, req, execute, parse)
 	if err != nil {
+		if codexChannel != nil {
+			return &FetchModelsResult{Models: f.getDefaultModelsByType(ctx, channel.TypeCodex), Fallback: true}, nil
+		}
+		if isQiniuChannelType(channelType) {
+			return &FetchModelsResult{
+				Models: qiniuFallbackModels,
+			}, nil
+		}
 		return &FetchModelsResult{
 			Models: []ModelIdentify{},
 			Error:  lo.ToPtr(fmt.Sprintf("failed to fetch models: %v", err)),
 		}, nil
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return &FetchModelsResult{
-			Models: []ModelIdentify{},
-			Error:  lo.ToPtr(fmt.Sprintf("failed to fetch models: %v", resp.StatusCode)),
-		}, nil
-	}
-
-	models, err := f.parseModelsResponse(resp.Body)
-	if err != nil {
-		return &FetchModelsResult{
-			Models: []ModelIdentify{},
-			Error:  lo.ToPtr(fmt.Sprintf("failed to parse models response: %v", err)),
-		}, nil
+	if isCommandCodeChannelType(channelType) {
+		models = filterCommandCodeModels(channelType, models)
 	}
 
 	return &FetchModelsResult{
-		Models: lo.Uniq(models),
+		Models: models,
 		Error:  nil,
 	}, nil
+}
+
+func fetchModels(
+	ctx context.Context,
+	req *httpclient.Request,
+	execute func(context.Context, *httpclient.Request) (*httpclient.Response, error),
+	parse func([]byte) ([]ModelIdentify, error),
+) ([]ModelIdentify, error) {
+	resp, err := execute(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+	models, err := parse(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse models response: %w", err)
+	}
+	return lo.Uniq(models), nil
+}
+
+func (f *ModelFetcher) prepareCodexModelsRequest(ctx context.Context, ch *ent.Channel, client *httpclient.HttpClient) (*httpclient.Request, error) {
+	creds, err := ch.Credentials.ResolveOAuthCredentials()
+	if err != nil {
+		return nil, err
+	}
+	params := codex.TokenProviderParams{Credentials: creds, HTTPClient: client}
+	if ch.ID != 0 {
+		params.OnRefreshed = f.channelService.onTokenRefreshed(ch)
+	}
+	return codex.ModelsRequest(ctx, codex.NewTokenProvider(params), ch.BaseURL)
+}
+
+func parseCodexModels(body []byte) ([]ModelIdentify, error) {
+	ids, err := codex.ParseModelCatalog(body)
+	if err != nil {
+		return nil, err
+	}
+	return lo.Map(ids, func(id string, _ int) ModelIdentify { return ModelIdentify{ID: id} }), nil
 }
 
 type geminiListModelsResponse struct {
@@ -478,6 +741,8 @@ func (f *ModelFetcher) prepareModelsEndpoint(channelType channel.Type, baseURL s
 		useRawURL = true
 	}
 
+	baseURL = httpModelsBaseURL(baseURL)
+
 	switch {
 	case channelType.IsAnthropic() || channelType == channel.TypeClaudecode:
 		headers.Set("Anthropic-Version", "2023-06-01")
@@ -495,20 +760,57 @@ func (f *ModelFetcher) prepareModelsEndpoint(channelType channel.Type, baseURL s
 
 		return baseURL + "/v1/models", headers
 	case channelType == channel.TypeZhipuAnthropic || channelType == channel.TypeZaiAnthropic:
+		if useRawURL {
+			return baseURL + "/models", headers
+		}
+
 		baseURL = strings.TrimSuffix(baseURL, "/anthropic")
+
+		if strings.HasSuffix(baseURL, "/v1") {
+			return baseURL + "/models", headers
+		}
+
 		return baseURL + "/paas/v4/models", headers
 	case channelType == channel.TypeZai || channelType == channel.TypeZhipu:
+		if useRawURL {
+			return baseURL + "/models", headers
+		}
+
 		baseURL = strings.TrimSuffix(baseURL, "/v4")
+
+		if strings.HasSuffix(baseURL, "/v1") {
+			return baseURL + "/models", headers
+		}
+
 		return baseURL + "/v4/models", headers
 	case channelType == channel.TypeDoubao || channelType == channel.TypeVolcengine:
 		baseURL = strings.TrimSuffix(baseURL, "/v3")
+
 		return baseURL + "/v3/models", headers
 	case channelType == channel.TypeDoubaoAnthropic:
 		baseURL = strings.TrimSuffix(baseURL, "/compatible")
+
 		return baseURL + "/v3/models", headers
+	case isCommandCodeChannelType(channelType):
+		baseURL = strings.TrimSuffix(baseURL, "/anthropic")
+		baseURL = strings.TrimSuffix(baseURL, "/claude")
+
+		if useRawURL {
+			return baseURL + "/models", headers
+		}
+
+		if strings.HasSuffix(baseURL, "/v1") {
+			return baseURL + "/models", headers
+		}
+
+		return baseURL + "/v1/models", headers
 	case channelType.IsAnthropicLike():
 		baseURL = strings.TrimSuffix(baseURL, "/anthropic")
 		baseURL = strings.TrimSuffix(baseURL, "/claude")
+
+		if strings.HasSuffix(baseURL, "/v1") {
+			return baseURL + "/models", headers
+		}
 
 		return baseURL + "/v1/models", headers
 	case channelType.IsGemini():
@@ -535,6 +837,24 @@ func (f *ModelFetcher) prepareModelsEndpoint(channelType channel.Type, baseURL s
 
 		return baseURL + "/v1/models", headers
 	}
+}
+
+// httpModelsBaseURL converts a channel's WebSocket endpoint to the matching
+// HTTP endpoint used by the provider's model listing API.
+func httpModelsBaseURL(baseURL string) string {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return baseURL
+	}
+
+	switch parsed.Scheme {
+	case "ws":
+		parsed.Scheme = "http"
+	case "wss":
+		parsed.Scheme = "https"
+	}
+
+	return parsed.String()
 }
 
 type GeminiModelResponse struct {

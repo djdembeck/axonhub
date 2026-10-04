@@ -1,10 +1,11 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { format } from 'date-fns';
 import { DashboardIcon } from '@radix-ui/react-icons';
 import { zhCN, enUS } from 'date-fns/locale';
 import { Copy, Clock, Key, Database, FileText, Layers, Download, Terminal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
+import { copyTextToClipboard } from '@/lib/clipboard';
 import { extractNumberID } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -13,14 +14,24 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { JsonViewer } from '@/components/json-tree-view';
 import { useGeneralSettings } from '@/features/system/data/system';
 import { getTokenFromStorage } from '@/stores/authStore';
+import { ensureFreshAccessToken } from '@/lib/auth-session';
 import { useUsageLogs } from '../data/usage-logs';
 import { type Request, useRequest, useRequestExecutions } from '../data';
 import { ChunksDialog } from './chunks-dialog';
 import { CurlPreviewDialog } from './curl-preview-dialog';
 import { getStatusColor } from './help';
+import { RequestConversationViewer } from './request-conversation-viewer';
 import { ResponseFlow } from './response-flow';
 import { parseResponse } from '../utils/response-parser';
+import { parseRequestConversation } from '../utils/request-conversation';
 import { generateRequestCurl, generateExecutionCurl } from '../utils/curl-generator';
+import { getVideoLastFrameURL, isVideoRequestFormat } from '../utils/video-display';
+import { getExecutionModelAuditVerdict, MODEL_AUDIT_VERDICT_CLASS } from '../utils/upstream-model-audit';
+
+// The detail page renders whole request and response payloads. Expanding every
+// level eagerly produces hundreds of thousands of characters of DOM for a large
+// conversation and freezes the page, so open only the first levels by default.
+const JSON_VIEWER_EXPAND_DEPTH = 2;
 
 interface RequestDetailContentProps {
   requestId: string;
@@ -40,11 +51,28 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
   const [showCurlPreview, setShowCurlPreview] = useState(false);
   const [curlCommand, setCurlCommand] = useState('');
   const [isDownloadingVideo, setIsDownloadingVideo] = useState(false);
+  const [audioObjectUrl, setAudioObjectUrl] = useState<string | null>(null);
+  const [isLoadingAudio, setIsLoadingAudio] = useState(false);
+  const [audioLoadFailed, setAudioLoadFailed] = useState(false);
   const [responseView, setResponseView] = useState<'preview' | 'json'>('preview');
+  const [requestBodyView, setRequestBodyView] = useState<'conversation' | 'json'>('conversation');
 
   const { data: settings } = useGeneralSettings();
   const { data: requestData, isLoading } = useRequest(requestId, { projectId, disableAutoRefresh: isPreviewStreaming });
   const request = previewRequest ?? requestData;
+
+  // Auto-select the appropriate request-body view once data is available:
+  // use the conversation view only when the body actually parses as a conversation.
+  // Only auto-adjust when the underlying request body changes, so manual toggles stick.
+  const lastAutoBodyRef = useRef<string>('');
+  useEffect(() => {
+    if (!request) return;
+    const bodyKey = JSON.stringify({ id: request?.id, body: request?.requestBody, format: request?.format });
+    if (bodyKey === lastAutoBodyRef.current) return;
+    lastAutoBodyRef.current = bodyKey;
+    const isConversation = !!parseRequestConversation(request.requestBody, request.format);
+    setRequestBodyView(isConversation ? 'conversation' : 'json');
+  }, [request?.id, request?.requestBody, request?.format]);
   const {
     data: executions,
     isLoading: isExecutionsLoading,
@@ -100,9 +128,13 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
     return result.trim();
   }, [request, parsedResponse]);
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    toast.success(t('requests.actions.copy'));
+  const copyToClipboard = async (text: string) => {
+    try {
+      await copyTextToClipboard(text);
+      toast.success(t('requests.actions.copy'));
+    } catch {
+      toast.error(t('common.errors.copyFailed'));
+    }
   };
 
   const downloadFile = (content: string, filename: string) => {
@@ -118,40 +150,62 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
     toast.success(t('requests.actions.download'));
   };
 
+  const isSpeechRequest = request?.format === 'openai/audio_speech';
+  const isVideoRequest = isVideoRequestFormat(request?.format);
+  const videoLastFrameURL = getVideoLastFrameURL(request?.responseBody);
+  const hasStoredContent = !!(request?.contentSaved && request?.contentStorageKey);
+
+  // fetchStoredContent downloads the binary artifact (video/audio) saved to external storage
+  // via the content-type-agnostic /admin/requests/:id/content endpoint.
+  const fetchStoredContent = useCallback(async (): Promise<{ blob: Blob; filename: string } | null> => {
+    if (!request?.contentSaved || !request?.contentStorageKey || !projectId) return null;
+
+    const requestIdNumber = extractNumberID(request.id);
+    if (!requestIdNumber) return null;
+
+    const token = await ensureFreshAccessToken();
+    if (!token) {
+      toast.error(t('common.errors.sessionExpiredSignIn'));
+      return null;
+    }
+
+    const url = `/admin/requests/${encodeURIComponent(requestIdNumber)}/content`;
+    const resp = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Project-ID': projectId,
+      },
+    });
+
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+
+    const contentDisposition = resp.headers.get('Content-Disposition') || '';
+    const filenameMatch = contentDisposition.match(/filename=\"?([^\";]+)\"?/i);
+    // Return empty string when the header is absent so callers can apply their own
+    // extension-aware fallback (e.g. .mp4 for video, .mp3 for audio). A non-empty
+    // generic fallback here would silently shadow those defaults.
+    const filename = filenameMatch?.[1] ?? '';
+    const blob = await resp.blob();
+
+    return { blob, filename };
+  }, [request, projectId, t]);
+
   const downloadVideo = async () => {
-    if (!request?.contentSaved || !request?.contentStorageKey || !projectId) return;
+    if (!hasStoredContent || !projectId) return;
 
     const requestIdNumber = extractNumberID(request.id);
     if (!requestIdNumber) return;
 
-    const url = `/admin/requests/${encodeURIComponent(requestIdNumber)}/content`;
-
     try {
       setIsDownloadingVideo(true);
 
-      const token = getTokenFromStorage();
-      if (!token) {
-        toast.error(t('common.errors.sessionExpiredSignIn'));
-        return;
-      }
+      const result = await fetchStoredContent();
+      if (!result) return;
 
-      const resp = await fetch(url, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-Project-ID': projectId,
-        },
-      });
-
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-
-      const contentDisposition = resp.headers.get('Content-Disposition') || '';
-      const filenameMatch = contentDisposition.match(/filename=\"?([^\";]+)\"?/i);
-      const filename = filenameMatch?.[1] || `video-${requestIdNumber}.mp4`;
-
-      const blob = await resp.blob();
-      const objectUrl = URL.createObjectURL(blob);
+      const filename = result.filename || `video-${requestIdNumber}.mp4`;
+      const objectUrl = URL.createObjectURL(result.blob);
       const a = document.createElement('a');
       a.href = objectUrl;
       a.download = filename;
@@ -166,6 +220,73 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
       setIsDownloadingVideo(false);
     }
   };
+
+  const downloadAudio = async () => {
+    if (!hasStoredContent || !projectId) return;
+
+    const requestIdNumber = extractNumberID(request.id);
+    if (!requestIdNumber) return;
+
+    try {
+      setIsLoadingAudio(true);
+
+      const result = await fetchStoredContent();
+      if (!result) return;
+
+      const filename = result.filename || `audio-${requestIdNumber}.mp3`;
+      const objectUrl = URL.createObjectURL(result.blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(objectUrl);
+      toast.success(t('requests.actions.download'));
+    } catch (_err) {
+      toast.error(t('common.errors.operationFailed', { operation: t('requests.actions.downloadAudio') }));
+    } finally {
+      setIsLoadingAudio(false);
+    }
+  };
+
+  // Load the stored audio artifact into an object URL for inline playback (TTS).
+  useEffect(() => {
+    if (!isSpeechRequest || !hasStoredContent) {
+      return;
+    }
+
+    let cancelled = false;
+    let createdUrl: string | null = null;
+
+    (async () => {
+      try {
+        setIsLoadingAudio(true);
+        setAudioLoadFailed(false);
+        const result = await fetchStoredContent();
+        if (cancelled) return;
+        if (!result) {
+          setAudioLoadFailed(true);
+          return;
+        }
+
+        createdUrl = URL.createObjectURL(result.blob);
+        setAudioObjectUrl(createdUrl);
+      } catch (_err) {
+        // Surface the failure in the preview instead of showing "no response data".
+        if (!cancelled) setAudioLoadFailed(true);
+      } finally {
+        if (!cancelled) setIsLoadingAudio(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+      setAudioObjectUrl(null);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSpeechRequest, hasStoredContent, request?.id]);
 
   const showResponseChunksModal = useCallback(() => {
     if (request?.responseChunks) {
@@ -196,8 +317,8 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
     setShowCurlPreview(true);
   }, []);
 
-  const showExecutionCurlPreview = useCallback((headers: any, body: any, channel?: { baseURL?: string; type?: string }, apiFormat?: string) => {
-    const curl = generateExecutionCurl(headers, body, channel as any, apiFormat as any);
+  const showExecutionCurlPreview = useCallback((headers: any, body: any, channel?: { baseURL?: string; type?: string }, apiFormat?: string, requestURL?: string) => {
+    const curl = generateExecutionCurl(headers, body, channel as any, apiFormat as any, requestURL);
     setCurlCommand(curl);
     setShowCurlPreview(true);
   }, []);
@@ -295,6 +416,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
           const promptTokens = usage.promptTokens || 0;
           const cachedTokens = usage.promptCachedTokens || 0;
           const writeCachedTokens = usage.promptWriteCachedTokens || 0;
+          const reasoningTokens = usage.completionReasoningTokens || 0;
           const hasReadCache = cachedTokens > 0;
           const hasWriteCache = writeCachedTokens > 0;
           const cacheHitRate = hasReadCache ? ((cachedTokens / promptTokens) * 100).toFixed(1) : '0.0';
@@ -309,7 +431,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
           const formatCurrency = (val: number) =>
             t('currencies.format', {
               val,
-              currency: settings?.currencyCode,
+              currency: settings?.currencyCode ?? 'USD',
               locale: i18n.language === 'zh' ? 'zh-CN' : 'en-US',
               minimumFractionDigits: 6,
             });
@@ -336,7 +458,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <div className='grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5'>
+                <div className='grid grid-cols-2 gap-2 sm:grid-cols-4'>
                   <div className='bg-muted/30 flex flex-col justify-center rounded-lg border px-2.5 py-2'>
                     <span className='text-muted-foreground text-xs font-medium'>{t('usageLogs.columns.inputLabel')}</span>
                     <div className='mt-1'>
@@ -348,35 +470,36 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                     <span className='text-muted-foreground text-xs font-medium'>{t('usageLogs.columns.outputLabel')}</span>
                     <div className='mt-1'>
                       <p className='text-sm font-semibold'>{usage.completionTokens.toLocaleString()}</p>
+                      {reasoningTokens > 0 && (
+                        <p className='text-muted-foreground text-xs'>
+                          {t('requests.columns.reasoning')}: {reasoningTokens.toLocaleString()}
+                        </p>
+                      )}
                       <p className='text-muted-foreground text-xs'>{renderCost(completionCost)}</p>
                     </div>
                   </div>
                   <div className='bg-muted/30 flex flex-col justify-center rounded-lg border px-2.5 py-2'>
                     <span className='text-muted-foreground text-xs font-medium'>{t('usageLogs.columns.promptCachedTokens')}</span>
                     <div className='mt-1'>
-                      <div className='flex items-center justify-between'>
+                      <div className='flex flex-wrap items-center gap-1'>
                         <p className='text-sm font-semibold'>{cachedTokens.toLocaleString()}</p>
                         {hasReadCache && (
                           <Badge variant='outline' className='h-4 border-green-200 bg-green-50 px-1 text-[10px] text-green-600'>
                             {cacheHitRate}%
                           </Badge>
                         )}
-                      </div>
-                      <p className='text-muted-foreground text-xs'>{renderCost(cacheReadCost)}</p>
-                    </div>
-                  </div>
-                  <div className='bg-muted/30 flex flex-col justify-center rounded-lg border px-2.5 py-2'>
-                    <span className='text-muted-foreground text-xs font-medium'>{t('usageLogs.columns.writeCacheTokens')}</span>
-                    <div className='mt-1'>
-                      <div className='flex items-center justify-between'>
-                        <p className='text-sm font-semibold'>{writeCachedTokens.toLocaleString()}</p>
                         {hasWriteCache && (
                           <Badge variant='outline' className='h-4 border-blue-200 bg-blue-50 px-1 text-[10px] text-blue-600'>
-                            {writeCacheRate}%
+                            {t('usageLogs.columns.writeCacheTokens')} {writeCacheRate}%
                           </Badge>
                         )}
                       </div>
-                      <p className='text-muted-foreground text-xs'>{renderCost(cacheWriteCost)}</p>
+                      {writeCachedTokens > 0 && (
+                        <p className='text-muted-foreground text-xs'>
+                          {t('requests.columns.writeCache')}: {writeCachedTokens.toLocaleString()}
+                        </p>
+                      )}
+                      <p className='text-muted-foreground text-xs'>{renderCost(cost > 0 ? (cacheReadCost || 0) + (cacheWriteCost || 0) : null)}</p>
                     </div>
                   </div>
                   <div className='bg-muted/30 flex flex-col justify-center rounded-lg border px-2.5 py-2'>
@@ -440,34 +563,69 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                     </div>
                   </div>
                   <div className='bg-muted/20 h-[300px] w-full overflow-auto rounded-lg border p-4'>
-                    <JsonViewer data={request.requestHeaders} rootName='' defaultExpanded={true} expandDepth='all' hideArrayIndices={true} className='text-sm' />
+                    <JsonViewer data={request.requestHeaders} rootName='' defaultExpanded={true} expandDepth={JSON_VIEWER_EXPAND_DEPTH} hideArrayIndices={true} className='text-sm' />
                   </div>
                 </div>
               )}
               <div className='space-y-4'>
-                <div className='flex items-center justify-between'>
+                <div className='flex flex-wrap items-center justify-between gap-2'>
                   <h4 className='flex items-center gap-2 text-base font-semibold'>
                     <FileText className='text-primary h-4 w-4' />
                     {t('requests.columns.requestBody')}
                   </h4>
-                  <div className='flex gap-2'>
-                    <Button variant='outline' size='sm' onClick={() => copyToClipboard(formatJson(request.requestBody))} className='hover:bg-primary hover:text-primary-foreground'>
-                      <Copy className='mr-2 h-4 w-4' />
-                      {t('requests.dialogs.jsonViewer.copy')}
-                    </Button>
-                    <Button variant='outline' size='sm' onClick={() => downloadFile(formatJson(request.requestBody), `request-body-${request.id}.json`)} className='hover:bg-primary hover:text-primary-foreground'>
-                      <Download className='mr-2 h-4 w-4' />
-                      {t('requests.dialogs.jsonViewer.download')}
-                    </Button>
+                  <div className='flex flex-wrap items-center gap-2'>
+                    <Tabs value={requestBodyView} onValueChange={(v: any) => setRequestBodyView(v)} className='w-auto'>
+                      <TabsList className='grid w-[220px] grid-cols-2'>
+                        <TabsTrigger value='conversation'>{t('requests.detail.tabs.conversation')}</TabsTrigger>
+                        <TabsTrigger value='json'>{t('requests.detail.tabs.json')}</TabsTrigger>
+                      </TabsList>
+                    </Tabs>
+                    <div className='flex gap-2'>
+                      <Button variant='outline' size='sm' onClick={() => copyToClipboard(formatJson(request.requestBody))} className='hover:bg-primary hover:text-primary-foreground'>
+                        <Copy className='mr-2 h-4 w-4' />
+                        {t('requests.dialogs.jsonViewer.copy')}
+                      </Button>
+                      <Button variant='outline' size='sm' onClick={() => downloadFile(formatJson(request.requestBody), `request-body-${request.id}.json`)} className='hover:bg-primary hover:text-primary-foreground'>
+                        <Download className='mr-2 h-4 w-4' />
+                        {t('requests.dialogs.jsonViewer.download')}
+                      </Button>
+                    </div>
                   </div>
                 </div>
-                <div className='bg-muted/20 h-[500px] w-full overflow-auto rounded-lg border p-4'>
-                  <JsonViewer data={request.requestBody} rootName='' defaultExpanded={true} expandDepth='all' hideArrayIndices={true} className='text-sm' />
-                </div>
+                {requestBodyView === 'conversation' ? (
+                  <RequestConversationViewer body={request.requestBody} format={request.format} />
+                ) : (
+                  <div className='bg-muted/20 h-[500px] w-full overflow-auto rounded-lg border p-4'>
+                    <JsonViewer data={request.requestBody} rootName='' defaultExpanded={true} expandDepth={JSON_VIEWER_EXPAND_DEPTH} hideArrayIndices={true} className='text-sm' />
+                  </div>
+                )}
               </div>
             </TabsContent>
 
             <TabsContent value='response' className='space-y-6 p-6'>
+              {request.responseHeaders && (
+                <div className='space-y-4'>
+                  <div className='flex items-center justify-between'>
+                    <h4 className='flex items-center gap-2 text-base font-semibold'>
+                      <FileText className='text-primary h-4 w-4' />
+                      {t('requests.columns.responseHeaders')}
+                    </h4>
+                    <div className='flex gap-2'>
+                      <Button variant='outline' size='sm' onClick={() => copyToClipboard(formatJson(request.responseHeaders))} className='hover:bg-primary hover:text-primary-foreground'>
+                        <Copy className='mr-2 h-4 w-4' />
+                        {t('requests.dialogs.jsonViewer.copy')}
+                      </Button>
+                      <Button variant='outline' size='sm' onClick={() => downloadFile(formatJson(request.responseHeaders), `response-headers-${request.id}.json`)} className='hover:bg-primary hover:text-primary-foreground'>
+                        <Download className='mr-2 h-4 w-4' />
+                        {t('requests.dialogs.jsonViewer.download')}
+                      </Button>
+                    </div>
+                  </div>
+                  <div className='bg-muted/20 h-[240px] w-full overflow-auto rounded-lg border p-4'>
+                    <JsonViewer data={request.responseHeaders} rootName='' defaultExpanded={true} expandDepth='all' hideArrayIndices={true} className='text-sm' />
+                  </div>
+                </div>
+              )}
               <Tabs value={responseView} onValueChange={(v: any) => setResponseView(v)} className='w-full'>
                 <div className='flex flex-wrap items-center justify-between gap-4'>
                   <TabsList className='grid w-full grid-cols-2 sm:w-[300px]'>
@@ -476,9 +634,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                   </TabsList>
 
                   <div className='flex flex-wrap items-center gap-2'>
-                    {(request.format === 'openai/video' || request.format === 'seedance/video') &&
-                      request.contentSaved &&
-                      request.contentStorageKey && (
+                    {isVideoRequest && hasStoredContent && (
                       <Button
                         variant='outline'
                         size='sm'
@@ -488,6 +644,18 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                       >
                         <Download className='mr-2 h-4 w-4' />
                         {t('requests.actions.downloadVideo')}
+                      </Button>
+                    )}
+                    {isSpeechRequest && hasStoredContent && (
+                      <Button
+                        variant='outline'
+                        size='sm'
+                        onClick={downloadAudio}
+                        disabled={isLoadingAudio}
+                        className='hover:bg-primary hover:text-primary-foreground'
+                      >
+                        <Download className='mr-2 h-4 w-4' />
+                        {t('requests.actions.downloadAudio')}
                       </Button>
                     )}
                     <Button
@@ -533,7 +701,40 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
 
                 <div className='mt-6'>
                   <TabsContent value='preview' className='mt-0 transition-all focus-visible:outline-none'>
-                    {hasPreviewData || isLive ? (
+                    {isSpeechRequest ? (
+                      <div className='bg-muted/20 flex min-h-[200px] w-full flex-col items-center justify-center gap-4 rounded-lg border p-6'>
+                        {audioObjectUrl ? (
+                          <audio controls src={audioObjectUrl} className='w-full max-w-xl'>
+                            {t('requests.detail.audioNotSupported')}
+                          </audio>
+                        ) : isLoadingAudio ? (
+                          <div className='space-y-4 text-center'>
+                            <div className='border-primary mx-auto h-8 w-8 animate-spin rounded-full border-b-2'></div>
+                            <p className='text-muted-foreground text-sm'>{t('common.loading')}...</p>
+                          </div>
+                        ) : (
+                          <div className='space-y-3 text-center'>
+                            <FileText className='text-muted-foreground mx-auto h-12 w-12' />
+                            <p className='text-muted-foreground text-base'>
+                              {audioLoadFailed
+                                ? t('requests.detail.audioLoadFailed')
+                                : hasStoredContent
+                                  ? t('requests.detail.noResponse')
+                                  : t('requests.detail.audioNotStored')}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    ) : isVideoRequest && videoLastFrameURL && !hasPreviewData && !isLive ? (
+                      <div className='bg-muted/20 flex min-h-[200px] w-full items-center justify-center rounded-lg border p-6'>
+                        <img
+                          src={videoLastFrameURL}
+                          alt={t('requests.detail.videoLastFrame')}
+                          className='max-h-[500px] max-w-full rounded object-contain'
+                          data-testid='video-last-frame'
+                        />
+                      </div>
+                    ) : hasPreviewData || isLive ? (
                       <ResponseFlow
                         chunks={request.responseChunks}
                         body={request.responseBody}
@@ -560,7 +761,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                   <TabsContent value='json' className='mt-0 focus-visible:outline-none'>
                     {hasResponseBody ? (
                       <div className='bg-muted/20 h-[500px] w-full overflow-auto rounded-lg border p-4'>
-                        <JsonViewer data={request.responseBody} rootName='' defaultExpanded={true} expandDepth='all' hideArrayIndices={true} className='text-sm' />
+                        <JsonViewer data={request.responseBody} rootName='' defaultExpanded={true} expandDepth={JSON_VIEWER_EXPAND_DEPTH} hideArrayIndices={true} className='text-sm' />
                       </div>
                     ) : request.status === 'processing' ? (
                       <div className='bg-muted/20 flex h-[500px] w-full items-center justify-center rounded-lg border'>
@@ -601,6 +802,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                 <div className='space-y-6'>
                   {executions.edges.map((edge: any, index: number) => {
                     const execution = edge.node;
+                    const modelVerdict = getExecutionModelAuditVerdict(execution, t);
                     return (
                       <Card key={execution.id} className='bg-muted/20 border-0 shadow-sm'>
                         <CardHeader className='pb-4'>
@@ -614,6 +816,11 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                             <Badge className={getStatusColor(execution.status)} variant='secondary'>
                               {t(`requests.status.${execution.status}`)}
                             </Badge>
+                            {execution.passThroughApplied && (
+                              <Badge className='border-amber-200 bg-amber-100 text-amber-800 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-300'>
+                                {t('requests.passThrough.applied')}
+                              </Badge>
+                            )}
                           </div>
                         </CardHeader>
                         <CardContent className='space-y-6'>
@@ -626,6 +833,35 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                               <p className='text-muted-foreground font-mono text-sm'>
                                 {execution.channel?.name || t('requests.columns.unknown')}
                               </p>
+                              {(execution.channelAPIKeySuffix || execution.channelAPIKeyIndex != null) && (
+                                <div className='flex items-center gap-1.5 text-xs text-muted-foreground pt-0.5'>
+                                  <Key className='h-3.5 w-3.5 shrink-0' />
+                                  <span>{t('requests.columns.upstreamApiKey')}</span>
+                                  {execution.channelAPIKeyIndex != null && (
+                                    <span className='font-mono'>key{execution.channelAPIKeyIndex}</span>
+                                  )}
+                                  {execution.channelAPIKeySuffix && (
+                                    <span className='font-mono'>••••{execution.channelAPIKeySuffix}</span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                            <div className='bg-background space-y-2 rounded-lg border p-3'>
+                              <span className='flex items-center gap-2 text-sm font-medium'>
+                                <Database className='text-primary h-4 w-4' />
+                                {t('requests.columns.modelId')}
+                              </span>
+                              <dl className='space-y-2 text-xs'>
+                                <div>
+                                  <dt className='text-muted-foreground'>{t('requests.detail.routedModel')}</dt>
+                                  <dd className='break-all font-mono'>{execution.modelID || t('requests.columns.unknown')}</dd>
+                                </div>
+                                <div>
+                                  <dt className='text-muted-foreground'>{t('requests.detail.upstreamModels')}</dt>
+                                  <dd className='break-all font-mono'>{execution.upstreamModelID || t('requests.columns.unknown')}</dd>
+                                </div>
+                              </dl>
+                              <p className={MODEL_AUDIT_VERDICT_CLASS[modelVerdict.tone]}>{modelVerdict.message}</p>
                             </div>
                             <div className='bg-background space-y-2 rounded-lg border p-3'>
                               <span className='flex items-center gap-2 text-sm font-medium'>
@@ -664,7 +900,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                                 {t('requests.columns.firstTokenLatency')}
                               </span>
                               <p className='text-muted-foreground font-mono text-sm'>
-                                {execution.status === 'completed' && execution.metricsFirstTokenLatencyMs != null ? formatLatency(execution.metricsFirstTokenLatencyMs) : '-'}
+                                {(execution.status === 'completed' || execution.status === 'failed') && execution.metricsFirstTokenLatencyMs != null ? formatLatency(execution.metricsFirstTokenLatencyMs) : '-'}
                               </p>
                             </div>
                           </div>
@@ -684,7 +920,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
 
                           {(execution.requestHeaders || execution.requestBody) && (
                             <div className='flex justify-end'>
-                              <Button variant='outline' size='sm' onClick={() => showExecutionCurlPreview(execution.requestHeaders, execution.requestBody, execution.channel, execution.format)} className='hover:bg-primary hover:text-primary-foreground'>
+                              <Button variant='outline' size='sm' onClick={() => showExecutionCurlPreview(execution.requestHeaders, execution.requestBody, execution.channel, execution.format, execution.requestURL)} className='hover:bg-primary hover:text-primary-foreground'>
                                 <Terminal className='mr-2 h-4 w-4' />
                                 {t('requests.actions.copyCurl')}
                               </Button>
@@ -711,6 +947,30 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
                               </div>
                               <div className='bg-background h-64 w-full overflow-auto rounded-lg border p-3'>
                                 <JsonViewer data={execution.requestHeaders} rootName='' defaultExpanded={false} hideArrayIndices={true} className='text-xs' />
+                              </div>
+                            </div>
+                          )}
+
+                          {execution.responseHeaders && (
+                            <div className='space-y-3'>
+                              <div className='flex items-center justify-between'>
+                                <span className='flex items-center gap-2 text-sm font-semibold'>
+                                  <FileText className='text-primary h-4 w-4' />
+                                  {t('requests.columns.responseHeaders')}
+                                </span>
+                                <div className='flex gap-2'>
+                                  <Button variant='outline' size='sm' onClick={() => copyToClipboard(formatJson(execution.responseHeaders))} className='hover:bg-primary hover:text-primary-foreground'>
+                                    <Copy className='mr-2 h-4 w-4' />
+                                    {t('requests.dialogs.jsonViewer.copy')}
+                                  </Button>
+                                  <Button variant='outline' size='sm' onClick={() => downloadFile(formatJson(execution.responseHeaders), `execution-${execution.id}-response-headers.json`)} className='hover:bg-primary hover:text-primary-foreground'>
+                                    <Download className='mr-2 h-4 w-4' />
+                                    {t('requests.dialogs.jsonViewer.download')}
+                                  </Button>
+                                </div>
+                              </div>
+                              <div className='bg-background h-64 w-full overflow-auto rounded-lg border p-3'>
+                                <JsonViewer data={execution.responseHeaders} rootName='' defaultExpanded={false} hideArrayIndices={true} className='text-xs' />
                               </div>
                             </div>
                           )}

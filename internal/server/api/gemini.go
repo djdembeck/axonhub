@@ -1,12 +1,14 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/fx"
 
+	entprivacy "github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/server/orchestrator"
@@ -29,6 +31,8 @@ type GeminiHandlersParams struct {
 	QuotaService    *biz.QuotaService
 	HttpClient      *httpclient.HttpClient
 	LiveStreamRegistry *biz.LiveStreamRegistry
+	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
+	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
 }
 
 type GeminiHandlers struct {
@@ -52,6 +56,8 @@ func NewGeminiHandlers(params GeminiHandlersParams) *GeminiHandlers {
 				params.QuotaService,
 				params.PromptProtectionRuleService,
 				params.LiveStreamRegistry,
+				params.ChannelLimiterManager,
+				params.ProviderQuotaStatusProvider,
 			),
 		),
 		ChannelService: params.ChannelService,
@@ -137,11 +143,18 @@ func (handlers *GeminiHandlers) ListModels(c *gin.Context) {
 
 	models, err := handlers.ModelService.ListEnabledModels(ctx)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gemini.GeminiError{
+		status := http.StatusInternalServerError
+		errorStatus := "internal_server_error"
+		if errors.Is(err, entprivacy.Deny) {
+			status = http.StatusForbidden
+			errorStatus = "permission_error"
+		}
+		_ = c.Error(err)
+		c.JSON(status, gemini.GeminiError{
 			Error: gemini.ErrorDetail{
 				Message: err.Error(),
-				Code:    http.StatusInternalServerError,
-				Status:  "internal_server_error",
+				Code:    status,
+				Status:  errorStatus,
 			},
 		})
 

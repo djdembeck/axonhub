@@ -14,7 +14,8 @@ import {
   Terminal,
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { extractNumberID } from '@/lib/utils';
+import { copyTextToClipboard } from '@/lib/clipboard';
+import { extractNumberID, cn } from '@/lib/utils';
 import { usePaginationSearch } from '@/hooks/use-pagination-search';
 import { useSelectedProjectId } from '@/stores/projectStore';
 import { Badge } from '@/components/ui/badge';
@@ -28,8 +29,10 @@ import { useRequestPermissions } from '../../../hooks/useRequestPermissions';
 import { useRequest, fetchAdjacentRequestPage } from '../data';
 import { Request, RequestConnection } from '../data/schema';
 import { CurlPreviewDialog } from './curl-preview-dialog';
+import { RequestConversationViewer } from './request-conversation-viewer';
 import { getStatusColor } from './help';
 import { generateRequestCurl } from '../utils/curl-generator';
+import { parseRequestConversation } from '../utils/request-conversation';
 
 interface RequestBodyDrawerProps {
   open: boolean;
@@ -46,6 +49,8 @@ interface RequestBodyDrawerProps {
   projectId?: string | null;
   onViewDetail?: (requestId: string) => void;
 }
+
+const OPEN_ANIMATION_DELAY_MS = 520;
 
 export function RequestBodyDrawer({
   open,
@@ -74,6 +79,7 @@ export function RequestBodyDrawer({
 
   // Reset when the drawer is (re)opened for a different request.
   const prevOpenRef = useRef(false);
+  const isOpeningBeforeStateSync = open && !prevOpenRef.current;
   useEffect(() => {
     const justOpened = open && !prevOpenRef.current;
     prevOpenRef.current = open;
@@ -84,34 +90,83 @@ export function RequestBodyDrawer({
     }
   }, [open, initialRequests, initialPageInfo, initialIndex]);
 
-  const currentRequestId = allRequests[currentIndex]?.id ?? initialRequestId;
+  const visibleRequests = isOpeningBeforeStateSync ? initialRequests : allRequests;
+  const visibleCurrentIndex = isOpeningBeforeStateSync ? initialIndex : currentIndex;
+  const currentRequestId = visibleRequests[visibleCurrentIndex]?.id ?? initialRequestId;
 
   // ── toggle for expanding/collapsing all string values ────────────────────
   const [globalExpanded, setGlobalExpanded] = useState(false);
 
+  // Let the Radix sheet finish its enter animation before fetching and mounting
+  // large request bodies. Query parsing and JSON tree rendering can both block
+  // the main thread enough to make the slide-in animation stutter.
+  const [canRenderBody, setCanRenderBody] = useState(false);
+  useEffect(() => {
+    if (!open) {
+      setCanRenderBody(false);
+      setGlobalExpanded(false);
+      return;
+    }
+
+    setCanRenderBody(false);
+    const timeoutId = setTimeout(() => setCanRenderBody(true), OPEN_ANIMATION_DELAY_MS);
+
+    return () => {
+      clearTimeout(timeoutId);
+    };
+  }, [open, initialRequestId]);
+
   // ── fetch detail for current request ──────────────────────────────────────
-  const { data: request, isLoading, isFetching } = useRequest(currentRequestId ?? '', { projectId: effectiveProjectId });
+  const { data: request, isLoading, isFetching } = useRequest(currentRequestId ?? '', {
+    projectId: effectiveProjectId,
+    enabled: open && canRenderBody && !!currentRequestId,
+  });
 
   // Keep previous request data visible while loading the next one.
   const displayedRequestRef = useRef<Request | null>(null);
+  useEffect(() => {
+    if (!open) {
+      displayedRequestRef.current = null;
+    }
+  }, [open]);
   if (request) displayedRequestRef.current = request;
   const displayedRequest = displayedRequestRef.current;
 
   // ── active tab ─────────────────────────────────────────────────────────────
   const [activeTab, setActiveTab] = useState('request');
+  const [requestBodyView, setRequestBodyView] = useState<'conversation' | 'json'>('conversation');
+
+  // Use the conversation view only when the body actually parses as a conversation.
+  // Only auto-adjust when the underlying request body changes, so manual toggles stick.
+  const lastAutoBodyRef = useRef<string>('');
+  useEffect(() => {
+    if (!displayedRequest) return;
+    const bodyKey = JSON.stringify({ id: displayedRequest?.id, body: displayedRequest?.requestBody, format: displayedRequest?.format });
+    if (bodyKey === lastAutoBodyRef.current) return;
+    lastAutoBodyRef.current = bodyKey;
+    const isConversation = !!parseRequestConversation(displayedRequest.requestBody, displayedRequest.format);
+    setRequestBodyView(isConversation ? 'conversation' : 'json');
+  }, [displayedRequest?.id, displayedRequest?.requestBody, displayedRequest?.format]);
 
   // ── copy / curl ───────────────────────────────────────────────────────────
   const [showCurlPreview, setShowCurlPreview] = useState(false);
   const [curlCommand, setCurlCommand] = useState('');
 
   const copyBody = useCallback(
-    (data: any) => {
+    async (data: any) => {
+      let text: string;
       try {
-        navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+        text = JSON.stringify(data, null, 2);
       } catch {
-        navigator.clipboard.writeText(String(data));
+        text = String(data);
       }
-      toast.success(t('requests.actions.copy'));
+
+      try {
+        await copyTextToClipboard(text);
+        toast.success(t('requests.actions.copy'));
+      } catch {
+        toast.error(t('common.errors.copyFailed'));
+      }
     },
     [t]
   );
@@ -124,7 +179,7 @@ export function RequestBodyDrawer({
   }, [displayedRequest]);
 
   // List-level data (always available, no loading flash).
-  const listRequest = allRequests[currentIndex];
+  const listRequest = visibleRequests[visibleCurrentIndex];
 
   // ── navigation ─────────────────────────────────────────────────────────────
   // The list is DESC (newest first).
@@ -223,7 +278,7 @@ export function RequestBodyDrawer({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         side='right'
-        className='flex w-[50vw] min-w-[500px] max-w-[800px] flex-col gap-0 p-0 sm:max-w-[800px]'
+        className='flex w-[min(100vw,clamp(500px,50vw,800px))] max-w-none flex-col gap-0 p-0 sm:max-w-none'
       >
         {/* Header */}
         <SheetHeader className='flex-shrink-0 border-b px-6 py-4'>
@@ -278,7 +333,7 @@ export function RequestBodyDrawer({
 
         {/* Body */}
         <div className='flex min-h-0 flex-1 flex-col'>
-          {displayedRequest ? (
+          {displayedRequest && canRenderBody ? (
             <div className='relative flex min-h-0 flex-1 flex-col'>
               {isFetching && (
                 <div className='absolute inset-x-0 top-0 z-10 h-0.5 animate-pulse bg-primary/40' />
@@ -328,24 +383,58 @@ export function RequestBodyDrawer({
                 </div>
 
                 <TabsContent value='request' className='m-0 min-h-0 flex-1 px-6 pb-6 pt-4'>
-                  <ScrollArea className='bg-muted/20 h-full w-full rounded-lg border p-4'>
-                    {displayedRequest.requestBody ? (
-                      <JsonViewer
-                        key={`req-${currentRequestId}`}
-                        data={displayedRequest.requestBody}
-                        rootName=''
-                        defaultExpanded={true}
-                        expandDepth='all'
-                        hideArrayIndices={true}
-                        globalStringExpanded={globalExpanded}
-                        className='text-sm'
-                      />
-                    ) : (
-                      <div className='flex h-32 items-center justify-center'>
-                        <p className='text-muted-foreground text-sm'>{t('requests.drawer.noRequestBody')}</p>
-                      </div>
-                    )}
-                  </ScrollArea>
+                  <div className='bg-muted/40 border-border mb-3 inline-flex h-8 items-center rounded-md border p-0.5'>
+                    <button
+                      type='button'
+                      className={cn(
+                        'text-muted-foreground hover:text-foreground h-full cursor-pointer rounded-md px-3 text-xs transition-colors',
+                        requestBodyView === 'conversation' && 'bg-background text-foreground shadow-sm'
+                      )}
+                      onClick={() => setRequestBodyView('conversation')}
+                    >
+                      {t('requests.detail.tabs.conversation')}
+                    </button>
+                    <button
+                      type='button'
+                      className={cn(
+                        'text-muted-foreground hover:text-foreground h-full cursor-pointer rounded-md px-3 text-xs transition-colors',
+                        requestBodyView === 'json' && 'bg-background text-foreground shadow-sm'
+                      )}
+                      onClick={() => setRequestBodyView('json')}
+                    >
+                      {t('requests.detail.tabs.json')}
+                    </button>
+                  </div>
+                  {requestBodyView === 'conversation' ? (
+                    <ScrollArea className='bg-muted/20 h-full w-full rounded-lg border p-4'>
+                      {displayedRequest.requestBody ? (
+                        <RequestConversationViewer body={displayedRequest.requestBody} format={displayedRequest.format} />
+                      ) : (
+                        <div className='flex h-32 items-center justify-center'>
+                          <p className='text-muted-foreground text-sm'>{t('requests.drawer.noRequestBody')}</p>
+                        </div>
+                      )}
+                    </ScrollArea>
+                  ) : (
+                    <ScrollArea className='bg-muted/20 h-full w-full rounded-lg border p-4'>
+                      {displayedRequest.requestBody ? (
+                        <JsonViewer
+                          key={`req-${currentRequestId}`}
+                          data={displayedRequest.requestBody}
+                          rootName=''
+                          defaultExpanded={true}
+                          expandDepth='all'
+                          hideArrayIndices={true}
+                          globalStringExpanded={globalExpanded}
+                          className='text-sm'
+                        />
+                      ) : (
+                        <div className='flex h-32 items-center justify-center'>
+                          <p className='text-muted-foreground text-sm'>{t('requests.drawer.noRequestBody')}</p>
+                        </div>
+                      )}
+                    </ScrollArea>
+                  )}
                 </TabsContent>
 
                 <TabsContent value='response' className='m-0 min-h-0 flex-1 px-6 pb-6 pt-4'>
@@ -370,7 +459,7 @@ export function RequestBodyDrawer({
                 </TabsContent>
               </Tabs>
             </div>
-          ) : isLoading ? (
+          ) : isLoading || !canRenderBody ? (
             <div className='space-y-4 p-6'>
               <Skeleton className='h-8 w-full' />
               <Skeleton className='h-64 w-full' />

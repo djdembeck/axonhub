@@ -13,7 +13,8 @@ import { useModels } from '../context/models-context';
 import { DEVELOPER_IDS, DEVELOPER_ICONS } from '../data/constants';
 import { useBulkCreateModels } from '../data/models';
 import { useDevelopersData } from '../data/providers';
-import { type Provider, type ProviderModel } from '../data/providers.schema';
+import { type Provider, type ProviderModel, resolveVision } from '../data/providers.schema';
+import { deriveReasoningEfforts } from '../data/reasoning-efforts';
 import { CreateModelInput, ModelCard, ModelType, modelTypeSchema } from '../data/schema';
 
 interface ModelRow {
@@ -152,13 +153,14 @@ export function ModelsBatchCreateDialog() {
                 supported: selectedModel.reasoning?.supported || false,
                 default: selectedModel.reasoning?.default || false,
               },
+              reasoningEfforts: deriveReasoningEfforts(selectedModel.reasoning_options),
               toolCall: selectedModel.tool_call || false,
               temperature: selectedModel.temperature || false,
               modalities: {
                 input: selectedModel.modalities?.input || [],
                 output: selectedModel.modalities?.output || [],
               },
-              vision: selectedModel.attachment || false,
+              vision: resolveVision(selectedModel),
               cost: {
                 input: selectedModel.cost?.input || 0,
                 output: selectedModel.cost?.output || 0,
@@ -285,6 +287,8 @@ export function ModelsBatchCreateDialog() {
         limit: { context: 0, output: 0 },
       },
       settings: {
+        loadBalancerStrategy: 'default',
+        traceStickyMode: 'default',
         associations: [
           {
             type: 'model',

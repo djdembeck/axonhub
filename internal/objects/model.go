@@ -24,21 +24,41 @@ type ModelCardLimit struct {
 }
 
 type ModelCard struct {
-	Reasoning   ModelCardReasoning  `json:"reasoning"`
-	ToolCall    bool                `json:"toolCall"`
-	Temperature bool                `json:"temperature"`
-	Modalities  ModelCardModalities `json:"modalities"`
-	Vision      bool                `json:"vision"`
-	Cost        ModelCardCost       `json:"cost"`
-	Limit       ModelCardLimit      `json:"limit"`
-	Knowledge   string              `json:"knowledge"`
-	ReleaseDate string              `json:"releaseDate"`
-	LastUpdated string              `json:"lastUpdated"`
+	Reasoning ModelCardReasoning `json:"reasoning"`
+	// ReasoningEfforts lists the reasoning effort levels the model accepts, using the
+	// unified values from llm/reasoning.go. Nil means the levels are unknown.
+	ReasoningEfforts []string            `json:"reasoningEfforts"`
+	ToolCall         bool                `json:"toolCall"`
+	Temperature      bool                `json:"temperature"`
+	Modalities       ModelCardModalities `json:"modalities"`
+	Vision           bool                `json:"vision"`
+	Cost             ModelCardCost       `json:"cost"`
+	Limit            ModelCardLimit      `json:"limit"`
+	Knowledge        string              `json:"knowledge"`
+	ReleaseDate      string              `json:"releaseDate"`
+	LastUpdated      string              `json:"lastUpdated"`
 }
 
 type ModelSettings struct {
-	Associations []*ModelAssociation `json:"associations"`
+	DisableDeveloperSettingsInheritance bool                `json:"disableDeveloperSettingsInheritance"`
+	Associations                        []*ModelAssociation `json:"associations"`
+	LoadBalancerStrategy                string              `json:"loadBalancerStrategy"`
+	TraceStickyMode                     string              `json:"traceStickyMode"`
 }
+
+const (
+	ModelAssociationConditionFieldPromptTokens        = "prompt_tokens"
+	ModelAssociationConditionFieldStream              = "stream"
+	ModelAssociationConditionFieldRequestFormat       = "request_format"
+	ModelAssociationConditionFieldReasoningEffort     = "reasoning_effort"
+	ModelAssociationConditionFieldDailyTime           = "daily_time"
+	ModelAssociationConditionFieldHasImage            = "has_image"
+	ModelAssociationConditionFieldHasVideo            = "has_video"
+	ModelAssociationConditionFieldHasDocument         = "has_document"
+	ModelAssociationConditionFieldHasAudio            = "has_audio"
+	ModelAssociationConditionFieldRequestHeader       = "request_header"
+	ModelAssociationConditionFieldRequestHeaderPrefix = "request_header."
+)
 
 type ModelAssociation struct {
 	// channel_model: the specified model id in the specified channel
