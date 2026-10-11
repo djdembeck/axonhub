@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { TFunction } from 'i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { graphqlRequest } from '@/gql/graphql';
 import { pageInfoSchema } from '@/gql/pagination';
@@ -57,7 +58,7 @@ export type UpdateChannelOverrideTemplateInput = z.infer<typeof updateChannelOve
 export const applyChannelOverrideTemplateInputSchema = z.object({
   templateID: z.string(),
   channelIDs: z.array(z.string()).min(1, 'At least one channel is required'),
-  mode: z.enum(['MERGE']).optional(),
+  mode: z.enum(['MERGE', 'REPLACE']).optional(),
 });
 export type ApplyChannelOverrideTemplateInput = z.infer<typeof applyChannelOverrideTemplateInputSchema>;
 
@@ -67,6 +68,30 @@ export const applyChannelOverrideTemplatePayloadSchema = z.object({
   channels: z.array(z.any()), // Channel schema is complex, just mark as any here
 });
 export type ApplyChannelOverrideTemplatePayload = z.infer<typeof applyChannelOverrideTemplatePayloadSchema>;
+
+export const clearChannelOverrideTemplatesInputSchema = z.object({
+  channelIDs: z.array(z.string()).min(1, 'At least one channel is required'),
+});
+export type ClearChannelOverrideTemplatesInput = z.infer<typeof clearChannelOverrideTemplatesInputSchema>;
+
+export const clearChannelOverrideTemplatesPayloadSchema = z.object({
+  success: z.boolean(),
+  updated: z.number(),
+  channels: z.array(z.any()),
+});
+export type ClearChannelOverrideTemplatesPayload = z.infer<typeof clearChannelOverrideTemplatesPayloadSchema>;
+
+/**
+ * Template names are unique per user, so create and rename can collide with an
+ * existing template. The backend reports this as a DUPLICATE_NAME conflict and
+ * the generic handler stays silent while a custom callback is supplied, so show
+ * a localized hint naming the conflicting template here.
+ */
+function reportTemplateNameConflict(t: TFunction, name?: string) {
+  return (info: { value?: string }) => {
+    toast.error(t('channels.templates.validation.duplicateName', { name: info.value || name || '' }));
+  };
+}
 
 // GraphQL Fragments
 const TEMPLATE_FRAGMENT = `
@@ -94,6 +119,12 @@ const TEMPLATE_FRAGMENT = `
       to
       value
       condition
+      match {
+        path
+        eq
+      }
+      index
+      splat
     }
     bodyOverrideOperations {
       op
@@ -102,6 +133,12 @@ const TEMPLATE_FRAGMENT = `
       to
       value
       condition
+      match {
+        path
+        eq
+      }
+      index
+      splat
     }
   }
 `;
@@ -177,6 +214,18 @@ const APPLY_CHANNEL_OVERRIDE_TEMPLATE = `
   }
 `;
 
+const CLEAR_CHANNEL_OVERRIDE_TEMPLATES = `
+  mutation ClearChannelOverrideTemplates($input: ClearChannelOverrideTemplatesInput!) {
+    clearChannelOverrideTemplates(input: $input) {
+      success
+      updated
+      channels {
+        id
+      }
+    }
+  }
+`;
+
 // React Query Hooks
 
 export function useChannelOverrideTemplates(
@@ -231,7 +280,10 @@ export function useCreateChannelOverrideTemplate() {
         });
         return channelOverrideTemplateSchema.parse(data.createChannelOverrideTemplate);
       } catch (error) {
-        handleError(error, { context: 'Create Channel Template' });
+        handleError(error, {
+          context: 'Create Channel Template',
+          onDuplicate: reportTemplateNameConflict(t, input.name),
+        });
         throw error;
       }
     },
@@ -256,7 +308,10 @@ export function useUpdateChannelOverrideTemplate() {
         });
         return channelOverrideTemplateSchema.parse(data.updateChannelOverrideTemplate);
       } catch (error) {
-        handleError(error, { context: 'Update Channel Template' });
+        handleError(error, {
+          context: 'Update Channel Template',
+          onDuplicate: reportTemplateNameConflict(t, input.name),
+        });
         throw error;
       }
     },
@@ -310,6 +365,31 @@ export function useApplyChannelOverrideTemplate() {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.templates.messages.applySuccess', { count: data.updated }));
+    },
+  });
+}
+
+export function useClearChannelOverrideTemplates() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async (input: ClearChannelOverrideTemplatesInput) => {
+      try {
+        const data = await graphqlRequest<{ clearChannelOverrideTemplates: ClearChannelOverrideTemplatesPayload }>(
+          CLEAR_CHANNEL_OVERRIDE_TEMPLATES,
+          { input }
+        );
+        return clearChannelOverrideTemplatesPayloadSchema.parse(data.clearChannelOverrideTemplates);
+      } catch (error) {
+        handleError(error, { context: 'Clear Channel Templates' });
+        throw error;
+      }
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      toast.success(t('channels.templates.messages.clearSuccess', { count: data.updated }));
     },
   });
 }

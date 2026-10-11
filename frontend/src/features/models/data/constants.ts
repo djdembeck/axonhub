@@ -1,6 +1,7 @@
 export const DEVELOPER_IDS = [
   'deepseek',
   'alibaba',
+  'tencent',
   'zai',
   'openai',
   'moonshot',
@@ -15,6 +16,11 @@ export const DEVELOPER_IDS = [
   'xai',
   'bytedance',
   'stepfun',
+  'meta',
+  'ibm',
+  'poolside',
+  'inclusionai',
+  'thinkingmachines',
 ];
 
 export const DEVELOPER_ICONS: Record<string, string> = {
@@ -28,10 +34,13 @@ export const DEVELOPER_ICONS: Record<string, string> = {
   minimax: 'Minimax',
   kwaipilot: 'KwaiKAT',
   alibaba: 'Qwen',
+  tencent: 'Hunyuan',
   xiaomi: 'XiaomiMiMo',
   longcat: 'LongCat',
   mistral: 'Mistral',
   nvidia: 'Nvidia',
   bytedance: 'Doubao',
   stepfun: 'Stepfun',
+  meta: 'Meta',
+  ibm: 'IBM',
 };

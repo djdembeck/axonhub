@@ -223,6 +223,34 @@ func (_c *ChannelCreate) SetNillableErrorMessage(v *string) *ChannelCreate {
 	return _c
 }
 
+// SetAutoDisabledAt sets the "auto_disabled_at" field.
+func (_c *ChannelCreate) SetAutoDisabledAt(v time.Time) *ChannelCreate {
+	_c.mutation.SetAutoDisabledAt(v)
+	return _c
+}
+
+// SetNillableAutoDisabledAt sets the "auto_disabled_at" field if the given value is not nil.
+func (_c *ChannelCreate) SetNillableAutoDisabledAt(v *time.Time) *ChannelCreate {
+	if v != nil {
+		_c.SetAutoDisabledAt(*v)
+	}
+	return _c
+}
+
+// SetAutoDisableExpiresAt sets the "auto_disable_expires_at" field.
+func (_c *ChannelCreate) SetAutoDisableExpiresAt(v time.Time) *ChannelCreate {
+	_c.mutation.SetAutoDisableExpiresAt(v)
+	return _c
+}
+
+// SetNillableAutoDisableExpiresAt sets the "auto_disable_expires_at" field if the given value is not nil.
+func (_c *ChannelCreate) SetNillableAutoDisableExpiresAt(v *time.Time) *ChannelCreate {
+	if v != nil {
+		_c.SetAutoDisableExpiresAt(*v)
+	}
+	return _c
+}
+
 // SetRemark sets the "remark" field.
 func (_c *ChannelCreate) SetRemark(v string) *ChannelCreate {
 	_c.mutation.SetRemark(v)
@@ -234,6 +262,12 @@ func (_c *ChannelCreate) SetNillableRemark(v *string) *ChannelCreate {
 	if v != nil {
 		_c.SetRemark(*v)
 	}
+	return _c
+}
+
+// SetEndpoints sets the "endpoints" field.
+func (_c *ChannelCreate) SetEndpoints(v []objects.ChannelEndpoint) *ChannelCreate {
+	_c.mutation.SetEndpoints(v)
 	return _c
 }
 
@@ -422,6 +456,10 @@ func (_c *ChannelCreate) defaults() error {
 		v := channel.DefaultOrderingWeight
 		_c.mutation.SetOrderingWeight(v)
 	}
+	if _, ok := _c.mutation.Endpoints(); !ok {
+		v := channel.DefaultEndpoints
+		_c.mutation.SetEndpoints(v)
+	}
 	return nil
 }
 
@@ -567,9 +605,21 @@ func (_c *ChannelCreate) createSpec() (*Channel, *sqlgraph.CreateSpec) {
 		_spec.SetField(channel.FieldErrorMessage, field.TypeString, value)
 		_node.ErrorMessage = &value
 	}
+	if value, ok := _c.mutation.AutoDisabledAt(); ok {
+		_spec.SetField(channel.FieldAutoDisabledAt, field.TypeTime, value)
+		_node.AutoDisabledAt = &value
+	}
+	if value, ok := _c.mutation.AutoDisableExpiresAt(); ok {
+		_spec.SetField(channel.FieldAutoDisableExpiresAt, field.TypeTime, value)
+		_node.AutoDisableExpiresAt = &value
+	}
 	if value, ok := _c.mutation.Remark(); ok {
 		_spec.SetField(channel.FieldRemark, field.TypeString, value)
 		_node.Remark = &value
+	}
+	if value, ok := _c.mutation.Endpoints(); ok {
+		_spec.SetField(channel.FieldEndpoints, field.TypeJSON, value)
+		_node.Endpoints = value
 	}
 	if nodes := _c.mutation.RequestsIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -995,6 +1045,42 @@ func (u *ChannelUpsert) ClearErrorMessage() *ChannelUpsert {
 	return u
 }
 
+// SetAutoDisabledAt sets the "auto_disabled_at" field.
+func (u *ChannelUpsert) SetAutoDisabledAt(v time.Time) *ChannelUpsert {
+	u.Set(channel.FieldAutoDisabledAt, v)
+	return u
+}
+
+// UpdateAutoDisabledAt sets the "auto_disabled_at" field to the value that was provided on create.
+func (u *ChannelUpsert) UpdateAutoDisabledAt() *ChannelUpsert {
+	u.SetExcluded(channel.FieldAutoDisabledAt)
+	return u
+}
+
+// ClearAutoDisabledAt clears the value of the "auto_disabled_at" field.
+func (u *ChannelUpsert) ClearAutoDisabledAt() *ChannelUpsert {
+	u.SetNull(channel.FieldAutoDisabledAt)
+	return u
+}
+
+// SetAutoDisableExpiresAt sets the "auto_disable_expires_at" field.
+func (u *ChannelUpsert) SetAutoDisableExpiresAt(v time.Time) *ChannelUpsert {
+	u.Set(channel.FieldAutoDisableExpiresAt, v)
+	return u
+}
+
+// UpdateAutoDisableExpiresAt sets the "auto_disable_expires_at" field to the value that was provided on create.
+func (u *ChannelUpsert) UpdateAutoDisableExpiresAt() *ChannelUpsert {
+	u.SetExcluded(channel.FieldAutoDisableExpiresAt)
+	return u
+}
+
+// ClearAutoDisableExpiresAt clears the value of the "auto_disable_expires_at" field.
+func (u *ChannelUpsert) ClearAutoDisableExpiresAt() *ChannelUpsert {
+	u.SetNull(channel.FieldAutoDisableExpiresAt)
+	return u
+}
+
 // SetRemark sets the "remark" field.
 func (u *ChannelUpsert) SetRemark(v string) *ChannelUpsert {
 	u.Set(channel.FieldRemark, v)
@@ -1010,6 +1096,24 @@ func (u *ChannelUpsert) UpdateRemark() *ChannelUpsert {
 // ClearRemark clears the value of the "remark" field.
 func (u *ChannelUpsert) ClearRemark() *ChannelUpsert {
 	u.SetNull(channel.FieldRemark)
+	return u
+}
+
+// SetEndpoints sets the "endpoints" field.
+func (u *ChannelUpsert) SetEndpoints(v []objects.ChannelEndpoint) *ChannelUpsert {
+	u.Set(channel.FieldEndpoints, v)
+	return u
+}
+
+// UpdateEndpoints sets the "endpoints" field to the value that was provided on create.
+func (u *ChannelUpsert) UpdateEndpoints() *ChannelUpsert {
+	u.SetExcluded(channel.FieldEndpoints)
+	return u
+}
+
+// ClearEndpoints clears the value of the "endpoints" field.
+func (u *ChannelUpsert) ClearEndpoints() *ChannelUpsert {
+	u.SetNull(channel.FieldEndpoints)
 	return u
 }
 
@@ -1380,6 +1484,48 @@ func (u *ChannelUpsertOne) ClearErrorMessage() *ChannelUpsertOne {
 	})
 }
 
+// SetAutoDisabledAt sets the "auto_disabled_at" field.
+func (u *ChannelUpsertOne) SetAutoDisabledAt(v time.Time) *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.SetAutoDisabledAt(v)
+	})
+}
+
+// UpdateAutoDisabledAt sets the "auto_disabled_at" field to the value that was provided on create.
+func (u *ChannelUpsertOne) UpdateAutoDisabledAt() *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.UpdateAutoDisabledAt()
+	})
+}
+
+// ClearAutoDisabledAt clears the value of the "auto_disabled_at" field.
+func (u *ChannelUpsertOne) ClearAutoDisabledAt() *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.ClearAutoDisabledAt()
+	})
+}
+
+// SetAutoDisableExpiresAt sets the "auto_disable_expires_at" field.
+func (u *ChannelUpsertOne) SetAutoDisableExpiresAt(v time.Time) *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.SetAutoDisableExpiresAt(v)
+	})
+}
+
+// UpdateAutoDisableExpiresAt sets the "auto_disable_expires_at" field to the value that was provided on create.
+func (u *ChannelUpsertOne) UpdateAutoDisableExpiresAt() *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.UpdateAutoDisableExpiresAt()
+	})
+}
+
+// ClearAutoDisableExpiresAt clears the value of the "auto_disable_expires_at" field.
+func (u *ChannelUpsertOne) ClearAutoDisableExpiresAt() *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.ClearAutoDisableExpiresAt()
+	})
+}
+
 // SetRemark sets the "remark" field.
 func (u *ChannelUpsertOne) SetRemark(v string) *ChannelUpsertOne {
 	return u.Update(func(s *ChannelUpsert) {
@@ -1398,6 +1544,27 @@ func (u *ChannelUpsertOne) UpdateRemark() *ChannelUpsertOne {
 func (u *ChannelUpsertOne) ClearRemark() *ChannelUpsertOne {
 	return u.Update(func(s *ChannelUpsert) {
 		s.ClearRemark()
+	})
+}
+
+// SetEndpoints sets the "endpoints" field.
+func (u *ChannelUpsertOne) SetEndpoints(v []objects.ChannelEndpoint) *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.SetEndpoints(v)
+	})
+}
+
+// UpdateEndpoints sets the "endpoints" field to the value that was provided on create.
+func (u *ChannelUpsertOne) UpdateEndpoints() *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.UpdateEndpoints()
+	})
+}
+
+// ClearEndpoints clears the value of the "endpoints" field.
+func (u *ChannelUpsertOne) ClearEndpoints() *ChannelUpsertOne {
+	return u.Update(func(s *ChannelUpsert) {
+		s.ClearEndpoints()
 	})
 }
 
@@ -1934,6 +2101,48 @@ func (u *ChannelUpsertBulk) ClearErrorMessage() *ChannelUpsertBulk {
 	})
 }
 
+// SetAutoDisabledAt sets the "auto_disabled_at" field.
+func (u *ChannelUpsertBulk) SetAutoDisabledAt(v time.Time) *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.SetAutoDisabledAt(v)
+	})
+}
+
+// UpdateAutoDisabledAt sets the "auto_disabled_at" field to the value that was provided on create.
+func (u *ChannelUpsertBulk) UpdateAutoDisabledAt() *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.UpdateAutoDisabledAt()
+	})
+}
+
+// ClearAutoDisabledAt clears the value of the "auto_disabled_at" field.
+func (u *ChannelUpsertBulk) ClearAutoDisabledAt() *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.ClearAutoDisabledAt()
+	})
+}
+
+// SetAutoDisableExpiresAt sets the "auto_disable_expires_at" field.
+func (u *ChannelUpsertBulk) SetAutoDisableExpiresAt(v time.Time) *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.SetAutoDisableExpiresAt(v)
+	})
+}
+
+// UpdateAutoDisableExpiresAt sets the "auto_disable_expires_at" field to the value that was provided on create.
+func (u *ChannelUpsertBulk) UpdateAutoDisableExpiresAt() *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.UpdateAutoDisableExpiresAt()
+	})
+}
+
+// ClearAutoDisableExpiresAt clears the value of the "auto_disable_expires_at" field.
+func (u *ChannelUpsertBulk) ClearAutoDisableExpiresAt() *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.ClearAutoDisableExpiresAt()
+	})
+}
+
 // SetRemark sets the "remark" field.
 func (u *ChannelUpsertBulk) SetRemark(v string) *ChannelUpsertBulk {
 	return u.Update(func(s *ChannelUpsert) {
@@ -1952,6 +2161,27 @@ func (u *ChannelUpsertBulk) UpdateRemark() *ChannelUpsertBulk {
 func (u *ChannelUpsertBulk) ClearRemark() *ChannelUpsertBulk {
 	return u.Update(func(s *ChannelUpsert) {
 		s.ClearRemark()
+	})
+}
+
+// SetEndpoints sets the "endpoints" field.
+func (u *ChannelUpsertBulk) SetEndpoints(v []objects.ChannelEndpoint) *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.SetEndpoints(v)
+	})
+}
+
+// UpdateEndpoints sets the "endpoints" field to the value that was provided on create.
+func (u *ChannelUpsertBulk) UpdateEndpoints() *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.UpdateEndpoints()
+	})
+}
+
+// ClearEndpoints clears the value of the "endpoints" field.
+func (u *ChannelUpsertBulk) ClearEndpoints() *ChannelUpsertBulk {
+	return u.Update(func(s *ChannelUpsert) {
+		s.ClearEndpoints()
 	})
 }
 

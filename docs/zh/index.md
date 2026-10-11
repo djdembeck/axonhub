@@ -23,6 +23,7 @@
 | [成本追踪](guides/cost-tracking.md) | 实时监控和用量分析 |
 | [请求追踪](guides/tracing.md) | 完整的请求链路追踪 |
 | [请求覆盖](guides/request-override.md) | 动态修改请求参数 |
+| [安全功能](guides/security.md) | IP 访问控制、IP 黑名单和 API Key IP 限制 |
 | [提示词保护规则](guides/prompt-protection-rules.md) | 敏感信息过滤和保护 |
 
 ### 🤖 AI 编程工具集成
@@ -43,13 +44,7 @@
 | [图像生成 API](api-reference/image-generation.md) | 图像生成接口文档 |
 | [嵌入 API](api-reference/embedding-api.md) | 向量嵌入接口文档 |
 | [重排序 API](api-reference/rerank-api.md) | 重排序接口文档 |
-
-### 🚀 部署指南
-
-| 文档 | 描述 |
-|------|------|
-| [Docker 部署](deployment/docker.md) | 使用 Docker 和 Docker Compose 部署 |
-| [配置详解](deployment/configuration.md) | 详细的配置选项说明 |
+| [System One API](api-reference/systemone-api.md) | 原生决策推理接口文档 |
 
 ### 🛠️ 开发文档
 

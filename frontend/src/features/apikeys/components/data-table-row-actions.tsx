@@ -1,10 +1,11 @@
 import React from 'react';
 import { DotsHorizontalIcon } from '@radix-ui/react-icons';
 import { Row } from '@tanstack/react-table';
-import { IconUserOff, IconUserCheck, IconEdit, IconSettings, IconArchive } from '@tabler/icons-react';
+import { IconUserOff, IconUserCheck, IconEdit, IconSettings, IconArchive, IconCheck, IconRefresh } from '@tabler/icons-react';
 import { BarChart3 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { usePermissions } from '@/hooks/usePermissions';
+import { useAuthStore } from '@/stores/authStore';
 import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useApiKeysContext } from '../context/apikeys-context';
@@ -19,9 +20,17 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const { t } = useTranslation();
   const { openDialog } = useApiKeysContext();
   const { apiKeyPermissions } = usePermissions();
+  const currentUser = useAuthStore((state) => state.auth.user);
   const apiKey = row.original;
   const [open, setOpen] = React.useState(false);
   const [chartOpen, setChartOpen] = React.useState(false);
+
+  // Personal API keys can only be modified by their creator or a system
+  // owner; hide mutating actions on other users' personal keys for anyone
+  // else instead of letting them fail.
+  const isOthersPersonalKey =
+    apiKey.type === 'personal' && !currentUser?.isOwner && apiKey.user?.id != null && apiKey.user.id !== currentUser?.id;
+  const canMutate = apiKeyPermissions.canWrite && !isOthersPersonalKey;
 
   // Don't show menu if user has no permissions
   if (!apiKeyPermissions.canRead && !apiKeyPermissions.canWrite) {
@@ -35,7 +44,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
 
   const handleStatusChange = (apiKey: ApiKey) => {
     if (apiKey.status === 'archived') {
-      // Archived API keys cannot be enabled/disabled
+      // Archived API keys cannot be enabled/disabled, use archive dialog for restore
       return;
     }
     setOpen(false);
@@ -57,6 +66,11 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
     setTimeout(() => setChartOpen(true), 0);
   };
 
+  const handleRotate = (apiKey: ApiKey) => {
+    setOpen(false);
+    setTimeout(() => openDialog('rotate', apiKey), 0);
+  };
+
   return (
     <>
       <DropdownMenu open={open} onOpenChange={setOpen}>
@@ -71,7 +85,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
             <BarChart3 className='mr-2 h-4 w-4' />
             {t('apikeys.actions.viewTokenChart')}
           </DropdownMenuItem>
-          {apiKeyPermissions.canWrite && (
+          {canMutate && (
             <>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={() => handleEdit(apiKey)}>
@@ -102,12 +116,15 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
                   )}
                 </DropdownMenuItem>
               )}
-              {apiKey.status !== 'archived' && (
-                <DropdownMenuItem onClick={() => handleArchive(apiKey)} className='text-orange-600'>
-                  <IconArchive className='mr-2 h-4 w-4' />
-                  {t('common.buttons.archive')}
-                </DropdownMenuItem>
-              )}
+              <DropdownMenuItem onClick={() => handleArchive(apiKey)} className={apiKey.status === 'archived' ? 'text-green-600' : 'text-orange-600'}>
+                {apiKey.status === 'archived' ? <IconCheck className='mr-2 h-4 w-4' /> : <IconArchive className='mr-2 h-4 w-4' />}
+                {apiKey.status === 'archived' ? t('common.buttons.restore') : t('common.buttons.archive')}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => handleRotate(apiKey)}>
+                <IconRefresh className='mr-2 h-4 w-4' />
+                {t('apikeys.dialogs.rotate.title')}
+              </DropdownMenuItem>
             </>
           )}
         </DropdownMenuContent>

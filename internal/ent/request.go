@@ -30,6 +30,8 @@ type Request struct {
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 	// API Key ID of the request, null for the request from the Admin.
 	APIKeyID int `json:"api_key_id,omitempty"`
+	// User ID of the Playground request creator
+	UserID *int `json:"user_id,omitempty"`
 	// Project ID, default to 1 for backward compatibility
 	ProjectID int `json:"project_id,omitempty"`
 	// Trace ID that this request belongs to
@@ -40,12 +42,16 @@ type Request struct {
 	Source request.Source `json:"source,omitempty"`
 	// ModelID holds the value of the "model_id" field.
 	ModelID string `json:"model_id,omitempty"`
+	// Reasoning effort used for reasoning models
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	// Format holds the value of the "format" field.
 	Format string `json:"format,omitempty"`
 	// Request headers
 	RequestHeaders objects.JSONRawMessage `json:"request_headers,omitempty"`
 	// RequestBody holds the value of the "request_body" field.
 	RequestBody objects.JSONRawMessage `json:"request_body,omitempty"`
+	// Response headers sent to the client, with sensitive values masked
+	ResponseHeaders objects.JSONRawMessage `json:"response_headers,omitempty"`
 	// ResponseBody holds the value of the "response_body" field.
 	ResponseBody objects.JSONRawMessage `json:"response_body,omitempty"`
 	// ResponseChunks holds the value of the "response_chunks" field.
@@ -60,6 +66,8 @@ type Request struct {
 	Stream bool `json:"stream,omitempty"`
 	// ClientIP holds the value of the "client_ip" field.
 	ClientIP string `json:"client_ip,omitempty"`
+	// UserAgent holds the value of the "user_agent" field.
+	UserAgent string `json:"user_agent,omitempty"`
 	// MetricsLatencyMs holds the value of the "metrics_latency_ms" field.
 	MetricsLatencyMs *int64 `json:"metrics_latency_ms,omitempty"`
 	// MetricsFirstTokenLatencyMs holds the value of the "metrics_first_token_latency_ms" field.
@@ -184,13 +192,13 @@ func (*Request) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case request.FieldRequestHeaders, request.FieldRequestBody, request.FieldResponseBody, request.FieldResponseChunks:
+		case request.FieldRequestHeaders, request.FieldRequestBody, request.FieldResponseHeaders, request.FieldResponseBody, request.FieldResponseChunks:
 			values[i] = new([]byte)
 		case request.FieldStream, request.FieldContentSaved:
 			values[i] = new(sql.NullBool)
-		case request.FieldID, request.FieldAPIKeyID, request.FieldProjectID, request.FieldTraceID, request.FieldDataStorageID, request.FieldChannelID, request.FieldMetricsLatencyMs, request.FieldMetricsFirstTokenLatencyMs, request.FieldMetricsReasoningDurationMs, request.FieldContentStorageID:
+		case request.FieldID, request.FieldAPIKeyID, request.FieldUserID, request.FieldProjectID, request.FieldTraceID, request.FieldDataStorageID, request.FieldChannelID, request.FieldMetricsLatencyMs, request.FieldMetricsFirstTokenLatencyMs, request.FieldMetricsReasoningDurationMs, request.FieldContentStorageID:
 			values[i] = new(sql.NullInt64)
-		case request.FieldSource, request.FieldModelID, request.FieldFormat, request.FieldExternalID, request.FieldStatus, request.FieldClientIP, request.FieldContentStorageKey:
+		case request.FieldSource, request.FieldModelID, request.FieldReasoningEffort, request.FieldFormat, request.FieldExternalID, request.FieldStatus, request.FieldClientIP, request.FieldUserAgent, request.FieldContentStorageKey:
 			values[i] = new(sql.NullString)
 		case request.FieldCreatedAt, request.FieldUpdatedAt, request.FieldContentSavedAt:
 			values[i] = new(sql.NullTime)
@@ -233,6 +241,13 @@ func (_m *Request) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.APIKeyID = int(value.Int64)
 			}
+		case request.FieldUserID:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field user_id", values[i])
+			} else if value.Valid {
+				_m.UserID = new(int)
+				*_m.UserID = int(value.Int64)
+			}
 		case request.FieldProjectID:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
 				return fmt.Errorf("unexpected type %T for field project_id", values[i])
@@ -263,6 +278,12 @@ func (_m *Request) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.ModelID = value.String
 			}
+		case request.FieldReasoningEffort:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field reasoning_effort", values[i])
+			} else if value.Valid {
+				_m.ReasoningEffort = value.String
+			}
 		case request.FieldFormat:
 			if value, ok := values[i].(*sql.NullString); !ok {
 				return fmt.Errorf("unexpected type %T for field format", values[i])
@@ -283,6 +304,14 @@ func (_m *Request) assignValues(columns []string, values []any) error {
 			} else if value != nil && len(*value) > 0 {
 				if err := json.Unmarshal(*value, &_m.RequestBody); err != nil {
 					return fmt.Errorf("unmarshal field request_body: %w", err)
+				}
+			}
+		case request.FieldResponseHeaders:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field response_headers", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.ResponseHeaders); err != nil {
+					return fmt.Errorf("unmarshal field response_headers: %w", err)
 				}
 			}
 		case request.FieldResponseBody:
@@ -330,6 +359,12 @@ func (_m *Request) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field client_ip", values[i])
 			} else if value.Valid {
 				_m.ClientIP = value.String
+			}
+		case request.FieldUserAgent:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field user_agent", values[i])
+			} else if value.Valid {
+				_m.UserAgent = value.String
 			}
 		case request.FieldMetricsLatencyMs:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
@@ -459,6 +494,11 @@ func (_m *Request) String() string {
 	builder.WriteString("api_key_id=")
 	builder.WriteString(fmt.Sprintf("%v", _m.APIKeyID))
 	builder.WriteString(", ")
+	if v := _m.UserID; v != nil {
+		builder.WriteString("user_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
 	builder.WriteString("project_id=")
 	builder.WriteString(fmt.Sprintf("%v", _m.ProjectID))
 	builder.WriteString(", ")
@@ -474,6 +514,9 @@ func (_m *Request) String() string {
 	builder.WriteString("model_id=")
 	builder.WriteString(_m.ModelID)
 	builder.WriteString(", ")
+	builder.WriteString("reasoning_effort=")
+	builder.WriteString(_m.ReasoningEffort)
+	builder.WriteString(", ")
 	builder.WriteString("format=")
 	builder.WriteString(_m.Format)
 	builder.WriteString(", ")
@@ -482,6 +525,9 @@ func (_m *Request) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("request_body=")
 	builder.WriteString(fmt.Sprintf("%v", _m.RequestBody))
+	builder.WriteString(", ")
+	builder.WriteString("response_headers=")
+	builder.WriteString(fmt.Sprintf("%v", _m.ResponseHeaders))
 	builder.WriteString(", ")
 	builder.WriteString("response_body=")
 	builder.WriteString(fmt.Sprintf("%v", _m.ResponseBody))
@@ -503,6 +549,9 @@ func (_m *Request) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("client_ip=")
 	builder.WriteString(_m.ClientIP)
+	builder.WriteString(", ")
+	builder.WriteString("user_agent=")
+	builder.WriteString(_m.UserAgent)
 	builder.WriteString(", ")
 	if v := _m.MetricsLatencyMs; v != nil {
 		builder.WriteString("metrics_latency_ms=")

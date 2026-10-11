@@ -15,7 +15,7 @@ import (
 // selectCandidates creates a middleware that selects available channel model candidates for the model.
 // This is the second step in the inbound pipeline, moved from outbound transformer.
 // If no valid candidates are found, it returns ErrInvalidModel to fail fast.
-func selectCandidates(inbound *PersistentInboundTransformer) pipeline.Middleware {
+func selectCandidates(inbound *PersistentInboundTransformer, quotaProvider ProviderQuotaStatusProvider, systemService biz.QuotaRoutingSettingsProvider) pipeline.Middleware {
 	return pipeline.OnLlmRequest("select-candidates", func(ctx context.Context, llmRequest *llm.Request) (*llm.Request, error) {
 		// Only select candidates once
 		if len(inbound.state.ChannelModelsCandidates) > 0 {
@@ -62,8 +62,20 @@ func selectCandidates(inbound *PersistentInboundTransformer) pipeline.Middleware
 
 		selector = WithStreamPolicySelector(selector)
 
-		if inbound.state.LoadBalancer != nil {
-			selector = WithLoadBalancedSelector(selector, inbound.state.LoadBalancer, inbound.state.RetryPolicyProvider)
+		gate := NewQuotaRoutingGate(quotaProvider, systemService.QuotaRoutingSettingsOrDefault(ctx))
+
+		if len(inbound.state.LoadBalancers) > 0 {
+			selector = WithRoutingPolicyLoadBalancedSelector(
+				selector,
+				inbound.state.LoadBalancers,
+				inbound.state.RetryPolicyProvider,
+				inbound.state.RequestService,
+				inbound.state.APIKey,
+				&inbound.state.RoutingPolicy,
+				gate,
+			)
+		} else {
+			selector = WithQuotaRoutingSelector(selector, gate)
 		}
 
 		candidates, err := selector.Select(ctx, llmRequest)
@@ -75,6 +87,8 @@ func selectCandidates(inbound *PersistentInboundTransformer) pipeline.Middleware
 			log.Debug(ctx, "selected candidates",
 				log.Int("candidate_count", len(candidates)),
 				log.String("model", llmRequest.Model),
+				log.String("load_balance_strategy", inbound.state.RoutingPolicy.LoadBalancerStrategy),
+				log.String("trace_sticky_mode", string(inbound.state.RoutingPolicy.TraceStickyMode)),
 				log.Any("candidates", lo.Map(candidates, func(candidate *ChannelModelsCandidate, _ int) map[string]any {
 					return map[string]any{
 						"channel_name": candidate.Channel.Name,
@@ -93,6 +107,9 @@ func selectCandidates(inbound *PersistentInboundTransformer) pipeline.Middleware
 		}
 
 		if len(candidates) == 0 {
+			if gate.DroppedCount() > 0 {
+				return nil, NewQuotaExhaustedError(llmRequest.Model)
+			}
 			return nil, fmt.Errorf("%w: %s", biz.ErrInvalidModel, llmRequest.Model)
 		}
 

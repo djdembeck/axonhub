@@ -1,7 +1,11 @@
 package llm
 
+import "encoding/json"
+
 // ImageRequest is the unified image request structure (similar to EmbeddingRequest).
+// Note: Common fields like Model are in the parent Request struct, not here.
 type ImageRequest struct {
+	ModelSpecified bool `json:"-"`
 	// Prompt is the text prompt for image generation.
 	Prompt string `json:"prompt,omitempty"`
 
@@ -46,9 +50,21 @@ type ImageRequest struct {
 
 	// Style is the style for DALL-E 3 (vivid or natural).
 	Style string `json:"style,omitempty"`
+
+	// SubjectReference contains provider-specific reference image descriptors.
+	SubjectReference json.RawMessage `json:"subject_reference,omitempty"`
+
+	// AspectRatio, Width and Height control provider-specific image dimensions.
+	AspectRatio string `json:"aspect_ratio,omitempty"`
+	Width       *int64 `json:"width,omitempty"`
+	Height      *int64 `json:"height,omitempty"`
+
+	// PromptOptimizer enables provider prompt optimization when supported.
+	PromptOptimizer *bool `json:"prompt_optimizer,omitempty"`
 }
 
-// ImageResponse is the unified image response structure.
+// ImageResponse represents the unified image response model.
+// Note: Common fields like Usage are in the parent Response struct, not here.
 type ImageResponse struct {
 	Created      int64       `json:"created"`
 	Data         []ImageData `json:"data"`
@@ -64,5 +80,3 @@ type ImageData struct {
 	URL           string `json:"url,omitempty"`
 	RevisedPrompt string `json:"revised_prompt,omitempty"`
 }
-
-

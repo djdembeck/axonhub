@@ -16,6 +16,7 @@ schema:
   - prompt_protection_rule.graphql
   - price.graphql
   - cost.graphql
+  - analytics.graphql
 
 omit_gqlgen_version_in_file_notice: true
 
@@ -102,6 +103,18 @@ models:
   ModelMappingInput:
     model:
       - github.com/looplj/axonhub/internal/objects.ModelMapping
+  ModelProtocol:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ModelProtocol
+  ModelProtocolInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ModelProtocol
+  ReasoningEffortMapping:
+    model:
+      - github.com/looplj/axonhub/llm.ReasoningEffortMapping
+  ReasoningEffortMappingInput:
+    model:
+      - github.com/looplj/axonhub/llm.ReasoningEffortMapping
   ProxyType:
     model:
       - github.com/looplj/axonhub/internal/objects.ProxyType
@@ -114,18 +127,60 @@ models:
   CapabilityPolicy:
     model:
       - github.com/looplj/axonhub/internal/objects.CapabilityPolicy
+  ChannelEndpoint:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ChannelEndpoint
+  ChannelEndpointInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ChannelEndpoint
   ChannelPolicies:
     model:
       - github.com/looplj/axonhub/internal/objects.ChannelPolicies
   ChannelPoliciesInput:
     model:
       - github.com/looplj/axonhub/internal/objects.ChannelPolicies
+  APIKeyAutoDisableRule:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyAutoDisableRule
+  APIKeyAutoDisableRuleInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyAutoDisableRule
+  APIKeyAutoDisableAction:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyAutoDisableAction
+  APIKeyAutoDisableMode:
+    model:
+      - github.com/looplj/axonhub/internal/objects.APIKeyAutoDisableMode
   ChannelSettings:
     model:
       - github.com/looplj/axonhub/internal/objects.ChannelSettings
   ChannelSettingsInput:
     model:
       - github.com/looplj/axonhub/internal/objects.ChannelSettings
+  RetryableErrorPattern:
+    model:
+      - github.com/looplj/axonhub/internal/objects.RetryableErrorPattern
+  RetryableErrorPatternInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.RetryableErrorPattern
+  ChannelProviderQuotaSettings:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ChannelProviderQuotaSettings
+  ChannelProviderQuotaSettingsInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.ChannelProviderQuotaSettings
+  CommandCodeQuotaSettings:
+    model:
+      - github.com/looplj/axonhub/internal/objects.CommandCodeQuotaSettings
+  CommandCodeQuotaSettingsInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.CommandCodeQuotaSettings
+  OllamaQuotaSettings:
+    model:
+      - github.com/looplj/axonhub/internal/objects.OllamaQuotaSettings
+  OllamaQuotaSettingsInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.OllamaQuotaSettings
   ChannelRateLimit:
     model:
       - github.com/looplj/axonhub/internal/objects.ChannelRateLimit
@@ -147,6 +202,24 @@ models:
   BulkCreateChannelsInput:
     model:
       - github.com/looplj/axonhub/internal/server/biz.BulkCreateChannelsInput
+  BulkUpdateChannelAutoDisableInput:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.BulkUpdateChannelAutoDisableInput
+  BulkAutoDisableAction:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.BulkAutoDisableAction
+  SaveChannelEndpointsInput:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.SaveChannelEndpointsInput
+  DetectChannelEndpointsInput:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.DetectChannelEndpointsInput
+  DetectedChannelEndpoint:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.DetectedChannelEndpoint
+  DetectChannelEndpointsPayload:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.DetectChannelEndpointsPayload
   QueryChannelInput:
     model:
       - github.com/looplj/axonhub/internal/server/biz.QueryChannelsInput
@@ -189,15 +262,15 @@ models:
   AutoDisableChannel:
     model:
       - github.com/looplj/axonhub/internal/server/biz.AutoDisableChannel
-  AutoDisableChannelStatus:
-    model:
-      - github.com/looplj/axonhub/internal/server/biz.AutoDisableChannelStatus
   AutoDisableChannelInput:
     model:
       - github.com/looplj/axonhub/internal/server/biz.AutoDisableChannel
-  AutoDisableChannelStatusInput:
+  UpstreamErrorPolicy:
     model:
-      - github.com/looplj/axonhub/internal/server/biz.AutoDisableChannelStatus
+      - github.com/looplj/axonhub/internal/server/biz.UpstreamErrorPolicy
+  UpstreamErrorPolicyInput:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.UpstreamErrorPolicy
   UpdateAPIKeyProfilesInput:
     model:
       - github.com/looplj/axonhub/internal/objects.APIKeyProfiles
@@ -399,6 +472,36 @@ models:
   PromptWriteCacheVariantInput:
     model:
       - github.com/looplj/axonhub/internal/objects.PromptWriteCacheVariant
+  PriceSchedule:
+    model:
+      - github.com/looplj/axonhub/internal/objects.PriceSchedule
+  PriceScheduleInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.PriceSchedule
+  PriceOverride:
+    model:
+      - github.com/looplj/axonhub/internal/objects.PriceOverride
+  PriceOverrideInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.PriceOverride
+  OverrideWhen:
+    model:
+      - github.com/looplj/axonhub/internal/objects.OverrideWhen
+  OverrideWhenInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.OverrideWhen
+  DailyTimeRange:
+    model:
+      - github.com/looplj/axonhub/internal/objects.DailyTimeRange
+  DailyTimeRangeInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.DailyTimeRange
+  DateRange:
+    model:
+      - github.com/looplj/axonhub/internal/objects.DateRange
+  DateRangeInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.DateRange
   PricingMode:
     model:
       - github.com/looplj/axonhub/internal/objects.PricingMode
@@ -528,6 +631,12 @@ models:
   OverrideOperationInput:
     model:
       - github.com/looplj/axonhub/internal/objects.OverrideOperation
+  OverrideMatch:
+    model:
+      - github.com/looplj/axonhub/internal/objects.OverrideMatch
+  OverrideMatchInput:
+    model:
+      - github.com/looplj/axonhub/internal/objects.OverrideMatch
   TierCost:
     model:
       - github.com/looplj/axonhub/internal/objects.TierCost
@@ -555,12 +664,18 @@ models:
   UpdateSystemModelSettingsInput:
     model:
       - github.com/looplj/axonhub/internal/server/biz.SystemModelSettings
+  DeveloperModelSettings:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.DeveloperModelSettings
+  DeveloperModelSettingsInput:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.DeveloperModelSettings
   SystemChannelSettings:
     model:
       - github.com/looplj/axonhub/internal/server/biz.SystemChannelSettings
   UpdateSystemChannelSettingsInput:
     model:
-      - github.com/looplj/axonhub/internal/server/biz.SystemChannelSettings
+      - github.com/looplj/axonhub/internal/server/biz.UpdateSystemChannelSettings
   SystemGeneralSettings:
     model:
       - github.com/looplj/axonhub/internal/server/biz.SystemGeneralSettings
@@ -606,6 +721,24 @@ models:
   AutoSyncFrequency:
     model:
       - github.com/looplj/axonhub/internal/server/biz.AutoSyncFrequency
+  QuotaRoutingMode:
+    model:
+      - github.com/looplj/axonhub/internal/objects.QuotaRoutingMode
+  QuotaRoutingSettings:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.QuotaRoutingSettings
+  ChannelQuotaRoutingMode:
+    model:
+      - github.com/looplj/axonhub/internal/objects.QuotaRoutingMode
+  TraceStickyMode:
+    model:
+      - github.com/looplj/axonhub/internal/server/biz.TraceStickyMode
+  TriggerGcCleanupInput:
+    model:
+      - github.com/looplj/axonhub/internal/server/gc.TriggerGcCleanupInput
+  GcCleanupPreviewItem:
+    model:
+      - github.com/looplj/axonhub/internal/server/gc.GcCleanupPreviewItem
   PromptSettings:
     model:
       - github.com/looplj/axonhub/internal/objects.PromptSettings

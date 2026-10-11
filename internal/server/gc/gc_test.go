@@ -14,6 +14,7 @@ import (
 
 	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
+	"github.com/looplj/axonhub/internal/ent/channelprobe"
 	"github.com/looplj/axonhub/internal/ent/datastorage"
 	"github.com/looplj/axonhub/internal/ent/enttest"
 	"github.com/looplj/axonhub/internal/objects"
@@ -121,6 +122,25 @@ func TestWorker_cleanupExecutionExternalStorageDeletesFsArtifacts(t *testing.T) 
 	}
 }
 
+func TestHasRealDirectories(t *testing.T) {
+	cases := []struct {
+		typ  datastorage.Type
+		want bool
+	}{
+		{datastorage.TypeFs, true},
+		{datastorage.TypeWebdav, true},
+		{datastorage.TypeS3, false},
+		{datastorage.TypeGcs, false},
+		{datastorage.TypeDatabase, false},
+	}
+
+	for _, c := range cases {
+		if got := hasRealDirectories(c.typ); got != c.want {
+			t.Errorf("hasRealDirectories(%s) = %v, want %v", c.typ, got, c.want)
+		}
+	}
+}
+
 func setupWorkerWithFSStorage(t *testing.T) (*Worker, context.Context, *ent.DataStorage, string) {
 	t.Helper()
 
@@ -146,7 +166,6 @@ func setupWorkerWithFSStorage(t *testing.T) (*Worker, context.Context, *ent.Data
 	dataStorageService := biz.NewDataStorageService(biz.DataStorageServiceParams{
 		SystemService: systemService,
 		CacheConfig:   cacheConfig,
-		Executor:      executor,
 		Client:        client,
 	})
 
@@ -157,6 +176,16 @@ func setupWorkerWithFSStorage(t *testing.T) (*Worker, context.Context, *ent.Data
 	dir := t.TempDir()
 	dirCopy := dir
 	settings := &objects.DataStorageSettings{Directory: &dirCopy}
+
+	_, err := client.DataStorage.Create().
+		SetName("primary").
+		SetDescription("primary database").
+		SetPrimary(true).
+		SetType(datastorage.TypeDatabase).
+		SetSettings(&objects.DataStorageSettings{}).
+		SetStatus(datastorage.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
 
 	dataStorage, err := client.DataStorage.Create().
 		SetName("fs-storage").
@@ -169,6 +198,7 @@ func setupWorkerWithFSStorage(t *testing.T) (*Worker, context.Context, *ent.Data
 	require.NoError(t, err)
 
 	worker := &Worker{
+		SystemService:      systemService,
 		DataStorageService: dataStorageService,
 		Ent:                client,
 	}
@@ -260,4 +290,56 @@ func TestWorker_cleanupWithZeroDays(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cleanupUsageLogs with negative days failed: %v", err)
 	}
+}
+
+func TestWorker_cleanupChannelProbesDeletesInBatches(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=1")
+	t.Cleanup(func() {
+		client.Close()
+	})
+
+	ctx := authz.WithTestBypass(context.Background())
+	ctx = ent.NewContext(ctx, client)
+
+	originalBatchSize := defaultBatchSize
+	defaultBatchSize = 2
+	t.Cleanup(func() {
+		defaultBatchSize = originalBatchSize
+	})
+
+	worker := &Worker{Ent: client, Config: Config{CRON: "0 0 * * *"}}
+	oldTimestamp := time.Now().AddDate(0, 0, -5).Unix()
+	recentTimestamp := time.Now().Unix()
+
+	for range 5 {
+		_, err := client.ChannelProbe.Create().
+			SetChannelID(1).
+			SetTotalRequestCount(1).
+			SetSuccessRequestCount(1).
+			SetTimestamp(oldTimestamp).
+			Save(ctx)
+		require.NoError(t, err)
+	}
+
+	for range 2 {
+		_, err := client.ChannelProbe.Create().
+			SetChannelID(1).
+			SetTotalRequestCount(1).
+			SetSuccessRequestCount(1).
+			SetTimestamp(recentTimestamp).
+			Save(ctx)
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, worker.cleanupChannelProbes(ctx, 3, false))
+
+	oldCount, err := client.ChannelProbe.Query().
+		Where(channelprobe.TimestampLT(time.Now().AddDate(0, 0, -3).Unix())).
+		Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, oldCount)
+
+	totalCount, err := client.ChannelProbe.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, totalCount)
 }

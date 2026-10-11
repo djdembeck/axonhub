@@ -4,14 +4,34 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent/channel"
+	"github.com/looplj/axonhub/internal/ent/enttest"
+	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/transformer/xai/subscription"
 )
+
+func TestModelFetcher_getDefaultModelsByType_returns_xAI_subscription_models(t *testing.T) {
+	// Given
+	fetcher := NewModelFetcher(httpclient.NewHttpClient(), nil)
+
+	// When
+	models := fetcher.getDefaultModelsByType(t.Context(), channel.TypeXaiSubscription)
+
+	// Then
+	require.Len(t, models, len(subscription.DefaultModels()))
+	require.Equal(t, subscription.DefaultModels()[0], models[0].ID)
+}
 
 // setupProviderConfMockServer creates a mock HTTP server returning provider conf JSON.
 // The callCounter is incremented on each request (if not nil).
@@ -261,6 +281,42 @@ func TestPrepareModelsEndpoint(t *testing.T) {
 			expectedURL: "https://open.bigmodel.cn/api/v4/models",
 		},
 		{
+			name:        "ZhipuAnthropic with raw URL marker (#)",
+			channelType: channel.TypeZhipuAnthropic,
+			baseURL:     "https://custom-proxy.example.com/v1#",
+			expectedURL: "https://custom-proxy.example.com/v1/models",
+		},
+		{
+			name:        "ZaiAnthropic with raw URL marker (#)",
+			channelType: channel.TypeZaiAnthropic,
+			baseURL:     "https://custom-proxy.example.com/v1#",
+			expectedURL: "https://custom-proxy.example.com/v1/models",
+		},
+		{
+			name:        "ZaiAnthropic with /v1 suffix",
+			channelType: channel.TypeZaiAnthropic,
+			baseURL:     "https://custom-proxy.example.com/v1",
+			expectedURL: "https://custom-proxy.example.com/v1/models",
+		},
+		{
+			name:        "Zai with raw URL marker (#)",
+			channelType: channel.TypeZai,
+			baseURL:     "https://custom-proxy.example.com/v1#",
+			expectedURL: "https://custom-proxy.example.com/v1/models",
+		},
+		{
+			name:        "Zai with /v1 suffix",
+			channelType: channel.TypeZai,
+			baseURL:     "https://custom-proxy.example.com/v1",
+			expectedURL: "https://custom-proxy.example.com/v1/models",
+		},
+		{
+			name:        "Zhipu with raw URL marker on official path",
+			channelType: channel.TypeZhipu,
+			baseURL:     "https://open.bigmodel.cn/api/paas/v4#",
+			expectedURL: "https://open.bigmodel.cn/api/paas/v4/models",
+		},
+		{
 			name:        "DeepseekAnthropic",
 			channelType: channel.TypeDeepseekAnthropic,
 			baseURL:     "https://api.deepseek.com/anthropic",
@@ -271,6 +327,18 @@ func TestPrepareModelsEndpoint(t *testing.T) {
 			channelType: channel.TypeMoonshotAnthropic,
 			baseURL:     "https://api.moonshot.cn/claude",
 			expectedURL: "https://api.moonshot.cn/v1/models",
+		},
+		{
+			name:        "OpencodeGoAnthropic with /v1 suffix",
+			channelType: channel.TypeOpencodeGoAnthropic,
+			baseURL:     "https://opencode.ai/zen/go/v1",
+			expectedURL: "https://opencode.ai/zen/go/v1/models",
+		},
+		{
+			name:        "OpencodeGoAnthropic without /v1 suffix",
+			channelType: channel.TypeOpencodeGoAnthropic,
+			baseURL:     "https://opencode.ai/zen/go",
+			expectedURL: "https://opencode.ai/zen/go/v1/models",
 		},
 		{
 			name:        "Gemini with /v1 suffix",
@@ -301,6 +369,18 @@ func TestPrepareModelsEndpoint(t *testing.T) {
 			channelType: channel.TypeOpenai,
 			baseURL:     "https://custom.api.com/custom/path#",
 			expectedURL: "https://custom.api.com/custom/path/models",
+		},
+		{
+			name:        "OpenAI secure WebSocket endpoint",
+			channelType: channel.TypeOpenai,
+			baseURL:     "wss://api.openai.com/v1#",
+			expectedURL: "https://api.openai.com/v1/models",
+		},
+		{
+			name:        "OpenAI WebSocket endpoint",
+			channelType: channel.TypeOpenai,
+			baseURL:     "ws://api.example.com/v1",
+			expectedURL: "http://api.example.com/v1/models",
 		},
 		{
 			name:        "Deepseek",
@@ -373,6 +453,30 @@ func TestPrepareModelsEndpoint(t *testing.T) {
 			channelType: channel.TypeDoubaoAnthropic,
 			baseURL:     "https://ark.cn-beijing.volces.com/api/compatible",
 			expectedURL: "https://ark.cn-beijing.volces.com/api/v3/models",
+		},
+		{
+			name:        "CommandCode provider base without /v1",
+			channelType: channel.TypeCommandcode,
+			baseURL:     "https://api.commandcode.ai/provider",
+			expectedURL: "https://api.commandcode.ai/provider/v1/models",
+		},
+		{
+			name:        "CommandCode anthropic provider base without /v1",
+			channelType: channel.TypeCommandcodeAnthropic,
+			baseURL:     "https://api.commandcode.ai/provider",
+			expectedURL: "https://api.commandcode.ai/provider/v1/models",
+		},
+		{
+			name:        "CommandCode with /v1 suffix",
+			channelType: channel.TypeCommandcode,
+			baseURL:     "https://api.commandcode.ai/provider/v1",
+			expectedURL: "https://api.commandcode.ai/provider/v1/models",
+		},
+		{
+			name:        "CommandCode anthropic with /v1 trailing slash",
+			channelType: channel.TypeCommandcodeAnthropic,
+			baseURL:     "https://api.commandcode.ai/provider/v1/",
+			expectedURL: "https://api.commandcode.ai/provider/v1/models",
 		},
 	}
 
@@ -495,6 +599,189 @@ func TestFetchModelsGeminiPagination(t *testing.T) {
 	}
 }
 
+// TestFetchModelsFamilyAnthropicWithRawURLMarker reproduces #2479: a Zai/Zhipu
+// Anthropic-format channel pointed at an OpenAI-compatible relay must send the
+// model-list probe to <relay>/models when the base URL carries the raw "#" marker,
+// instead of appending the official family path (/paas/v4/models).
+func TestFetchModelsFamilyAnthropicWithRawURLMarker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"glm-5.2"},{"id":"glm-5.1"}]}`))
+	}))
+	defer server.Close()
+
+	fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(server.Client()), nil)
+	apiKey := "test-key"
+
+	result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{
+		ChannelType: channel.TypeZaiAnthropic.String(),
+		BaseURL:     server.URL + "/v1#",
+		APIKey:      &apiKey,
+	})
+
+	require.NoError(t, err)
+	require.Nil(t, result.Error)
+	assert.Equal(t, []ModelIdentify{{ID: "glm-5.2"}, {ID: "glm-5.1"}}, result.Models)
+}
+
+func TestFetchModelsWithChannelIDUsesStoredCredentialsOnlyForStoredEndpoint(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"stored-model"}]}`))
+	}))
+	defer server.Close()
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:fetch_models_stored_endpoint?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithSystemBypass(context.Background(), "test")
+	ch, err := client.Channel.Create().
+		SetName("stored-endpoint").
+		SetType(channel.TypeOpenai).
+		SetBaseURL(server.URL).
+		SetCredentials(objects.ChannelCredentials{APIKey: "stored-secret"}).
+		SetSupportedModels([]string{"stored-model"}).
+		SetDefaultTestModel("stored-model").
+		Save(ctx)
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	fetcher := NewModelFetcher(
+		httpclient.NewHttpClientWithClient(server.Client()),
+		&ChannelService{AbstractService: &AbstractService{db: client}},
+	)
+
+	result, err := fetcher.FetchModels(ctx, FetchModelsInput{
+		ChannelType: channel.TypeOpenai.String(),
+		BaseURL:     server.URL + "/",
+		ChannelID:   &ch.ID,
+	})
+	if err != nil {
+		t.Fatalf("FetchModels() unexpected error: %v", err)
+	}
+	if result.Error != nil {
+		t.Fatalf("FetchModels() expected nil result.Error, got: %v", *result.Error)
+	}
+	if gotAuth != "Bearer stored-secret" {
+		t.Fatalf("Authorization header = %q, want stored credential", gotAuth)
+	}
+	if len(result.Models) != 1 || result.Models[0].ID != "stored-model" {
+		t.Fatalf("unexpected models: %#v", result.Models)
+	}
+}
+
+func TestFetchModelsClineWithChannelIDUsesStoredProxyWithoutCredentials(t *testing.T) {
+	const catalogURL = "http://127.0.0.1:1/api/v1/ai/cline/recommended-models"
+
+	var proxyCalls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, catalogURL, r.URL.String())
+		assert.Empty(t, r.Header.Get("Authorization"))
+		assert.Empty(t, r.Header.Get("X-Api-Key"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"recommended": [{"id":"proxied-model"}],
+			"clinePass": [{"id":"cline-pass/proxied-model"}]
+		}`))
+	}))
+	defer proxy.Close()
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:fetch_models_cline_proxy?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithSystemBypass(context.Background(), "test")
+	ch, err := client.Channel.Create().
+		SetName("cline-proxy").
+		SetType(channel.TypeCline).
+		SetBaseURL("https://api.cline.bot/api/v1").
+		SetCredentials(objects.ChannelCredentials{APIKeys: []string{"stored-secret"}}).
+		SetSupportedModels([]string{"cline-pass/deepseek-v4-flash"}).
+		SetDefaultTestModel("cline-pass/deepseek-v4-flash").
+		SetSettings(&objects.ChannelSettings{Proxy: &httpclient.ProxyConfig{
+			Type: httpclient.ProxyTypeURL,
+			URL:  proxy.URL,
+		}}).
+		Save(ctx)
+	require.NoError(t, err)
+
+	fetcher := NewModelFetcher(
+		httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled}),
+		&ChannelService{AbstractService: &AbstractService{db: client}},
+	)
+	fetcher.clineRecommendedModelsURL = catalogURL
+	inputKey := "input-secret"
+
+	result, err := fetcher.FetchModels(ctx, FetchModelsInput{
+		ChannelType: channel.TypeCline.String(),
+		BaseURL:     ch.BaseURL + "/",
+		APIKey:      &inputKey,
+		ChannelID:   &ch.ID,
+	})
+	require.NoError(t, err)
+	require.Nil(t, result.Error)
+	assert.False(t, result.Fallback)
+	assert.Equal(t, []ModelIdentify{
+		{ID: "proxied-model"},
+		{ID: "cline-pass/proxied-model"},
+	}, result.Models)
+	assert.Equal(t, int32(1), proxyCalls.Load())
+}
+
+func TestFetchModelsWithChannelIDRejectsStoredCredentialForChangedEndpoint(t *testing.T) {
+	var attackerCalls atomic.Int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attackerCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"exfiltrated"}]}`))
+	}))
+	defer attacker.Close()
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:fetch_models_changed_endpoint?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithSystemBypass(context.Background(), "test")
+	ch, err := client.Channel.Create().
+		SetName("stored-endpoint").
+		SetType(channel.TypeOpenai).
+		SetBaseURL("https://api.openai.example").
+		SetCredentials(objects.ChannelCredentials{APIKey: "stored-secret"}).
+		SetSupportedModels([]string{"stored-model"}).
+		SetDefaultTestModel("stored-model").
+		Save(ctx)
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	fetcher := NewModelFetcher(
+		httpclient.NewHttpClientWithClient(attacker.Client()),
+		&ChannelService{AbstractService: &AbstractService{db: client}},
+	)
+
+	result, err := fetcher.FetchModels(ctx, FetchModelsInput{
+		ChannelType: channel.TypeOpenai.String(),
+		BaseURL:     attacker.URL,
+		ChannelID:   &ch.ID,
+	})
+	if err != nil {
+		t.Fatalf("FetchModels() unexpected error: %v", err)
+	}
+	if result.Error == nil || !strings.Contains(*result.Error, "API key is required") {
+		t.Fatalf("FetchModels() expected API key required error, got: %#v", result.Error)
+	}
+	if got := attackerCalls.Load(); got != 0 {
+		t.Fatalf("attacker endpoint was called %d times", got)
+	}
+}
+
 func TestProviderConfFetcher_Caching(t *testing.T) {
 	var callCount atomic.Int32
 
@@ -554,6 +841,175 @@ func TestProviderConfFetcher_Caching(t *testing.T) {
 	if thirdCallCount != 2 {
 		t.Fatalf("expected 2 server calls after cache expiry, got %d", thirdCallCount)
 	}
+}
+
+func TestFetchModelsClineRecommendedModels(t *testing.T) {
+	var callCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "application/json", r.Header.Get("Accept"))
+		assert.Empty(t, r.Header.Get("Authorization"))
+		assert.Empty(t, r.Header.Get("X-Api-Key"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"recommended": [
+				{"id": "payg-1"},
+				{"id": " shared "},
+				{"id": " "}
+			],
+			"free": [
+				{"id": "shared"},
+				{"id": "free-1"}
+			],
+			"clinePass": [
+				{"id": "pass-1"},
+				{"id": "free-1"}
+			],
+			"futureField": true
+		}`))
+	}))
+	defer server.Close()
+
+	fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(server.Client()), nil)
+	fetcher.clineRecommendedModelsURL = server.URL
+	apiKey := "must-not-be-sent"
+
+	for range 2 {
+		result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{
+			ChannelType: channel.TypeCline.String(),
+			BaseURL:     "https://changed.example.invalid",
+			APIKey:      &apiKey,
+		})
+		require.NoError(t, err)
+		require.Nil(t, result.Error)
+		assert.False(t, result.Fallback)
+		assert.Equal(t, []ModelIdentify{
+			{ID: "payg-1"},
+			{ID: "shared"},
+			{ID: "free-1"},
+			{ID: "pass-1"},
+		}, result.Models)
+	}
+
+	assert.Equal(t, int32(2), callCount.Load(), "Cline model discovery should fetch on demand without caching")
+}
+
+func TestFetchModelsClineDuplicatePassDoesNotAppendStaticFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"recommended": [{"id": "shared"}],
+			"clinePass": [{"id": " shared "}]
+		}`))
+	}))
+	defer server.Close()
+
+	fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(server.Client()), nil)
+	fetcher.clineRecommendedModelsURL = server.URL
+
+	result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{ChannelType: channel.TypeCline.String()})
+	require.NoError(t, err)
+	require.Nil(t, result.Error)
+	assert.False(t, result.Fallback)
+	assert.Equal(t, []ModelIdentify{{ID: "shared"}}, result.Models)
+}
+
+func TestFetchModelsClineMissingPassAppendsStaticFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"recommended": [{"id": "payg-1"}, {"id": "cline-pass/deepseek-v4-flash"}],
+			"free": [{"id": "free-1"}],
+			"clinePass": [{"id": " "}]
+		}`))
+	}))
+	defer server.Close()
+
+	fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(server.Client()), nil)
+	fetcher.clineRecommendedModelsURL = server.URL
+
+	result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{ChannelType: channel.TypeCline.String()})
+	require.NoError(t, err)
+	require.Nil(t, result.Error)
+	assert.True(t, result.Fallback)
+
+	assert.Equal(t, []ModelIdentify{
+		{ID: "payg-1"},
+		{ID: "cline-pass/deepseek-v4-flash"},
+		{ID: "free-1"},
+		{ID: "cline-pass/deepseek-v4-pro"},
+		{ID: "cline-pass/qwen3.7-plus"},
+		{ID: "cline-pass/qwen3.7-max"},
+		{ID: "cline-pass/kimi-k3"},
+		{ID: "cline-pass/kimi-k2.7-code"},
+		{ID: "cline-pass/kimi-k2.6"},
+		{ID: "cline-pass/glm-5.2"},
+		{ID: "cline-pass/mimo-v2.5"},
+		{ID: "cline-pass/mimo-v2.5-pro"},
+		{ID: "cline-pass/minimax-m3"},
+	}, result.Models)
+}
+
+func TestFetchModelsClineFailuresReturnStaticFallback(t *testing.T) {
+	fallback := []ModelIdentify{
+		{ID: "cline-pass/deepseek-v4-flash"},
+		{ID: "cline-pass/deepseek-v4-pro"},
+		{ID: "cline-pass/qwen3.7-plus"},
+		{ID: "cline-pass/qwen3.7-max"},
+		{ID: "cline-pass/kimi-k3"},
+		{ID: "cline-pass/kimi-k2.7-code"},
+		{ID: "cline-pass/kimi-k2.6"},
+		{ID: "cline-pass/glm-5.2"},
+		{ID: "cline-pass/mimo-v2.5"},
+		{ID: "cline-pass/mimo-v2.5-pro"},
+		{ID: "cline-pass/minimax-m3"},
+	}
+
+	for _, tt := range []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{name: "non-OK status", statusCode: http.StatusBadGateway, body: `{"error":"upstream unavailable"}`},
+		{name: "invalid JSON", statusCode: http.StatusOK, body: `{`},
+		{name: "empty groups", statusCode: http.StatusOK, body: `{"recommended":[],"free":[],"clinePass":[]}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var callCount atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				callCount.Add(1)
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(server.Client()), nil)
+			fetcher.clineRecommendedModelsURL = server.URL
+
+			result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{ChannelType: channel.TypeCline.String()})
+			require.NoError(t, err)
+			require.Nil(t, result.Error)
+			assert.True(t, result.Fallback)
+			assert.Equal(t, fallback, result.Models)
+			assert.Equal(t, int32(1), callCount.Load())
+		})
+	}
+
+	t.Run("request failure", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		client := server.Client()
+		server.Close()
+
+		fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(client), nil)
+		fetcher.clineRecommendedModelsURL = server.URL
+
+		result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{ChannelType: channel.TypeCline.String()})
+		require.NoError(t, err)
+		require.Nil(t, result.Error)
+		assert.True(t, result.Fallback)
+		assert.Equal(t, fallback, result.Models)
+	})
 }
 
 func TestFetchModelsGeminiVertex(t *testing.T) {
@@ -646,4 +1102,198 @@ func TestFetchCopilotModels(t *testing.T) {
 	if int(callCount.Load()) != 1 {
 		t.Errorf("expected 1 server call (cached), got %d", callCount.Load())
 	}
+}
+
+func TestFetchModelsCommandCodeSingleBearerRequest(t *testing.T) {
+	for _, channelType := range []channel.Type{channel.TypeCommandcode, channel.TypeCommandcodeAnthropic} {
+		t.Run(channelType.String(), func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Header.Get("Authorization") != "Bearer test-key" {
+					t.Errorf("expected Authorization: Bearer test-key, got %q", r.Header.Get("Authorization"))
+				}
+				if r.Header.Get("X-Api-Key") != "" {
+					t.Errorf("commandcode must not send X-Api-Key, got %q", r.Header.Get("X-Api-Key"))
+				}
+				if r.URL.Path != "/v1/models" {
+					t.Errorf("expected /v1/models, got %q", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":[{"id":"claude-sonnet-4-5"},{"id":"gpt-5-codex"},{"id":"deepseek-v3"}]}`))
+			}))
+			defer server.Close()
+
+			key := "test-key"
+			fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(server.Client()), nil)
+			result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{
+				ChannelType: channelType.String(),
+				BaseURL:     server.URL + "/v1",
+				APIKey:      &key,
+			})
+			require.NoError(t, err)
+			require.Nil(t, result.Error)
+			require.Equal(t, int32(1), calls.Load())
+
+			expectedIDs := []string{"gpt-5-codex", "deepseek-v3"}
+			if channelType == channel.TypeCommandcodeAnthropic {
+				expectedIDs = []string{"claude-sonnet-4-5"}
+			}
+			gotIDs := make([]string, len(result.Models))
+			for i, model := range result.Models {
+				gotIDs[i] = model.ID
+			}
+			require.Equal(t, expectedIDs, gotIDs)
+		})
+	}
+}
+
+func TestFetchModelsCommandCodeBaseWithoutV1AppendsV1(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("expected /v1/models, got %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer server.Close()
+
+	key := "test-key"
+	fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(server.Client()), nil)
+	result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{
+		ChannelType: channel.TypeCommandcodeAnthropic.String(),
+		BaseURL:     server.URL, // no /v1: must become /v1/models
+		APIKey:      &key,
+	})
+	if err != nil {
+		t.Fatalf("FetchModels() error: %v", err)
+	}
+	if result.Error != nil {
+		t.Fatalf("FetchModels() unexpected error result: %s", *result.Error)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected exactly 1 request, got %d", calls.Load())
+	}
+}
+
+func TestFetchModelsCommandCodeRejectsHTTP(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+	}))
+	defer server.Close()
+
+	key := "test-key"
+	fetcher := NewModelFetcher(httpclient.NewHttpClientWithClient(server.Client()), nil)
+	result, err := fetcher.FetchModels(context.Background(), FetchModelsInput{
+		ChannelType: channel.TypeCommandcode.String(),
+		BaseURL:     server.URL,
+		APIKey:      &key,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Error)
+	if result.Error != nil {
+		require.Contains(t, *result.Error, "HTTPS")
+	}
+	require.Zero(t, calls.Load())
+}
+
+func TestFetchModelsAppliesHeaderOverrideOperationsFromSettings(t *testing.T) {
+	var gotAPIKey, gotAuth string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey = r.Header.Get("X-Api-Key")
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"override-model"}]}`))
+	}))
+	defer server.Close()
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:fetch_models_header_override?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithSystemBypass(context.Background(), "test")
+	ch, err := client.Channel.Create().
+		SetName("header-override").
+		SetType(channel.TypeOpenai).
+		SetBaseURL(server.URL).
+		SetCredentials(objects.ChannelCredentials{APIKey: "stored-secret"}).
+		SetSupportedModels([]string{"override-model"}).
+		SetDefaultTestModel("override-model").
+		SetSettings(&objects.ChannelSettings{
+			HeaderOverrideOperations: []objects.OverrideOperation{
+				{Op: objects.OverrideOpSet, Path: "x-api-key", Value: "override-secret"},
+				{Op: objects.OverrideOpDelete, Path: "Authorization"},
+			},
+		}).
+		Save(ctx)
+	require.NoError(t, err)
+
+	fetcher := NewModelFetcher(
+		httpclient.NewHttpClientWithClient(server.Client()),
+		&ChannelService{AbstractService: &AbstractService{db: client}},
+	)
+
+	result, err := fetcher.FetchModels(ctx, FetchModelsInput{
+		ChannelType: channel.TypeOpenai.String(),
+		BaseURL:     server.URL + "/",
+		ChannelID:   &ch.ID,
+	})
+	require.NoError(t, err)
+	require.Nil(t, result.Error)
+	require.Len(t, result.Models, 1)
+	require.Equal(t, "override-model", result.Models[0].ID)
+
+	assert.Equal(t, "override-secret", gotAPIKey,
+		"the channel's header override must be applied to the /models probe request")
+	assert.Empty(t, gotAuth,
+		"a delete override must remove the standard Authorization header from the probe")
+}
+
+func TestFetchModelsAppliesLegacyOverrideHeaders(t *testing.T) {
+	var gotAPIKey string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey = r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"legacy-model"}]}`))
+	}))
+	defer server.Close()
+
+	client := enttest.NewEntClient(t, "sqlite3", "file:fetch_models_header_override_legacy?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithSystemBypass(context.Background(), "test")
+	ch, err := client.Channel.Create().
+		SetName("legacy-header-override").
+		SetType(channel.TypeOpenai).
+		SetBaseURL(server.URL).
+		SetCredentials(objects.ChannelCredentials{APIKey: "stored-secret"}).
+		SetSupportedModels([]string{"legacy-model"}).
+		SetDefaultTestModel("legacy-model").
+		SetSettings(&objects.ChannelSettings{
+			OverrideHeaders: []objects.HeaderEntry{{Key: "x-api-key", Value: "legacy-secret"}},
+		}).
+		Save(ctx)
+	require.NoError(t, err)
+
+	fetcher := NewModelFetcher(
+		httpclient.NewHttpClientWithClient(server.Client()),
+		&ChannelService{AbstractService: &AbstractService{db: client}},
+	)
+
+	result, err := fetcher.FetchModels(ctx, FetchModelsInput{
+		ChannelType: channel.TypeOpenai.String(),
+		BaseURL:     server.URL + "/",
+		ChannelID:   &ch.ID,
+	})
+	require.NoError(t, err)
+	require.Nil(t, result.Error)
+	require.Len(t, result.Models, 1)
+	require.Equal(t, "legacy-model", result.Models[0].ID)
+
+	assert.Equal(t, "legacy-secret", gotAPIKey,
+		"the deprecated OverrideHeaders list must still be applied to the probe request")
 }

@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/llm"
-	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestConvertToChatCompletionResponse(t *testing.T) {
@@ -29,7 +28,7 @@ func TestConvertToChatCompletionResponse(t *testing.T) {
 			OutputTokens: 20,
 		},
 	}
-	result := convertToLlmResponse(anthropicResp, PlatformDirect, shared.TransportScope{})
+	result := convertToLlmResponse(anthropicResp, PlatformDirect)
 
 	require.Equal(t, "msg_123", result.ID)
 	require.Equal(t, "chat.completion", result.Object)
@@ -41,6 +40,28 @@ func TestConvertToChatCompletionResponse(t *testing.T) {
 	require.Equal(t, int64(10), result.Usage.PromptTokens)
 	require.Equal(t, int64(20), result.Usage.CompletionTokens)
 	require.Equal(t, int64(30), result.Usage.TotalTokens)
+}
+
+func TestConvertToLlmResponse_PreservesMultipleThinkingItems(t *testing.T) {
+	result := convertToLlmResponse(&Message{
+		ID:   "msg_reasoning_items",
+		Role: "assistant",
+		Content: []MessageContentBlock{
+			{Type: "thinking", Thinking: lo.ToPtr("first"), Signature: lo.ToPtr("gAAAA_FIRST_BLOB")},
+			{Type: "thinking", Thinking: lo.ToPtr("second"), Signature: lo.ToPtr("gAAAA_SECOND_BLOB")},
+			{Type: "tool_use", ID: "call_tool", Name: lo.ToPtr("lookup"), Input: json.RawMessage(`{}`)},
+		},
+	}, PlatformDirect)
+
+	require.Len(t, result.Choices, 1)
+	message := result.Choices[0].Message
+	require.Equal(t, []llm.ReasoningItem{
+		{Content: "first", Signature: "Z0FBQUFfRklSU1RfQkxPQg=="},
+		{Content: "second", Signature: "Z0FBQUFfU0VDT05EX0JMT0I="},
+	}, message.ReasoningItems)
+	require.Equal(t, "firstsecond", lo.FromPtr(message.ReasoningContent))
+	require.Equal(t, "Z0FBQUFfU0VDT05EX0JMT0I=", lo.FromPtr(message.ReasoningSignature))
+	require.Len(t, message.ToolCalls, 1)
 }
 
 func TestConvertToolChoiceToAnthropic(t *testing.T) {
@@ -399,7 +420,7 @@ func TestConvertToChatCompletionResponse_EdgeCases(t *testing.T) {
 						StopReason: lo.ToPtr(anthropicReason),
 					}
 
-					result := convertToLlmResponse(msg, PlatformDirect, shared.TransportScope{})
+					result := convertToLlmResponse(msg, PlatformDirect)
 					if expectedReason == "stop" {
 						require.Equal(t, expectedReason, *result.Choices[0].FinishReason)
 					} else {
@@ -512,9 +533,63 @@ func TestConvertToChatCompletionResponse_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertToLlmResponse(tt.input, PlatformDirect, shared.TransportScope{})
+			result := convertToLlmResponse(tt.input, PlatformDirect)
 			tt.validate(t, result)
 		})
+	}
+}
+
+func TestConvertToLlmResponse_WithTextBlockCitations(t *testing.T) {
+	anthropicResp := &Message{
+		ID:   "msg_citations",
+		Type: "message",
+		Role: "assistant",
+		Content: []MessageContentBlock{
+			{
+				Type: "text",
+				Text: lo.ToPtr("Answer with sources"),
+				Citations: []TextCitation{
+					{
+						Type:           "url_citation",
+						URL:            "https://example.com/a",
+						Title:          "Example A",
+						EncryptedIndex: lo.ToPtr("secret"),
+						CitedText:      lo.ToPtr("quoted"),
+					},
+					{
+						Type:  "url_citation",
+						URL:   "https://example.com/b",
+						Title: "Example B",
+					},
+				},
+			},
+		},
+		Model: "claude-3-sonnet-20240229",
+	}
+
+	result := convertToLlmResponse(anthropicResp, PlatformDirect)
+	require.NotNil(t, result)
+	require.Len(t, result.Choices, 1)
+	require.NotNil(t, result.Choices[0].Message)
+	require.Equal(t, []llm.Annotation{
+		{
+			Type: "url_citation",
+			URLCitation: &llm.URLCitation{
+				URL:   "https://example.com/a",
+				Title: "Example A",
+			},
+		},
+		{
+			Type: "url_citation",
+			URLCitation: &llm.URLCitation{
+				URL:   "https://example.com/b",
+				Title: "Example B",
+			},
+		},
+	}, result.Choices[0].Message.Annotations)
+	for _, annotation := range result.Choices[0].Message.Annotations {
+		require.Nil(t, annotation.StartIndex)
+		require.Nil(t, annotation.EndIndex)
 	}
 }
 
@@ -1061,4 +1136,172 @@ func TestConvertToAnthropicRequest(t *testing.T) {
 			require.Equal(t, len(tt.expected.Messages), len(result.Messages))
 		})
 	}
+}
+
+func TestResolveMaxTokens(t *testing.T) {
+	tests := []struct {
+		name     string
+		chatReq  *llm.Request
+		expected int64
+	}{
+		{
+			name: "uses client max_tokens",
+			chatReq: &llm.Request{
+				MaxTokens: lo.ToPtr(int64(1024)),
+			},
+			expected: 1024,
+		},
+		{
+			name: "uses max_completion_tokens when max_tokens is unset",
+			chatReq: &llm.Request{
+				MaxCompletionTokens: lo.ToPtr(int64(2048)),
+			},
+			expected: 2048,
+		},
+		{
+			name: "prefers max_tokens over max_completion_tokens",
+			chatReq: &llm.Request{
+				MaxTokens:           lo.ToPtr(int64(512)),
+				MaxCompletionTokens: lo.ToPtr(int64(2048)),
+			},
+			expected: 512,
+		},
+		{
+			name: "uses model card default when client omitted an output cap",
+			chatReq: &llm.Request{
+				TransformOptions: llm.TransformOptions{
+					DefaultMaxTokens: lo.ToPtr(int64(131072)),
+				},
+			},
+			expected: 131072,
+		},
+		{
+			name: "prefers client max_tokens over model card default",
+			chatReq: &llm.Request{
+				MaxTokens: lo.ToPtr(int64(1024)),
+				TransformOptions: llm.TransformOptions{
+					DefaultMaxTokens: lo.ToPtr(int64(131072)),
+				},
+			},
+			expected: 1024,
+		},
+		{
+			name: "ignores non-positive model card default",
+			chatReq: &llm.Request{
+				TransformOptions: llm.TransformOptions{
+					DefaultMaxTokens: lo.ToPtr(int64(0)),
+				},
+			},
+			expected: 8192,
+		},
+		{
+			name:     "falls back to 8192 when no limit is available",
+			chatReq:  &llm.Request{},
+			expected: 8192,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, resolveMaxTokens(tt.chatReq))
+		})
+	}
+}
+
+func TestConvertToAnthropicRequest_ParallelToolCalls(t *testing.T) {
+	tools := []llm.Tool{
+		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "lookup"}},
+	}
+
+	tests := []struct {
+		name     string
+		chatReq  *llm.Request
+		expected *ToolChoice
+	}{
+		{
+			name: "false without tool_choice -> auto with parallel disabled",
+			chatReq: &llm.Request{
+				Tools:             tools,
+				ParallelToolCalls: lo.ToPtr(false),
+			},
+			expected: &ToolChoice{Type: "auto", DisableParallelToolUse: lo.ToPtr(true)},
+		},
+		{
+			name: "false with required -> any with parallel disabled",
+			chatReq: &llm.Request{
+				Tools:             tools,
+				ToolChoice:        &llm.ToolChoice{ToolChoice: lo.ToPtr("required")},
+				ParallelToolCalls: lo.ToPtr(false),
+			},
+			expected: &ToolChoice{Type: "any", DisableParallelToolUse: lo.ToPtr(true)},
+		},
+		{
+			name: "true with named tool -> explicit parallel enabled",
+			chatReq: &llm.Request{
+				Tools: tools,
+				ToolChoice: &llm.ToolChoice{
+					NamedToolChoice: &llm.NamedToolChoice{
+						Type:     "function",
+						Function: llm.ToolFunction{Name: "lookup"},
+					},
+				},
+				ParallelToolCalls: lo.ToPtr(true),
+			},
+			expected: &ToolChoice{Type: "tool", Name: lo.ToPtr("lookup"), DisableParallelToolUse: lo.ToPtr(false)},
+		},
+		{
+			name: "true without tool_choice -> no tool_choice synthesized",
+			chatReq: &llm.Request{
+				Tools:             tools,
+				ParallelToolCalls: lo.ToPtr(true),
+			},
+			expected: nil,
+		},
+		{
+			name: "none is left untouched",
+			chatReq: &llm.Request{
+				Tools:             tools,
+				ToolChoice:        &llm.ToolChoice{ToolChoice: lo.ToPtr("none")},
+				ParallelToolCalls: lo.ToPtr(false),
+			},
+			expected: &ToolChoice{Type: "none"},
+		},
+		{
+			name: "no tools -> no tool_choice",
+			chatReq: &llm.Request{
+				ParallelToolCalls: lo.ToPtr(false),
+			},
+			expected: nil,
+		},
+		{
+			name: "unset -> tool_choice unchanged",
+			chatReq: &llm.Request{
+				Tools:      tools,
+				ToolChoice: &llm.ToolChoice{ToolChoice: lo.ToPtr("auto")},
+			},
+			expected: &ToolChoice{Type: "auto"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := convertToAnthropicRequest(tt.chatReq)
+			require.Equal(t, tt.expected, result.ToolChoice)
+		})
+	}
+}
+
+func TestConvertToolsAnthropic_NullParameters(t *testing.T) {
+	result := convertToolsAnthropic([]llm.Tool{{
+		Type: llm.ToolTypeFunction,
+		Function: llm.Function{
+			Name:       "null_params_func",
+			Parameters: json.RawMessage("null"),
+		},
+	}}, nil)
+
+	require.Len(t, result, 1)
+	var schema map[string]any
+	require.NoError(t, json.Unmarshal(result[0].InputSchema, &schema))
+	require.Equal(t, "object", schema["type"])
 }
