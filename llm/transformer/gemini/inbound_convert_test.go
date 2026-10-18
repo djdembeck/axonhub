@@ -445,8 +445,38 @@ func TestConvertGeminiToLLMRequest_ResponseFormat(t *testing.T) {
 				require.NotNil(t, result.ResponseFormat)
 				require.Equal(t, "json_schema", result.ResponseFormat.Type)
 				require.NotNil(t, result.ResponseFormat.JSONSchema)
-				require.Contains(t, string(result.ResponseFormat.JSONSchema), "name")
-				require.Contains(t, string(result.ResponseFormat.JSONSchema), "age")
+
+				var wrapper struct {
+					Name   string          `json:"name"`
+					Schema json.RawMessage `json:"schema"`
+				}
+				require.NoError(t, json.Unmarshal(result.ResponseFormat.JSONSchema, &wrapper))
+				require.Equal(t, "gemini_response", wrapper.Name)
+				require.JSONEq(t, `{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}}}`, string(wrapper.Schema))
+			},
+		},
+		{
+			name: "request with ResponseJsonSchema adds OpenAI schema name",
+			input: &GenerateContentRequest{
+				Contents: []*Content{{
+					Role:  "user",
+					Parts: []*Part{{Text: "Generate JSON"}},
+				}},
+				GenerationConfig: &GenerationConfig{
+					ResponseJsonSchema: json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}}}`),
+				},
+			},
+			validate: func(t *testing.T, result *llm.Request) {
+				t.Helper()
+				require.NotNil(t, result.ResponseFormat)
+
+				var wrapper struct {
+					Name   string          `json:"name"`
+					Schema json.RawMessage `json:"schema"`
+				}
+				require.NoError(t, json.Unmarshal(result.ResponseFormat.JSONSchema, &wrapper))
+				require.Equal(t, "gemini_response", wrapper.Name)
+				require.JSONEq(t, `{"type":"object","properties":{"answer":{"type":"string"}}}`, string(wrapper.Schema))
 			},
 		},
 		{
@@ -977,6 +1007,39 @@ func TestConvertGeminiContentToLLMMessage(t *testing.T) {
 	}
 }
 
+func TestConvertGeminiContentToLLMMessages_MultipleFunctionResponses(t *testing.T) {
+	messages, err := convertGeminiContentToLLMMessages(&Content{
+		Role: "user",
+		Parts: []*Part{
+			{Text: "Tool results:"},
+			{FunctionResponse: &FunctionResponse{
+				ID:       "call_alpha",
+				Name:     "tool_alpha",
+				Response: map[string]any{"value": 1},
+			}},
+			{FunctionResponse: &FunctionResponse{
+				ID:       "call_beta",
+				Name:     "tool_beta",
+				Response: map[string]any{"value": 2},
+			}},
+			{Text: "Continue."},
+		},
+	}, nil)
+	require.NoError(t, err)
+	require.Len(t, messages, 4)
+
+	require.Equal(t, "user", messages[0].Role)
+	require.Equal(t, "Tool results:", lo.FromPtr(messages[0].Content.Content))
+	require.Equal(t, "tool", messages[1].Role)
+	require.Equal(t, "call_alpha", lo.FromPtr(messages[1].ToolCallID))
+	require.JSONEq(t, `{"value":1}`, lo.FromPtr(messages[1].Content.Content))
+	require.Equal(t, "tool", messages[2].Role)
+	require.Equal(t, "call_beta", lo.FromPtr(messages[2].ToolCallID))
+	require.JSONEq(t, `{"value":2}`, lo.FromPtr(messages[2].Content.Content))
+	require.Equal(t, "user", messages[3].Role)
+	require.Equal(t, "Continue.", lo.FromPtr(messages[3].Content.Content))
+}
+
 func TestConvertGeminiContentToLLMMessage_ThoughtSignature(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1070,7 +1133,7 @@ func TestConvertGeminiContentToLLMMessage_ThoughtSignature(t *testing.T) {
 							Name: "check_weather",
 							Args: map[string]any{"city": "Tokyo"},
 						},
-						ThoughtSignature: shared.GeminiThoughtSignaturePrefix + "signature_prefixed",
+						ThoughtSignature: "signature_prefixed",
 					},
 				},
 			},
@@ -1078,15 +1141,15 @@ func TestConvertGeminiContentToLLMMessage_ThoughtSignature(t *testing.T) {
 				t.Helper()
 				require.NotNil(t, result)
 				require.NotNil(t, result.ReasoningSignature)
-				require.Equal(t, shared.GeminiThoughtSignaturePrefix+"signature_prefixed", *result.ReasoningSignature)
-				decoded := shared.DecodeGeminiThoughtSignature(result.ReasoningSignature, "")
+				require.Equal(t, "signature_prefixed", *result.ReasoningSignature)
+				decoded := shared.DecodeGeminiThoughtSignature(result.ReasoningSignature)
 				require.Nil(t, decoded)
 				require.Len(t, result.ToolCalls, 1)
 				require.Equal(t, "call_003", result.ToolCalls[0].ID)
 				require.NotNil(t, result.ToolCalls[0].TransformerMetadata)
 				require.Equal(
 					t,
-					shared.GeminiThoughtSignaturePrefix+"signature_prefixed",
+					"signature_prefixed",
 					result.ToolCalls[0].TransformerMetadata[transformerMetadataKeyGoogleThoughtSignature],
 				)
 			},
@@ -1137,7 +1200,7 @@ func TestConvertLLMChoiceToGeminiCandidate_ThoughtSignature(t *testing.T) {
 				Index: 0,
 				Message: &llm.Message{
 					Role:               "assistant",
-					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_prefixed"), ""),
+					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_prefixed")),
 					ToolCalls: []llm.ToolCall{
 						{
 							ID:   "call_001",
@@ -1164,7 +1227,7 @@ func TestConvertLLMChoiceToGeminiCandidate_ThoughtSignature(t *testing.T) {
 				Index: 0,
 				Message: &llm.Message{
 					Role:               "assistant",
-					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_A"), ""),
+					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_A")),
 					ToolCalls: []llm.ToolCall{
 						{
 							ID:   "call_001",
@@ -1193,7 +1256,7 @@ func TestConvertLLMChoiceToGeminiCandidate_ThoughtSignature(t *testing.T) {
 				Index: 0,
 				Message: &llm.Message{
 					Role:               "assistant",
-					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_A"), ""),
+					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_A")),
 					ToolCalls: []llm.ToolCall{
 						{
 							ID:   "call_001",
@@ -1269,7 +1332,7 @@ func TestConvertLLMChoiceToGeminiCandidate_ThoughtSignature(t *testing.T) {
 				Index: 0,
 				Message: &llm.Message{
 					Role:               "assistant",
-					ReasoningSignature: lo.ToPtr(shared.OpenAIEncryptedContentPrefix + "encrypted_data"),
+					ReasoningSignature: lo.ToPtr("encrypted_data"),
 					ToolCalls: []llm.ToolCall{
 						{
 							ID:   "call_001",
@@ -1286,7 +1349,7 @@ func TestConvertLLMChoiceToGeminiCandidate_ThoughtSignature(t *testing.T) {
 				t.Helper()
 				require.NotNil(t, result)
 				require.Len(t, result.Content.Parts, 1)
-				require.Equal(t, shared.OpenAIEncryptedContentPrefix+"encrypted_data", result.Content.Parts[0].ThoughtSignature)
+				require.Equal(t, "encrypted_data", result.Content.Parts[0].ThoughtSignature)
 			},
 		},
 		{
@@ -1355,7 +1418,7 @@ func TestConvertLLMChoiceToGeminiCandidate_ThoughtSignature(t *testing.T) {
 				Index: 0,
 				Message: &llm.Message{
 					Role:               "assistant",
-					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_without_parts"), ""),
+					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_without_parts")),
 				},
 			},
 			validate: func(t *testing.T, result *Candidate) {
@@ -1765,7 +1828,7 @@ func TestConvertGeminiToLLMResponse_Testdata(t *testing.T) {
 			err := xtest.LoadTestData(t, tc.geminiFile, &geminiResp)
 			require.NoError(t, err)
 
-			result := convertGeminiToLLMResponse(&geminiResp, false, shared.TransportScope{})
+			result := convertGeminiToLLMResponse(&geminiResp, false)
 			tc.validateFunc(t, result)
 		})
 	}
@@ -1876,7 +1939,7 @@ func TestRoundTrip_GeminiResponse_ToLLM_BackToGemini(t *testing.T) {
 			require.NoError(t, err)
 
 			// Convert Gemini -> LLM (non-streaming)
-			llmResp := convertGeminiToLLMResponse(&originalGemini, false, shared.TransportScope{})
+			llmResp := convertGeminiToLLMResponse(&originalGemini, false)
 
 			// Convert LLM -> Gemini (non-streaming)
 			convertedGemini := convertLLMToGeminiResponse(llmResp, false)
@@ -2003,7 +2066,7 @@ func TestRoundTrip_LLMResponse_ToGemini_BackToLLM(t *testing.T) {
 			geminiResp := convertLLMToGeminiResponse(&originalLLM, false)
 
 			// Convert Gemini -> LLM (non-streaming)
-			convertedLLM := convertGeminiToLLMResponse(geminiResp, false, shared.TransportScope{})
+			convertedLLM := convertGeminiToLLMResponse(geminiResp, false)
 
 			// Verify key fields are preserved
 			require.Equal(t, originalLLM.ID, convertedLLM.ID)
@@ -2036,6 +2099,59 @@ func TestRoundTrip_LLMResponse_ToGemini_BackToLLM(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConvertLLMToGeminiResponse_CitationMetadataFallback(t *testing.T) {
+	resp := convertLLMToGeminiResponse(&llm.Response{
+		ID:    "resp_gemini_fallback",
+		Model: "gemini-2.5-flash",
+		Choices: []llm.Choice{{
+			Message: &llm.Message{
+				Role:    "assistant",
+				Content: llm.MessageContent{Content: lo.ToPtr("Grounded answer")},
+				Annotations: []llm.Annotation{{
+					Type:        "url_citation",
+					StartIndex:  lo.ToPtr(int64(0)),
+					EndIndex:    lo.ToPtr(int64(8)),
+					URLCitation: &llm.URLCitation{URL: "https://example.com/fallback", Title: "Fallback Source"},
+				}},
+			},
+		}},
+	}, false)
+
+	require.Len(t, resp.Candidates, 1)
+	require.Nil(t, resp.Candidates[0].GroundingMetadata)
+	require.NotNil(t, resp.Candidates[0].CitationMetadata)
+	require.Len(t, resp.Candidates[0].CitationMetadata.Citations, 1)
+	require.Equal(t, "https://example.com/fallback", resp.Candidates[0].CitationMetadata.Citations[0].URI)
+	require.Equal(t, "Fallback Source", resp.Candidates[0].CitationMetadata.Citations[0].Title)
+	require.Equal(t, int64(0), resp.Candidates[0].CitationMetadata.Citations[0].StartIndex)
+	require.Equal(t, int64(8), resp.Candidates[0].CitationMetadata.Citations[0].EndIndex)
+}
+
+func TestConvertLLMToGeminiResponse_GroundingMetadataTakesPrecedenceOverAnnotations(t *testing.T) {
+	resp := convertLLMToGeminiResponse(&llm.Response{
+		ID:    "resp_gemini_priority",
+		Model: "gemini-2.5-flash",
+		Choices: []llm.Choice{{
+			Message: &llm.Message{
+				Role:    "assistant",
+				Content: llm.MessageContent{Content: lo.ToPtr("Grounded answer")},
+				Annotations: []llm.Annotation{{
+					Type:        "url_citation",
+					URLCitation: &llm.URLCitation{URL: "https://example.com/ignore", Title: "Ignore Me"},
+				}},
+			},
+			TransformerMetadata: map[string]any{
+				TransformerMetadataKeyGroundingMetadata: &GroundingMetadata{WebSearchQueries: []string{"authoritative query"}},
+			},
+		}},
+	}, false)
+
+	require.Len(t, resp.Candidates, 1)
+	require.NotNil(t, resp.Candidates[0].GroundingMetadata)
+	require.Equal(t, []string{"authoritative query"}, resp.Candidates[0].GroundingMetadata.WebSearchQueries)
+	require.Nil(t, resp.Candidates[0].CitationMetadata)
 }
 
 func TestConvertLLMToGeminiResponse_GroundingMetadata(t *testing.T) {

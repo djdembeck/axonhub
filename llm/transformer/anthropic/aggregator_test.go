@@ -2,11 +2,13 @@ package anthropic
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 )
@@ -146,6 +148,96 @@ func TestAggregateStreamChunks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAggregateStreamChunks_MessageStopFinalizesOrderedUsage(t *testing.T) {
+	for _, usage := range []struct {
+		name   string
+		input  int64
+		output int64
+	}{
+		{name: "nonzero", input: 12, output: 34},
+		{name: "zero"},
+	} {
+		t.Run(usage.name, func(t *testing.T) {
+			chunks := []*httpclient.StreamEvent{
+				{Data: []byte(`{"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","content":[],"model":"claude","usage":{"input_tokens":` + strconv.FormatInt(usage.input, 10) + `,"output_tokens":0}}}`)},
+				{Data: []byte(`{"type":"message_delta","usage":{"input_tokens":` + strconv.FormatInt(usage.input, 10) + `,"output_tokens":` + strconv.FormatInt(usage.output, 10) + `},"delta":{"stop_reason":"end_turn"}}`)},
+				{Data: []byte(`{"type":"message_stop"}`)},
+			}
+			_, meta, err := AggregateStreamChunks(t.Context(), chunks, PlatformDirect)
+			require.NoError(t, err)
+			require.Equal(t, llm.AccountingEvidenceExplicitFinal, meta.AccountingEvidence)
+			require.Equal(t, usage.input+usage.output, meta.Usage.TotalTokens)
+		})
+	}
+}
+
+func TestAggregateStreamChunks_MessageDeltaUsageWithoutStartUsage(t *testing.T) {
+	base := []*httpclient.StreamEvent{
+		{Data: []byte(`{"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","content":[],"model":"claude"}}`)},
+		{Data: []byte(`{"type":"message_delta","usage":{"input_tokens":12,"output_tokens":34},"delta":{"stop_reason":"end_turn"}}`)},
+		{Data: []byte(`{"type":"message_stop"}`)},
+	}
+	_, meta, err := AggregateStreamChunks(t.Context(), base, PlatformDirect)
+	require.NoError(t, err)
+	require.Equal(t, llm.AccountingEvidenceExplicitFinal, meta.AccountingEvidence)
+	require.Equal(t, int64(46), meta.Usage.TotalTokens)
+
+	// A trailing error after the completion boundary cannot retract usage the
+	// provider already delivered with the completed message.
+	withError := append(append([]*httpclient.StreamEvent{}, base...), &httpclient.StreamEvent{Data: []byte(`{"type":"error"}`)})
+	_, meta, err = AggregateStreamChunks(t.Context(), withError, PlatformDirect)
+	require.NoError(t, err)
+	require.Equal(t, llm.AccountingEvidenceExplicitFinal, meta.AccountingEvidence)
+	require.Equal(t, int64(46), meta.Usage.TotalTokens)
+
+	// An error before the completion boundary still invalidates the usage.
+	beforeStop := []*httpclient.StreamEvent{
+		base[0],
+		base[1],
+		{Data: []byte(`{"type":"error"}`)},
+		base[2],
+	}
+	_, meta, err = AggregateStreamChunks(t.Context(), beforeStop, PlatformDirect)
+	require.NoError(t, err)
+	require.Equal(t, llm.AccountingEvidenceUnavailable, meta.AccountingEvidence)
+}
+
+func TestAggregateStreamChunks_MissingMessageStopLeavesUsageUnavailable(t *testing.T) {
+	_, meta, err := AggregateStreamChunks(t.Context(), []*httpclient.StreamEvent{
+		{Data: []byte(`{"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","content":[],"model":"claude","usage":{"input_tokens":12,"output_tokens":0}}}`)},
+		{Data: []byte(`{"type":"message_delta","usage":{"input_tokens":12,"output_tokens":34},"delta":{"stop_reason":"end_turn"}}`)},
+	}, PlatformDirect)
+	require.NoError(t, err)
+	require.Equal(t, llm.AccountingEvidenceUnavailable, meta.AccountingEvidence)
+}
+
+func TestAggregateStreamChunks_SetsCompletedForStopReason(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{Data: []byte(`{"type":"message_start","message":{"id":"msg_stop","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6"}}`)},
+		{Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}`)},
+		{Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":1}}`)},
+	}
+
+	_, meta, err := AggregateStreamChunks(t.Context(), chunks, PlatformDirect)
+
+	require.NoError(t, err)
+	require.Equal(t, "msg_stop", meta.ID)
+	require.True(t, meta.Completed)
+}
+
+func TestAggregateStreamChunks_DoesNotCompleteWithoutMessageStart(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`)},
+		{Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":1}}`)},
+	}
+
+	_, meta, err := AggregateStreamChunks(t.Context(), chunks, PlatformDirect)
+
+	require.NoError(t, err)
+	require.Equal(t, "msg_unknown", meta.ID)
+	require.False(t, meta.Completed)
 }
 
 func TestAggregateStreamChunks_EdgeCases(t *testing.T) {
@@ -837,6 +929,87 @@ func TestAggregateStreamChunks_EdgeCases(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestAggregateStreamChunks_WithCitationsDelta(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Data: []byte(`{
+				"type": "message_start",
+				"message": {
+					"id": "msg_citations",
+					"type": "message",
+					"role": "assistant",
+					"content": [],
+					"model": "claude-sonnet-4-6"
+				}
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "content_block_start",
+				"index": 0,
+				"content_block": {
+					"type": "text",
+					"text": ""
+				}
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "content_block_delta",
+				"index": 0,
+				"delta": {
+					"type": "text_delta",
+					"text": "Answer with source"
+				}
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "content_block_delta",
+				"index": 0,
+				"delta": {
+					"type": "citations_delta",
+					"citation": {
+						"type": "url_citation",
+						"url": "https://example.com/source",
+						"title": "Example Source"
+					}
+				}
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "content_block_stop",
+				"index": 0
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "message_delta",
+				"delta": {
+					"stop_reason": "end_turn"
+				}
+			}`),
+		},
+	}
+
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks, PlatformDirect)
+	require.NoError(t, err)
+
+	var result Message
+	err = json.Unmarshal(resultBytes, &result)
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+	require.Equal(t, "text", result.Content[0].Type)
+	require.Equal(t, "Answer with source", *result.Content[0].Text)
+	require.Equal(t, []TextCitation{{
+		Type:  "url_citation",
+		URL:   "https://example.com/source",
+		Title: "Example Source",
+	}}, result.Content[0].Citations)
+	require.Nil(t, result.Content[0].Citations[0].EncryptedIndex)
 }
 
 func TestAggregateStreamChunks_WithTestData(t *testing.T) {

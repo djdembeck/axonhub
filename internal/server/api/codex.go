@@ -1,14 +1,13 @@
 package api
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,14 +28,54 @@ type CodexHandlersParams struct {
 }
 
 type CodexHandlers struct {
-	stateCache xcache.Cache[codexOAuthState]
-	httpClient *httpclient.HttpClient
+	stateCache      xcache.Cache[codexOAuthState]
+	httpClient      *httpclient.HttpClient
+	exchangeLocksMu sync.Mutex
+	exchangeLocks   map[string]*codexExchangeLock
+}
+
+type codexExchangeLock struct {
+	sem  chan struct{}
+	refs int
 }
 
 func NewCodexHandlers(params CodexHandlersParams) *CodexHandlers {
 	return &CodexHandlers{
-		stateCache: xcache.NewFromConfig[codexOAuthState](params.CacheConfig),
-		httpClient: params.HttpClient,
+		stateCache:    xcache.NewFromConfig[codexOAuthState](params.CacheConfig),
+		httpClient:    params.HttpClient,
+		exchangeLocks: make(map[string]*codexExchangeLock),
+	}
+}
+
+func (h *CodexHandlers) acquireExchangeLock(ctx context.Context, sessionID string) (func(), error) {
+	h.exchangeLocksMu.Lock()
+	lock, ok := h.exchangeLocks[sessionID]
+	if !ok {
+		lock = &codexExchangeLock{sem: make(chan struct{}, 1)}
+		h.exchangeLocks[sessionID] = lock
+	}
+	lock.refs++
+	h.exchangeLocksMu.Unlock()
+
+	select {
+	case lock.sem <- struct{}{}:
+		return func() {
+			<-lock.sem
+			h.exchangeLocksMu.Lock()
+			lock.refs--
+			if lock.refs == 0 {
+				delete(h.exchangeLocks, sessionID)
+			}
+			h.exchangeLocksMu.Unlock()
+		}, nil
+	case <-ctx.Done():
+		h.exchangeLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(h.exchangeLocks, sessionID)
+		}
+		h.exchangeLocksMu.Unlock()
+		return nil, ctx.Err()
 	}
 }
 
@@ -50,29 +89,6 @@ type StartCodexOAuthResponse struct {
 type codexOAuthState struct {
 	CodeVerifier string `json:"code_verifier"`
 	CreatedAt    int64  `json:"created_at"`
-}
-
-func generateCodexCodeVerifier() (string, error) {
-	b := make([]byte, 64)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-
-	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b), nil
-}
-
-func generateCodexCodeChallenge(verifier string) string {
-	hash := sha256.Sum256([]byte(verifier))
-	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(hash[:])
-}
-
-func generateCodexState() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-
-	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b), nil
 }
 
 func codexOAuthCacheKey(sessionID string) string {
@@ -90,19 +106,19 @@ func (h *CodexHandlers) StartOAuth(c *gin.Context) {
 		return
 	}
 
-	state, err := generateCodexState()
+	state, err := oauth.GenerateState(32)
 	if err != nil {
 		JSONError(c, http.StatusInternalServerError, fmt.Errorf("failed to generate oauth state: %w", err))
 		return
 	}
 
-	codeVerifier, err := generateCodexCodeVerifier()
+	codeVerifier, err := oauth.GenerateCodeVerifier(64)
 	if err != nil {
 		JSONError(c, http.StatusInternalServerError, fmt.Errorf("failed to generate code verifier: %w", err))
 		return
 	}
 
-	codeChallenge := generateCodexCodeChallenge(codeVerifier)
+	codeChallenge := oauth.GenerateCodeChallenge(codeVerifier)
 
 	cacheKey := codexOAuthCacheKey(state)
 	if err := h.stateCache.Set(ctx, cacheKey, codexOAuthState{CodeVerifier: codeVerifier, CreatedAt: time.Now().Unix()}, xcache.WithExpiration(10*time.Minute)); err != nil {
@@ -136,6 +152,14 @@ type ExchangeCodexOAuthResponse struct {
 	Credentials string `json:"credentials"`
 }
 
+type DecodeCodexAuthJSONRequest struct {
+	AuthJSON string `json:"auth_json" binding:"required"`
+}
+
+type DecodeCodexAuthJSONResponse struct {
+	Credentials string `json:"credentials"`
+}
+
 func parseCodexCallbackURL(callbackURL string) (string, string, error) {
 	trimmed := strings.TrimSpace(callbackURL)
 	if !strings.HasPrefix(trimmed, "http://") && !strings.HasPrefix(trimmed, "https://") {
@@ -162,6 +186,30 @@ func parseCodexCallbackURL(callbackURL string) (string, string, error) {
 	return code, state, nil
 }
 
+// DecodeAuthJSON decodes Codex auth.json into normalized OAuth credentials JSON.
+// POST /admin/codex/auth/decode.
+func (h *CodexHandlers) DecodeAuthJSON(c *gin.Context) {
+	var req DecodeCodexAuthJSONRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		JSONError(c, http.StatusBadRequest, errors.New("invalid request format"))
+		return
+	}
+
+	creds, err := codex.DecodeAuthJSON(req.AuthJSON)
+	if err != nil {
+		JSONError(c, http.StatusBadRequest, fmt.Errorf("failed to decode auth json: %w", err))
+		return
+	}
+
+	output, err := creds.ToJSON()
+	if err != nil {
+		JSONError(c, http.StatusInternalServerError, fmt.Errorf("failed to encode credentials: %w", err))
+		return
+	}
+
+	c.JSON(http.StatusOK, DecodeCodexAuthJSONResponse{Credentials: output})
+}
+
 // Exchange exchanges callback URL for OAuth credentials JSON.
 // POST /admin/codex/oauth/exchange.
 func (h *CodexHandlers) Exchange(c *gin.Context) {
@@ -179,15 +227,17 @@ func (h *CodexHandlers) Exchange(c *gin.Context) {
 	}
 
 	cacheKey := codexOAuthCacheKey(req.SessionID)
+	release, err := h.acquireExchangeLock(ctx, req.SessionID)
+	if err != nil {
+		JSONError(c, http.StatusRequestTimeout, err)
+		return
+	}
+	defer release()
 
 	state, err := h.stateCache.Get(ctx, cacheKey)
 	if err != nil {
 		JSONError(c, http.StatusBadRequest, errors.New("invalid or expired oauth session"))
 		return
-	}
-
-	if err := h.stateCache.Delete(ctx, cacheKey); err != nil {
-		log.Warn(ctx, "failed to delete used oauth state from cache", log.String("session_id", req.SessionID), log.Cause(err))
 	}
 
 	code, callbackState, err := parseCodexCallbackURL(req.CallbackURL)
@@ -211,7 +261,9 @@ func (h *CodexHandlers) Exchange(c *gin.Context) {
 		HTTPClient: httpClient,
 	})
 
-	creds, err := tokenProvider.Exchange(ctx, oauth.ExchangeParams{
+	exchangeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	creds, err := tokenProvider.Exchange(exchangeCtx, oauth.ExchangeParams{
 		Code:         code,
 		CodeVerifier: state.CodeVerifier,
 		ClientID:     codex.ClientID,
@@ -220,6 +272,12 @@ func (h *CodexHandlers) Exchange(c *gin.Context) {
 	if err != nil {
 		JSONError(c, http.StatusBadGateway, fmt.Errorf("token exchange failed: %w", err))
 		return
+	}
+
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cleanupCancel()
+	if err := h.stateCache.Delete(cleanupCtx, cacheKey); err != nil {
+		log.Warn(ctx, "failed to delete used oauth state from cache", log.String("session_id", req.SessionID), log.Cause(err))
 	}
 
 	output, err := creds.ToJSON()

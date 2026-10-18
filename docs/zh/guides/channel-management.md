@@ -67,7 +67,18 @@
 - 不同请求会随机选择可用的 Key
 - 某个 Key 出错时，系统会自动切换到其他 Key
 
-## 模型映射配置
+## 模型重命名
+
+AxonHub 在渠道层面提供多种模型重命名和别名机制。当请求到达时，渠道按以下优先级链解析请求模型到实际上游模型：
+
+1. **直接匹配** — 请求模型直接在支持模型列表中
+2. **额外模型前缀** — 为所有支持模型添加前缀别名
+3. **自动裁剪模型前缀** — 从支持模型中去除已知前缀，创建精简别名
+4. **模型映射** — 显式 `from → to` 别名配对
+
+> **注意**：如果多个机制产生了相同的请求模型名，则第一个匹配生效（按上述顺序）。
+
+### 模型映射
 
 **什么时候需要模型映射？**
 
@@ -79,16 +90,81 @@
 2. **统一不同渠道的模型名**：让 `claude-sonnet` 和 `gpt-4` 都指向同一个实际模型
 3. **旧版兼容**：客户端请求旧版模型名，自动映射到新版
 
-### 配置方法
+**配置方法：**
 
-在渠道的 **Settings** 中的模型映射区域添加：
+在渠道的 **Settings** → **模型映射** 中添加 `from → to` 配对：
 
 | 客户端请求的模型名 (from) | 实际发给上游的模型名 (to) |
 |--------------------------|--------------------------|
 | gpt-4o-mini | gpt-4o |
 | claude-3-sonnet | claude-3.5-sonnet |
 
-**注意**：目标模型（to）必须在 `supported_models` 列表中。
+**注意**：目标模型（`to`）必须在支持模型列表中。如果目标模型不在列表中，该映射将被静默忽略。
+
+### 额外模型前缀（Extra Model Prefix）
+
+为支持模型列表中的每个模型添加**带前缀的别名**，允许客户端使用带前缀或不带前缀的格式请求模型。
+
+**使用场景**：你想将渠道中的所有模型归入统一前缀命名空间（如 `deepseek/`）。
+
+**示例：**
+- 支持模型：`deepseek-chat`、`deepseek-reasoner`
+- 额外模型前缀：`deepseek`
+
+渠道现在**同时**接受以下两种请求格式：
+- `deepseek-chat` → 发送 `deepseek-chat` 给上游
+- `deepseek/deepseek-chat` → 发送 `deepseek-chat` 给上游
+
+当不同渠道存在同名模型时，客户端可以通过前缀来区分来源渠道。
+
+### 自动裁剪模型前缀（Auto-Trimmed Model Prefixes）
+
+自动**去除支持模型名中的指定前缀**，创建精简别名。这是额外模型前缀的反向操作。
+
+**使用场景**：像 OpenRouter、SiliconFlow 等供应商会在模型名前加上供应商前缀（如 `openai/gpt-5.4`）。你想让客户端直接使用短名 `gpt-5.4` 请求，而不必为每个模型手动创建映射。
+
+**示例：**
+- 支持模型：`openai/gpt-5.4`、`anthropic/claude-sonnet-4`、`deepseek-ai/deepseek-chat`
+- 自动裁剪模型前缀：`openai`、`anthropic`、`deepseek-ai`
+
+渠道同时接受原始名和精简名：
+- `gpt-5.4` → 发送 `openai/gpt-5.4` 给上游
+- `claude-sonnet-4` → 发送 `anthropic/claude-sonnet-4` 给上游
+- `deepseek-chat` → 发送 `deepseek-ai/deepseek-chat` 给上游
+- `openai/gpt-5.4` → 作为直接匹配仍然有效
+
+> **提示**：对于使用供应商前缀模型 ID 的供应商，推荐使用此功能。它可以批量重写模型 ID，无需逐个创建模型映射。
+
+### 模型名称转小写（Lowercase Model Name）
+
+启用后，模型名称的匹配键会转为小写，在渠道下发模型名包含大写字母时开启，可实现与其他小写模型名共同负载均衡。发送给提供商的模型名保留原始大小写。
+
+**示例**：将 `GLM-5.1` 转换为 `glm-5.1`，使该渠道可与其他下发 `glm-5.1` 的渠道共同负载均衡。
+
+> **注意**：启用此选项后，仅大小写不同的模型名（如 `GPT-4` 和 `gpt-4`）会被视为同一个模型。冲突时保留优先级最高的条目（direct > auto_trim > mapping > prefix）。
+
+### 可见性控制
+
+两个选项控制哪些模型名在模型列表中可见（例如客户端调用 `/v1/models` 接口时）：
+
+| 选项 | 效果 |
+|------|------|
+| **隐藏原始模型** | 隐藏原始（直接匹配）的模型名。仅显示经过转换的名称（来自前缀、自动裁剪或映射）。 |
+| **隐藏映射模型** | 隐藏模型映射的 `from` 名称。仅显示原始模型名。 |
+
+**示例 — 隐藏原始模型：**
+- 支持模型：`openai/gpt-5.4`
+- 自动裁剪前缀：`openai`
+- 隐藏原始模型：启用
+
+`/v1/models` 响应只显示 `gpt-5.4`，不显示 `openai/gpt-5.4`。两个名称都可用于请求。
+
+**示例 — 隐藏映射模型：**
+- 支持模型：`gpt-4o`
+- 模型映射：`gpt-4` → `gpt-4o`
+- 隐藏映射模型：启用
+
+`/v1/models` 响应显示 `gpt-4o` 但隐藏 `gpt-4`。两个名称都可用于请求。
 
 ## 测试和启用渠道
 
@@ -104,56 +180,6 @@
 ### 启用渠道
 
 测试通过后，点击 **启用** 按钮，渠道状态变为 **活跃**，即可开始接收请求。
-
-## 实际使用场景示例
-
-### 场景 1：Claude Code 使用 OpenRouter
-
-你想在 Claude Code 中使用 OpenRouter 的模型：
-
-1. **创建 OpenRouter 渠道**：
-
-   | 字段 | 值 |
-   |------|-----|
-   | 名称 | OpenRouter |
-   | 类型 | openai（OpenRouter 兼容 OpenAI 格式） |
-   | Base URL | https://openrouter.ai/api/v1 |
-   | API Key | sk-or-your-openrouter-key |
-   | 支持模型 | anthropic/claude-3.5-sonnet, anthropic/claude-3-opus, deepseek/deepseek-chat |
-
-2. **配置 API Key 模型映射**（在 API Key 管理中）：
-
-   | 客户端请求的模型名 (from) | 映射后的模型名 (to) |
-   |--------------------------|---------------------|
-   | claude-sonnet-4-5 | anthropic/claude-3.5-sonnet |
-   | claude-opus-4-5 | anthropic/claude-3-opus |
-
-3. **Claude Code 配置**：
-   ```bash
-   export ANTHROPIC_AUTH_TOKEN="your-axonhub-api-key"
-   export ANTHROPIC_BASE_URL="http://localhost:8090/anthropic"
-   ```
-
-### 场景 2：多服务商备份
-
-配置主用 OpenAI，备用 DeepSeek：
-
-1. **创建 OpenAI 渠道**（权重 10，优先级高）
-2. **创建 DeepSeek 渠道**（权重 5，优先级低）
-3. **在模型管理中配置关联**：
-   - 设置 OpenAI 渠道为优先级 0（优先使用）
-   - 设置 DeepSeek 渠道为优先级 1（备用）
-
-### 场景 3：成本优化
-
-把贵的模型请求转到便宜的替代模型：
-
-在 API Key Profile 中添加模型映射：
-
-| 客户端请求的模型名 (from) | 映射后的模型名 (to) |
-|--------------------------|---------------------|
-| gpt-4 | claude-3-sonnet |
-| gpt-4-turbo | deepseek-reasoner |
 
 ## Base URL 特殊配置
 
@@ -181,6 +207,129 @@ https://custom-proxy.example.com/api#
 https://custom-gateway.example.com/api##
 # 实际请求: /api（不会加版本号和端点路径）
 ```
+
+## 多协议端点与模型协议覆盖
+
+一个渠道可以同时配置多个出站端点（Endpoint），覆盖 chat、responses、messages 等协议，使不同客户端以原生协议直连。
+
+### 端点配置
+
+在渠道的 **端点** 对话框中管理：
+
+- 每个 endpoint 由 `api_format`、可选 `base_url`（留空继承渠道 Base URL）和可选 `path`（替换该协议的默认路径，配置后跳过版本号追加）组成。
+- 各渠道类型自带默认端点（如智谱提供 `openai/chat_completions`、`zhipu_anthropic` 提供 `anthropic/messages`），自定义端点可补充其他格式或覆盖同名格式。
+
+### 端点自动探测
+
+**端点** 对话框可以探测上游是否支持三种透传协议（`openai/chat_completions`、`openai/responses`、`anthropic/messages`）；若渠道三者都支持，基本可以让所有客户端协议原生透传。
+
+- 在 **当前端点** 区域点击 **自动探测**，后端会用渠道的 Base URL、凭证和默认测试模型，对每种协议发送一次轻量探测请求。
+- 探测到支持的协议会自动加入自定义端点列表（不会自动保存，确认后点击 **保存** 生效）。
+- 上游返回非 `404`/`405` 即视为该路由存在；`401`/`403` 归类为鉴权失败，`5xx` 或连接失败归类为错误。
+- 渠道列表的 **端点** 列用四个图标展示已配置的透传协议（包括原生 Gemini Contents 端点）：已配置高亮，未配置置灰。
+
+### 模型协议覆盖（ModelProtocols）
+
+在 **模型协议覆盖** 区块为单个模型强制可用的出站协议：
+
+```json
+{ "model": "glm-5.3-flash", "apiFormats": ["openai/responses", "openai/chat_completions"], "enabled": true }
+```
+
+- `apiFormats` 按配置顺序表达优先级；客户端入站协议在列表中时优先直连，否则使用列表中的第一个协议并经统一转换管线转换。
+- 启用的覆盖只能引用渠道已具备的 `api_format`（默认端点或自定义端点），保存时校验；模型被移出渠道支持列表时自动清理对应覆盖。
+- 端点与协议覆盖在同一次保存中原子提交。
+
+### Responses HTTP 与 WebSocket 端点
+
+Responses 有两种独立的端点格式：
+
+| `api_format` | 传输方式 | 默认请求路径 |
+|---|---|---|
+| `openai/responses` | HTTP | `/v1/responses` |
+| `openai/responses-ws` | WebSocket | `/v1/responses` |
+
+当一个渠道同时支持两种传输方式时，请在同一渠道中配置这两种格式。
+端点格式是出站传输方式的唯一依据。旧配置中的 WebSocket scheme 会归一化为
+`openai/responses-ws`；旧的 HTTP Responses 端点仍归一化为
+`openai/responses`。已经明确配置为仅 HTTP 或仅 WebSocket 的端点集合，在使用新配置
+保存前仍保持单模式。
+
+对于入站格式与所选渠道中允许的端点格式相同的请求，AxonHub 会先选择完全匹配的
+格式。如果没有同格式端点，则按配置顺序选择第一个允许的端点，并在 HTTP 与
+WebSocket 之间转换 Responses 请求、响应或事件封装。此回退不会改变渠道排序，也不会
+把 Images 或 Models 请求变成 Responses 请求。
+
+模型协议覆盖应列出模型可以使用的确切格式：
+
+```json
+{
+  "model": "gpt-5",
+  "apiFormats": ["openai/responses", "openai/responses-ws"],
+  "enabled": true
+}
+```
+
+覆盖只能引用该渠道已经提供的端点格式。Responses 连续对话应尽量保持在同一渠道。
+如果切换传输方式或渠道时无法确认此前的完整输入，AxonHub 会在发送上游请求前拒绝，
+不会带着不完整历史继续请求。
+
+### Responses 连续对话与有界恢复
+
+`previous_response_id` 会绑定到生成它的渠道、端点来源、模型、认证身份和 WebSocket
+连接代次。原生 WebSocket 续接会在匹配的上游会话中发送下一轮增量内容。过期、缺失、
+失效或超出预算的上下文不会被静默发送到其他端点或渠道。
+
+当完整上下文不可用时，AxonHub 返回 HTTP 400，或返回带有
+`previous_response_not_found` 代码的 WebSocket 错误，并要求客户端删除
+`previous_response_id`、重新发送完整输入。此恢复错误不会进入普通渠道故障转移。
+同一个下游连接上的其他 WebSocket lane 不会因某一个 lane 的恢复错误而关闭。
+
+当前有界默认值为：单条 HTTP 保留记录或流捕获 16 MiB、保留载荷总量 64 MiB、单个
+下游连接的单帧或排队帧 128 MiB。超过保留预算时，只会移除可选的回放历史；如果提供商
+会话仍可继续，则保留有效的原生 response identity。后续请求如果需要已被移除的历史，
+客户端必须重新发送完整输入。
+
+**示例**（GLM Coding Plan 渠道，三个端点 + 覆盖）：
+
+| endpoint | api_format | base_url |
+|---|---|---|
+| 1 | `openai/chat_completions` | `https://open.bigmodel.cn/api/coding/paas/v4` |
+| 2 | `openai/responses` | `https://open.bigmodel.cn/api/v1` |
+| 3 | `anthropic/messages` | 继承渠道 Base URL（`https://open.bigmodel.cn/api/anthropic`） |
+
+| 客户端 | 入站协议 | 选中出站协议 | 是否转换 |
+|---|---|---|---|
+| Claude Code | `anthropic/messages` | `anthropic/messages` | 否 |
+| Codex | `openai/responses` | `openai/responses` | 否 |
+| OpenAI SDK | `openai/chat_completions` | `openai/chat_completions` | 否 |
+| Codex（覆盖仅含 chat 时） | `openai/responses` | `openai/chat_completions` | 是 |
+
+### Provider 家族路由
+
+自定义 chat 端点按渠道家族选择原生 transformer，而非通用 OpenAI transformer（通用 transformer 按 `/v1` 约定拼接 URL，对非 `/v1` 上游会产生错误地址）：
+
+| 渠道类型 | Transformer | URL 版本 |
+|---|---|---|
+| zhipu / zai（含 `*_anthropic`） | zai | v4 |
+| xiaomi（含 `xiaomi_anthropic`） | zai | v1 |
+| doubao / volcengine（含 `*_anthropic`） | doubao | v3 |
+
+家族 transformer 同时应用 provider 方言处理：剥离 `metadata`、按 6–128 字符约束裁剪 `user_id`、将 `reasoning_effort` 转换为 `thinking.type`。
+
+## 思考等级（Reasoning Effort）
+
+统一思考等级取值：`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。
+
+### 渠道级映射（ReasoningEffortMapping）
+
+在渠道 **转换选项** 中配置 `{from, to}` 列表，第一个命中的 `from` 生效。映射在 outbound 转换前统一应用，对所有客户端与所有出站协议（chat / responses / messages）生效，并同步覆盖 Anthropic 元数据中的原生 effort。
+
+### 协议转换规则
+
+- Anthropic messages：优先保留客户端原生表达（`adaptive` / `budget_tokens` 原样回环）；显式 effort 原样透传（含 `max`、`xhigh`）；`minimal` 归一为 `low`（唯一自动互转）。
+- OpenAI chat / responses：`reasoning_effort` / `reasoning.effort` 原样透传。
+- 上游不支持某等级时，原始报错直接透传给客户端；不兼容等级可通过渠道映射兜底。
 
 ## 常见问题
 

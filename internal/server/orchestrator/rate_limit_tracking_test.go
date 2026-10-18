@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/server/biz"
@@ -174,7 +175,7 @@ func TestRateLimitTracking_OnOutboundLlmStream(t *testing.T) {
 	assert.Equal(t, int64(250), tracker.GetTokenCount(channel.ID))
 }
 
-func TestRateLimitTracking_OnOutboundRawRequest(t *testing.T) {
+func TestRateLimitTracking_OnOutboundRawRequest_DoesNotIncrementRequests(t *testing.T) {
 	tracker := NewChannelRequestTracker()
 
 	entChannel := &ent.Channel{ID: 1, Name: "test-channel"}
@@ -192,16 +193,15 @@ func TestRateLimitTracking_OnOutboundRawRequest(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Increment request count multiple times
 	for range 5 {
 		_, err := middleware.OnOutboundRawRequest(ctx, nil)
 		assert.NoError(t, err)
 	}
 
-	assert.Equal(t, int64(5), tracker.GetRequestCount(channel.ID))
+	assert.Equal(t, int64(0), tracker.GetRequestCount(channel.ID))
 }
 
-func TestRateLimitTracking_Combined(t *testing.T) {
+func TestRateLimitTracking_CombinedTokenOnly(t *testing.T) {
 	tracker := NewChannelRequestTracker()
 
 	entChannel := &ent.Channel{ID: 1, Name: "test-channel"}
@@ -219,26 +219,22 @@ func TestRateLimitTracking_Combined(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Simulate a request flow
-	// 1. Request starts
+	// Simulate a request flow. RPM admission is handled before this middleware;
+	// tracking only records TPM and upstream cooldown signals.
 	_, _ = middleware.OnOutboundRawRequest(ctx, nil)
 	_, _ = middleware.OnOutboundRawRequest(ctx, nil)
 
-	// 2. Response with tokens
 	_, _ = middleware.OnOutboundLlmResponse(ctx, &llm.Response{
 		Usage: &llm.Usage{TotalTokens: 100},
 	})
 
-	// 3. Another request
 	_, _ = middleware.OnOutboundRawRequest(ctx, nil)
 
-	// 4. Another response with tokens
 	_, _ = middleware.OnOutboundLlmResponse(ctx, &llm.Response{
 		Usage: &llm.Usage{TotalTokens: 50},
 	})
 
-	// Verify both RPM and TPM are tracked
-	assert.Equal(t, int64(3), tracker.GetRequestCount(channel.ID))
+	assert.Equal(t, int64(0), tracker.GetRequestCount(channel.ID))
 	assert.Equal(t, int64(150), tracker.GetTokenCount(channel.ID))
 }
 
@@ -290,6 +286,30 @@ func TestRateLimitTracking_OnOutboundRawError_429(t *testing.T) {
 
 	// Verify channel is in cooldown
 	assert.True(t, tracker.IsCoolingDown(channel.ID))
+}
+
+func TestRateLimitTracking_OnOutboundRawError_QueueErrorIgnored(t *testing.T) {
+	tracker := NewChannelRequestTracker()
+
+	channel := &biz.Channel{Channel: &ent.Channel{ID: 7, Name: "kimi"}}
+
+	state := &PersistenceState{
+		CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+	}
+	outbound := &PersistentOutboundTransformer{state: state}
+
+	middleware := &rateLimitTracking{
+		outbound: outbound,
+		tracker:  tracker,
+	}
+
+	queueErr := asChannelQueueError(channel, ErrChannelQueueFull)
+	require.NotNil(t, queueErr)
+
+	middleware.OnOutboundRawError(context.Background(), queueErr)
+
+	assert.False(t, tracker.IsCoolingDown(channel.ID),
+		"local queue rejection must not trigger upstream-style cooldown")
 }
 
 func TestRateLimitTracking_OnOutboundRawError_429WithoutRetryAfter(t *testing.T) {

@@ -105,6 +105,16 @@ func ErrorMessage(v string) predicate.Channel {
 	return predicate.Channel(sql.FieldEQ(FieldErrorMessage, v))
 }
 
+// AutoDisabledAt applies equality check predicate on the "auto_disabled_at" field. It's identical to AutoDisabledAtEQ.
+func AutoDisabledAt(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldEQ(FieldAutoDisabledAt, v))
+}
+
+// AutoDisableExpiresAt applies equality check predicate on the "auto_disable_expires_at" field. It's identical to AutoDisableExpiresAtEQ.
+func AutoDisableExpiresAt(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldEQ(FieldAutoDisableExpiresAt, v))
+}
+
 // Remark applies equality check predicate on the "remark" field. It's identical to RemarkEQ.
 func Remark(v string) predicate.Channel {
 	return predicate.Channel(sql.FieldEQ(FieldRemark, v))
@@ -725,6 +735,106 @@ func ErrorMessageContainsFold(v string) predicate.Channel {
 	return predicate.Channel(sql.FieldContainsFold(FieldErrorMessage, v))
 }
 
+// AutoDisabledAtEQ applies the EQ predicate on the "auto_disabled_at" field.
+func AutoDisabledAtEQ(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldEQ(FieldAutoDisabledAt, v))
+}
+
+// AutoDisabledAtNEQ applies the NEQ predicate on the "auto_disabled_at" field.
+func AutoDisabledAtNEQ(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldNEQ(FieldAutoDisabledAt, v))
+}
+
+// AutoDisabledAtIn applies the In predicate on the "auto_disabled_at" field.
+func AutoDisabledAtIn(vs ...time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldIn(FieldAutoDisabledAt, vs...))
+}
+
+// AutoDisabledAtNotIn applies the NotIn predicate on the "auto_disabled_at" field.
+func AutoDisabledAtNotIn(vs ...time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldNotIn(FieldAutoDisabledAt, vs...))
+}
+
+// AutoDisabledAtGT applies the GT predicate on the "auto_disabled_at" field.
+func AutoDisabledAtGT(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldGT(FieldAutoDisabledAt, v))
+}
+
+// AutoDisabledAtGTE applies the GTE predicate on the "auto_disabled_at" field.
+func AutoDisabledAtGTE(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldGTE(FieldAutoDisabledAt, v))
+}
+
+// AutoDisabledAtLT applies the LT predicate on the "auto_disabled_at" field.
+func AutoDisabledAtLT(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldLT(FieldAutoDisabledAt, v))
+}
+
+// AutoDisabledAtLTE applies the LTE predicate on the "auto_disabled_at" field.
+func AutoDisabledAtLTE(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldLTE(FieldAutoDisabledAt, v))
+}
+
+// AutoDisabledAtIsNil applies the IsNil predicate on the "auto_disabled_at" field.
+func AutoDisabledAtIsNil() predicate.Channel {
+	return predicate.Channel(sql.FieldIsNull(FieldAutoDisabledAt))
+}
+
+// AutoDisabledAtNotNil applies the NotNil predicate on the "auto_disabled_at" field.
+func AutoDisabledAtNotNil() predicate.Channel {
+	return predicate.Channel(sql.FieldNotNull(FieldAutoDisabledAt))
+}
+
+// AutoDisableExpiresAtEQ applies the EQ predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtEQ(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldEQ(FieldAutoDisableExpiresAt, v))
+}
+
+// AutoDisableExpiresAtNEQ applies the NEQ predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtNEQ(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldNEQ(FieldAutoDisableExpiresAt, v))
+}
+
+// AutoDisableExpiresAtIn applies the In predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtIn(vs ...time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldIn(FieldAutoDisableExpiresAt, vs...))
+}
+
+// AutoDisableExpiresAtNotIn applies the NotIn predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtNotIn(vs ...time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldNotIn(FieldAutoDisableExpiresAt, vs...))
+}
+
+// AutoDisableExpiresAtGT applies the GT predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtGT(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldGT(FieldAutoDisableExpiresAt, v))
+}
+
+// AutoDisableExpiresAtGTE applies the GTE predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtGTE(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldGTE(FieldAutoDisableExpiresAt, v))
+}
+
+// AutoDisableExpiresAtLT applies the LT predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtLT(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldLT(FieldAutoDisableExpiresAt, v))
+}
+
+// AutoDisableExpiresAtLTE applies the LTE predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtLTE(v time.Time) predicate.Channel {
+	return predicate.Channel(sql.FieldLTE(FieldAutoDisableExpiresAt, v))
+}
+
+// AutoDisableExpiresAtIsNil applies the IsNil predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtIsNil() predicate.Channel {
+	return predicate.Channel(sql.FieldIsNull(FieldAutoDisableExpiresAt))
+}
+
+// AutoDisableExpiresAtNotNil applies the NotNil predicate on the "auto_disable_expires_at" field.
+func AutoDisableExpiresAtNotNil() predicate.Channel {
+	return predicate.Channel(sql.FieldNotNull(FieldAutoDisableExpiresAt))
+}
+
 // RemarkEQ applies the EQ predicate on the "remark" field.
 func RemarkEQ(v string) predicate.Channel {
 	return predicate.Channel(sql.FieldEQ(FieldRemark, v))
@@ -798,6 +908,16 @@ func RemarkEqualFold(v string) predicate.Channel {
 // RemarkContainsFold applies the ContainsFold predicate on the "remark" field.
 func RemarkContainsFold(v string) predicate.Channel {
 	return predicate.Channel(sql.FieldContainsFold(FieldRemark, v))
+}
+
+// EndpointsIsNil applies the IsNil predicate on the "endpoints" field.
+func EndpointsIsNil() predicate.Channel {
+	return predicate.Channel(sql.FieldIsNull(FieldEndpoints))
+}
+
+// EndpointsNotNil applies the NotNil predicate on the "endpoints" field.
+func EndpointsNotNil() predicate.Channel {
+	return predicate.Channel(sql.FieldNotNull(FieldEndpoints))
 }
 
 // HasRequests applies the HasEdge predicate on the "requests" edge.

@@ -16,13 +16,16 @@ import (
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
 	"github.com/looplj/axonhub/llm/transformer"
 )
 
 // buildImageGenerationAPIRequest builds the HTTP request to call the OpenAI Image Generation API.
 // based on whether images are present in the request.
 func (t *OutboundTransformer) buildImageGenerationAPIRequest(ctx context.Context, chatReq *llm.Request) (*httpclient.Request, error) {
-	chatReq.Stream = lo.ToPtr(false)
+	if chatReq.Stream != nil && *chatReq.Stream {
+		return nil, fmt.Errorf("%w: image request does not support streaming", transformer.ErrInvalidRequest)
+	}
 
 	if chatReq.Image == nil {
 		return nil, fmt.Errorf("image request is required")
@@ -43,7 +46,11 @@ func (t *OutboundTransformer) buildImageGenerationAPIRequest(ctx context.Context
 		rawReq, err = t.buildImageVariationRequest(chatReq, apiKey)
 		fmtType = llm.APIFormatOpenAIImageVariation
 	case llm.APIFormatOpenAIImageEdit:
-		rawReq, err = t.buildImageEditRequest(chatReq, apiKey)
+		if t.config.ImageEditJSON || len(chatReq.Image.ImageReferences) > len(chatReq.Image.Images) || (chatReq.Image.MaskReference != nil && len(chatReq.Image.Mask) == 0) {
+			rawReq, err = t.buildImageEditJSONRequest(chatReq, apiKey)
+		} else {
+			rawReq, err = t.buildImageEditRequest(chatReq, apiKey)
+		}
 		fmtType = llm.APIFormatOpenAIImageEdit
 	default:
 		rawReq, err = t.buildImageGenerateRequest(chatReq, apiKey)
@@ -66,8 +73,16 @@ func (t *OutboundTransformer) buildImageGenerationAPIRequest(ctx context.Context
 	return rawReq, nil
 }
 
-func isModelSupportResponseFormat(model string) bool {
-	return !strings.HasPrefix(model, "gpt-image-")
+func supportsImageGenerationResponseFormat(model string) bool {
+	return model == "dall-e-2" || model == "dall-e-3"
+}
+
+func supportsImageEditResponseFormat(model string) bool {
+	return model == "dall-e-2"
+}
+
+func supportsImageVariationResponseFormat(model string) bool {
+	return model == "" || model == "dall-e-2"
 }
 
 // buildImageGenerateRequest builds request for Image Generation API (images/generations).
@@ -87,6 +102,21 @@ func (t *OutboundTransformer) buildImageGenerateRequest(chatReq *llm.Request, ap
 
 	// Extract image generation parameters from Image field
 	img := chatReq.Image
+
+	// Forward input images for image-to-image generation (gpt-image-1)
+	if len(img.Images) > 0 {
+		dataURLs := make([]string, len(img.Images))
+		for i, data := range img.Images {
+			dataURLs[i] = encodeImageBytesToDataURL(data)
+		}
+
+		if len(dataURLs) == 1 {
+			reqBody["image"] = dataURLs[0]
+		} else {
+			reqBody["image"] = dataURLs
+		}
+	}
+
 	if img.N != nil {
 		reqBody["n"] = *img.N
 	}
@@ -123,11 +153,11 @@ func (t *OutboundTransformer) buildImageGenerateRequest(chatReq *llm.Request, ap
 		reqBody["partial_images"] = *img.PartialImages
 	}
 
-	if img.ResponseFormat != "" && isModelSupportResponseFormat(model) {
+	if img.ResponseFormat != "" && supportsImageGenerationResponseFormat(model) {
 		reqBody["response_format"] = img.ResponseFormat
 	}
 
-	if isModelSupportResponseFormat(chatReq.Model) {
+	if supportsImageGenerationResponseFormat(chatReq.Model) {
 		if _, ok := reqBody["response_format"]; !ok {
 			reqBody["response_format"] = "b64_json"
 		}
@@ -144,7 +174,7 @@ func (t *OutboundTransformer) buildImageGenerateRequest(chatReq *llm.Request, ap
 	headers.Set("Accept", "application/json")
 
 	// Build URL
-	url := t.config.BaseURL + "/images/generations"
+	url := t.imageRequestURL("/images/generations")
 
 	// Build auth config
 	auth := &httpclient.AuthConfig{
@@ -180,21 +210,12 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 	// Convert raw image bytes to FormFiles
 
 	for i, data := range chatReq.Image.Images {
-		formFiles = append(formFiles, FormFile{
-			Filename:    fmt.Sprintf("image_%d.png", i+1),
-			ContentType: "image/png",
-			Data:        data,
-			Format:      "png",
-		})
+		formFiles = append(formFiles, newImageFormFile(fmt.Sprintf("image_%d", i+1), data))
 	}
 
 	if len(chatReq.Image.Mask) > 0 {
-		maskFile = &FormFile{
-			Filename:    "mask.png",
-			ContentType: "image/png",
-			Data:        chatReq.Image.Mask,
-			Format:      "png",
-		}
+		file := newImageFormFile("mask", chatReq.Image.Mask)
+		maskFile = &file
 	}
 
 	if len(formFiles) == 0 {
@@ -209,10 +230,23 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
+	if model != "" {
+		if err := writer.WriteField("model", model); err != nil {
+			return nil, fmt.Errorf("failed to write model field: %w", err)
+		}
+
+		jsonBody["model"] = model
+	}
+
+	imageFieldName := "image"
+	if len(formFiles) > 1 {
+		imageFieldName = "image[]"
+	}
+
 	// Add images with proper MIME headers
 	for _, formFile := range formFiles {
 		h := make(textproto.MIMEHeader)
-		h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="image"; filename="%s"`, formFile.Filename))
+		h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, imageFieldName, formFile.Filename))
 		h.Set("Content-Type", formFile.ContentType)
 
 		part, err := writer.CreatePart(h)
@@ -245,15 +279,6 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 	// Add prompt
 	if err := writer.WriteField("prompt", prompt); err != nil {
 		return nil, fmt.Errorf("failed to write prompt field: %w", err)
-	}
-
-	// Add model if specified
-	if model != "" {
-		if err := writer.WriteField("model", model); err != nil {
-			return nil, fmt.Errorf("failed to write model field: %w", err)
-		}
-
-		jsonBody["model"] = model
 	}
 
 	// Extract image edit parameters from Image field
@@ -306,6 +331,13 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 			jsonBody["input_fidelity"] = img.InputFidelity
 		}
 
+		if img.Moderation != "" {
+			if err := writer.WriteField("moderation", img.Moderation); err != nil {
+				return nil, fmt.Errorf("failed to write moderation field: %w", err)
+			}
+			jsonBody["moderation"] = img.Moderation
+		}
+
 		if img.OutputCompression != nil {
 			if err := writer.WriteField("output_compression", fmt.Sprintf("%d", *img.OutputCompression)); err != nil {
 				return nil, fmt.Errorf("failed to write output_compression field: %w", err)
@@ -322,7 +354,7 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 			jsonBody["partial_images"] = *img.PartialImages
 		}
 
-		if img.ResponseFormat != "" && model != "gpt-image-1" {
+		if img.ResponseFormat != "" && supportsImageEditResponseFormat(model) {
 			if err := writer.WriteField("response_format", img.ResponseFormat); err != nil {
 				return nil, fmt.Errorf("failed to write response_format field: %w", err)
 			}
@@ -331,7 +363,7 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 		}
 	}
 
-	if model != "gpt-image-1" {
+	if supportsImageEditResponseFormat(model) {
 		if _, ok := jsonBody["response_format"]; !ok {
 			if err := writer.WriteField("response_format", "b64_json"); err != nil {
 				return nil, fmt.Errorf("failed to write response_format field: %w", err)
@@ -360,7 +392,7 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 	headers.Set("Accept", "application/json")
 
 	// Build URL
-	url := t.config.BaseURL + "/images/edits"
+	url := t.imageRequestURL("/images/edits")
 
 	// Build auth config
 	auth := &httpclient.AuthConfig{
@@ -392,12 +424,7 @@ func (t *OutboundTransformer) buildImageVariationRequest(chatReq *llm.Request, a
 
 	// Convert raw image bytes to FormFiles
 	for i, data := range chatReq.Image.Images {
-		formFiles = append(formFiles, FormFile{
-			Filename:    fmt.Sprintf("image_%d.png", i+1),
-			ContentType: "image/png",
-			Data:        data,
-			Format:      "png",
-		})
+		formFiles = append(formFiles, newImageFormFile(fmt.Sprintf("image_%d", i+1), data))
 	}
 
 	if len(formFiles) == 0 {
@@ -454,7 +481,7 @@ func (t *OutboundTransformer) buildImageVariationRequest(chatReq *llm.Request, a
 			jsonBody["size"] = img.Size
 		}
 
-		if img.ResponseFormat != "" && model != "gpt-image-1" {
+		if img.ResponseFormat != "" && supportsImageVariationResponseFormat(model) {
 			if err := writer.WriteField("response_format", img.ResponseFormat); err != nil {
 				return nil, fmt.Errorf("failed to write response_format field: %w", err)
 			}
@@ -463,7 +490,7 @@ func (t *OutboundTransformer) buildImageVariationRequest(chatReq *llm.Request, a
 		}
 	}
 
-	if model != "gpt-image-1" {
+	if supportsImageVariationResponseFormat(model) {
 		if _, ok := jsonBody["response_format"]; !ok {
 			if err := writer.WriteField("response_format", "b64_json"); err != nil {
 				return nil, fmt.Errorf("failed to write response_format field: %w", err)
@@ -482,6 +509,9 @@ func (t *OutboundTransformer) buildImageVariationRequest(chatReq *llm.Request, a
 	headers.Set("Accept", "application/json")
 
 	url := t.config.BaseURL + "/images/variations"
+	if t.config.EndpointPath != "" {
+		url = t.config.BaseURL + t.config.EndpointPath
+	}
 
 	auth := &httpclient.AuthConfig{
 		Type:   "bearer",
@@ -509,6 +539,34 @@ type FormFile struct {
 	ContentType string `json:"content_type"`
 	Data        []byte `json:"data"`
 	Format      string `json:"format"` // image format like "png", "jpeg", etc.
+}
+
+func newImageFormFile(name string, data []byte) FormFile {
+	contentType := http.DetectContentType(data)
+	extension := "png"
+	format := "png"
+
+	switch contentType {
+	case "image/jpeg":
+		extension = "jpg"
+		format = "jpg"
+	case "image/gif":
+		extension = "gif"
+		format = "gif"
+	case "image/webp":
+		extension = "webp"
+		format = "webp"
+	case "image/png":
+	default:
+		contentType = "image/png"
+	}
+
+	return FormFile{
+		Filename:    fmt.Sprintf("%s.%s", name, extension),
+		ContentType: contentType,
+		Data:        data,
+		Format:      format,
+	}
 }
 
 // transformImageGenerationResponse transforms the OpenAI Image Generation/Edit API response
@@ -540,12 +598,14 @@ func transformImageGenerationResponse(httpResp *httpclient.Response) (*llm.Respo
 
 	// Build ImageResponse
 	imageResponse := &llm.ImageResponse{
-		Created:      imgResp.Created,
-		Data:         make([]llm.ImageData, 0, len(imgResp.Data)),
-		Background:   imgResp.Background,
-		OutputFormat: imgResp.OutputFormat,
-		Quality:      imgResp.Quality,
-		Size:         imgResp.Size,
+		Created:          imgResp.Created,
+		Data:             make([]llm.ImageData, 0, len(imgResp.Data)),
+		Background:       imgResp.Background,
+		OutputFormat:     imgResp.OutputFormat,
+		Quality:          imgResp.Quality,
+		Size:             imgResp.Size,
+		SafetyIdentifier: imgResp.SafetyIdentifier,
+		Usage:            (*llm.ImageUsage)(imgResp.Usage),
 	}
 
 	// Convert usage information if present
@@ -554,17 +614,19 @@ func transformImageGenerationResponse(httpResp *httpclient.Response) (*llm.Respo
 			PromptTokens:     imgResp.Usage.InputTokens,
 			CompletionTokens: imgResp.Usage.OutputTokens,
 			TotalTokens:      imgResp.Usage.TotalTokens,
+			Cost:             imgResp.Usage.Cost,
 		}
 		if imgResp.Usage.InputTokensDetails != nil {
 			resp.Usage.PromptTokensDetails = &llm.PromptTokensDetails{
 				ImageTokens:  imgResp.Usage.InputTokensDetails.ImageTokens,
 				TextTokens:   imgResp.Usage.InputTokensDetails.TextTokens,
-				CachedTokens: imgResp.Usage.InputTokensDetails.CachedTokens,
+				CachedTokens: lo.FromPtr(imgResp.Usage.InputTokensDetails.CachedTokens),
 			}
 		}
+
 		if imgResp.Usage.OutputTokensDetails != nil {
 			resp.Usage.CompletionTokensDetails = &llm.CompletionTokensDetails{
-				ReasoningTokens: imgResp.Usage.OutputTokensDetails.ReasoningTokens,
+				ReasoningTokens: lo.FromPtr(imgResp.Usage.OutputTokensDetails.ReasoningTokens),
 			}
 		}
 	}
@@ -575,6 +637,7 @@ func transformImageGenerationResponse(httpResp *httpclient.Response) (*llm.Respo
 			B64JSON:       img.B64JSON,
 			URL:           img.URL,
 			RevisedPrompt: img.RevisedPrompt,
+			GenerationID:  img.GenerationID,
 		})
 	}
 
@@ -585,13 +648,14 @@ func transformImageGenerationResponse(httpResp *httpclient.Response) (*llm.Respo
 
 // ImagesResponse represents the response from OpenAI Image Generation/Edit API.
 type ImagesResponse struct {
-	Created      int64                `json:"created"`
-	Data         []ImageData          `json:"data"`
-	Background   string               `json:"background,omitempty"`
-	OutputFormat string               `json:"output_format,omitempty"`
-	Quality      string               `json:"quality,omitempty"`
-	Size         string               `json:"size,omitempty"`
-	Usage        *ImagesResponseUsage `json:"usage,omitempty"`
+	Created          int64                `json:"created"`
+	Data             []ImageData          `json:"data"`
+	Background       string               `json:"background,omitempty"`
+	OutputFormat     string               `json:"output_format,omitempty"`
+	Quality          string               `json:"quality,omitempty"`
+	Size             string               `json:"size,omitempty"`
+	Usage            *ImagesResponseUsage `json:"usage,omitempty"`
+	SafetyIdentifier json.RawMessage      `json:"safety_identifier,omitempty"`
 }
 
 // ImageData represents a single image in the response.
@@ -599,28 +663,17 @@ type ImageData struct {
 	B64JSON       string `json:"b64_json,omitempty"`
 	URL           string `json:"url,omitempty"`
 	RevisedPrompt string `json:"revised_prompt,omitempty"`
+	GenerationID  string `json:"generation_id,omitempty"`
 }
 
 // ImagesResponseUsage represents usage information for image generation.
-type ImagesResponseUsage struct {
-	InputTokens         int64                                   `json:"input_tokens"`
-	OutputTokens        int64                                   `json:"output_tokens"`
-	TotalTokens         int64                                   `json:"total_tokens"`
-	InputTokensDetails  *ImagesResponseUsageInputTokensDetails  `json:"input_tokens_details,omitempty"`
-	OutputTokensDetails *ImagesResponseUsageOutputTokensDetails `json:"output_tokens_details,omitempty"`
-}
+type ImagesResponseUsage llm.ImageUsage
 
 // ImagesResponseUsageInputTokensDetails represents detailed input token information.
-type ImagesResponseUsageInputTokensDetails struct {
-	ImageTokens  int64 `json:"image_tokens"`
-	TextTokens   int64 `json:"text_tokens"`
-	CachedTokens int64 `json:"cached_tokens,omitempty"`
-}
+type ImagesResponseUsageInputTokensDetails = llm.ImageInputTokensDetails
 
 // ImagesResponseUsageOutputTokensDetails represents detailed output token information.
-type ImagesResponseUsageOutputTokensDetails struct {
-	ReasoningTokens int64 `json:"reasoning_tokens,omitempty"`
-}
+type ImagesResponseUsageOutputTokensDetails = llm.ImageOutputTokensDetails
 
 // extractFile extracts base64 image data and returns FormFile.
 func extractFile(url string) (FormFile, error) {
@@ -664,4 +717,15 @@ func extractFile(url string) (FormFile, error) {
 	}
 
 	return FormFile{}, fmt.Errorf("%w: only data URLs are supported for image editing", transformer.ErrInvalidRequest)
+}
+
+// encodeImageBytesToDataURL encodes raw image bytes to a base64 data URL
+// suitable for JSON API request bodies (e.g. the image field in images/generations).
+func encodeImageBytesToDataURL(data []byte) string {
+	contentType := http.DetectContentType(data)
+	if !strings.HasPrefix(contentType, "image/") {
+		contentType = "image/png"
+	}
+
+	return xurl.BuildDataURL(contentType, base64.StdEncoding.EncodeToString(data), true)
 }

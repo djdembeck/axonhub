@@ -1,12 +1,16 @@
 package biz
 
 import (
-	"github.com/zhenzou/executors"
+	"context"
 
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
+
+func (svc *ChannelService) PreloadModelPricesForTest(ctx context.Context, ch *Channel) {
+	svc.preloadModelPrices(ctx, ch)
+}
 
 func NewChannelServiceForTest(client *ent.Client) *ChannelService {
 	mockSysSvc := &SystemService{
@@ -18,7 +22,6 @@ func NewChannelServiceForTest(client *ent.Client) *ChannelService {
 
 	svc := NewChannelService(ChannelServiceParams{
 		CacheConfig:   xcache.Config{Mode: xcache.ModeMemory},
-		Executor:      executors.NewPoolScheduleExecutor(),
 		Ent:           client,
 		SystemService: mockSysSvc,
 		HttpClient:    httpclient.NewHttpClient(),

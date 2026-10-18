@@ -85,7 +85,7 @@ func TestCodexHandlers_StartOAuth_DoesNotIncludeOriginatorParam(t *testing.T) {
 	require.Equal(t, resp.SessionID, query.Get("state"))
 }
 
-func TestCodexHandlers_Exchange_StateDeletedOnTokenExchangeFailure(t *testing.T) {
+func TestCodexHandlers_Exchange_RetainsStateOnTokenExchangeFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var tokenCalls int
@@ -94,8 +94,12 @@ func TestCodexHandlers_Exchange_StateDeletedOnTokenExchangeFailure(t *testing.T)
 		tokenCalls++
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte(`{"error":"bad_gateway"}`))
+		if tokenCalls == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":"bad_gateway"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"a","refresh_token":"r","expires_in":3600,"token_type":"bearer"}`))
 	}))
 	t.Cleanup(tokenServer.Close)
 
@@ -159,8 +163,8 @@ func TestCodexHandlers_Exchange_StateDeletedOnTokenExchangeFailure(t *testing.T)
 
 	exchangeW2 := httptest.NewRecorder()
 	router.ServeHTTP(exchangeW2, exchangeReq2)
-	require.Equal(t, http.StatusBadRequest, exchangeW2.Code)
-	require.Contains(t, exchangeW2.Body.String(), "invalid or expired oauth session")
+	require.Equal(t, http.StatusOK, exchangeW2.Code)
+	require.Equal(t, 2, tokenCalls)
 }
 
 func TestCodexHandlers_Exchange_RejectsStateMismatch(t *testing.T) {
@@ -241,8 +245,7 @@ func TestCodexHandlers_Exchange_RejectsStateMismatch(t *testing.T) {
 
 	exchangeW2 := httptest.NewRecorder()
 	router.ServeHTTP(exchangeW2, exchangeReq2)
-	require.Equal(t, http.StatusBadRequest, exchangeW2.Code)
-	require.Contains(t, exchangeW2.Body.String(), "invalid or expired oauth session")
+	require.Equal(t, http.StatusOK, exchangeW2.Code)
 }
 
 func TestCodexHandlers_Exchange_DeletesStateOnSuccess(t *testing.T) {
@@ -317,4 +320,31 @@ func TestCodexHandlers_Exchange_DeletesStateOnSuccess(t *testing.T) {
 	router.ServeHTTP(exchangeW2, exchangeReq2)
 	require.Equal(t, http.StatusBadRequest, exchangeW2.Code)
 	require.Contains(t, exchangeW2.Body.String(), "invalid or expired oauth session")
+}
+
+func TestCodexHandlers_DecodeAuthJSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := NewCodexHandlers(CodexHandlersParams{
+		CacheConfig: xcache.Config{Mode: xcache.ModeMemory},
+		HttpClient:  httpclient.NewHttpClient(),
+	})
+
+	router := gin.New()
+	router.POST("/admin/codex/auth/decode", h.DecodeAuthJSON)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/codex/auth/decode", bytes.NewBufferString(`{
+		"auth_json":"{\"auth_mode\":\"chatgpt\",\"last_refresh\":\"2026-04-17T08:58:36.389Z\",\"tokens\":{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"id_token\":\"id\"}}"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp DecodeCodexAuthJSONResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Contains(t, resp.Credentials, `"client_id":"`+codex.ClientID+`"`)
+	require.Contains(t, resp.Credentials, `"access_token":"access"`)
+	require.Contains(t, resp.Credentials, `"token_type":"bearer"`)
 }

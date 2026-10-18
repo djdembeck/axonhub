@@ -14,11 +14,12 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/samber/lo"
 	"github.com/spf13/afero"
 	"github.com/spf13/afero/gcsfs"
 	"github.com/studio-b12/gowebdav"
-	"github.com/zhenzou/executors"
 	"go.uber.org/fx"
 	"golang.org/x/oauth2/google"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 	"github.com/looplj/axonhub/internal/pkg/xerrors"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 )
 
 // DataStorageService handles data storage operations.
@@ -43,12 +45,14 @@ type DataStorageService struct {
 
 	SystemService *SystemService
 	Cache         xcache.Cache[ent.DataStorage]
-	Executors     executors.ScheduledExecutor
 
 	// fsCache caches afero filesystem instances by data storage ID
-	fsCache      map[int]afero.Fs
-	fsCacheMu    sync.RWMutex
-	latestUpdate time.Time
+	fsCache map[int]afero.Fs
+	// objectStoreCache caches native object-store clients (S3) by data storage ID.
+	// Guarded by fsCacheMu and invalidated in lockstep with fsCache.
+	objectStoreCache map[int]ObjectStore
+	fsCacheMu        sync.RWMutex
+	latestUpdate     time.Time
 }
 
 // DataStorageServiceParams holds the dependencies for DataStorageService.
@@ -57,7 +61,6 @@ type DataStorageServiceParams struct {
 
 	SystemService *SystemService
 	CacheConfig   xcache.Config
-	Executor      executors.ScheduledExecutor
 	Client        *ent.Client
 }
 
@@ -67,21 +70,23 @@ func NewDataStorageService(params DataStorageServiceParams) *DataStorageService 
 		AbstractService: &AbstractService{
 			db: params.Client,
 		},
-		SystemService: params.SystemService,
-		Cache:         xcache.NewFromConfig[ent.DataStorage](params.CacheConfig),
-		Executors:     params.Executor,
-		fsCache:       make(map[int]afero.Fs),
+		SystemService:    params.SystemService,
+		Cache:            xcache.NewFromConfig[ent.DataStorage](params.CacheConfig),
+		fsCache:          make(map[int]afero.Fs),
+		objectStoreCache: make(map[int]ObjectStore),
 	}
 	svc.reloadFileSystemsPeriodically(context.Background())
 
-	if _, err := svc.Executors.ScheduleFuncAtCronRate(
-		svc.reloadFileSystemsPeriodically,
-		executors.CRONRule{Expr: "*/1 * * * *"},
-	); err != nil {
-		log.Error(context.Background(), "failed to schedule data storage filesystem refresh", log.Cause(err))
-	}
-
 	return svc
+}
+
+func (s *DataStorageService) RegisterScheduledTasks(ctx context.Context, sched *scheduler.Scheduler) error {
+	return sched.Register(ctx, scheduler.TaskSpec{
+		Name:        "datastorage-fs-reload",
+		Description: "Refresh data storage filesystem cache every minute",
+		CronExpr:    "*/1 * * * *",
+		Timezone:    "UTC",
+	}, s.reloadFileSystemsPeriodically)
 }
 
 func (s *DataStorageService) refreshFileSystems(ctx context.Context) error {
@@ -134,6 +139,8 @@ func (s *DataStorageService) refreshFileSystems(ctx context.Context) error {
 
 	s.fsCacheMu.Lock()
 	s.fsCache = newCache
+	// Drop cached native object-store clients so changed configs are rebuilt lazily.
+	s.objectStoreCache = make(map[int]ObjectStore)
 	s.fsCacheMu.Unlock()
 
 	log.Info(ctx, "refreshed data storage filesystems", log.Int("count", len(newCache)))
@@ -369,6 +376,7 @@ func (s *DataStorageService) InvalidateAllDataStorageCache(ctx context.Context) 
 	// Also clear filesystem cache
 	s.fsCacheMu.Lock()
 	s.fsCache = make(map[int]afero.Fs)
+	s.objectStoreCache = make(map[int]ObjectStore)
 	s.fsCacheMu.Unlock()
 
 	s.latestUpdate = time.Time{}
@@ -380,13 +388,25 @@ func (s *DataStorageService) InvalidateAllDataStorageCache(ctx context.Context) 
 func (s *DataStorageService) InvalidateFsCache(id int) error {
 	s.fsCacheMu.Lock()
 	delete(s.fsCache, id)
+	delete(s.objectStoreCache, id)
 	s.fsCacheMu.Unlock()
 
 	return nil
 }
 
-// createS3Fs creates an S3 filesystem using the afero-s3 adapter.
-func (s *DataStorageService) createS3Fs(ctx context.Context, s3Config *objects.S3) (afero.Fs, error) {
+// newS3Client builds an aws-sdk-go-v2 S3 client from the given config. It uses
+// an adaptive retryer (client-side rate limiting + backoff/jitter) so throttling
+// (HTTP 503 SlowDown) does not trigger a retry storm that multiplies Class A
+// operations under load. The client is shared by createS3Fs (the afero adapter
+// used by GetFileSystem) and the native s3ObjectStore (byte Save/Load/Delete).
+func newS3Client(ctx context.Context, s3Config *objects.S3) (*awss3.Client, error) {
+	return newS3ClientWithHTTPClient(ctx, s3Config, nil)
+}
+
+// newS3ClientWithHTTPClient is newS3Client with an optional custom HTTP client.
+// Production passes nil so the SDK builds its own client; tests inject the
+// httptest TLS server's client to exercise the real request-signing path.
+func newS3ClientWithHTTPClient(ctx context.Context, s3Config *objects.S3, httpClient aws.HTTPClient) (*awss3.Client, error) {
 	credProvider := awscredentials.NewStaticCredentialsProvider(
 		s3Config.AccessKey,
 		s3Config.SecretKey,
@@ -396,6 +416,27 @@ func (s *DataStorageService) createS3Fs(ctx context.Context, s3Config *objects.S
 	loadOptions := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(s3Config.Region),
 		awsconfig.WithCredentialsProvider(credProvider),
+		// Disable the SDK's default trailing (streaming) checksums. Since
+		// aws-sdk-go-v2 v1.26 the default is RequestChecksumCalculationWhenSupported,
+		// which makes PutObject compute a CRC32 and, over HTTPS, send it as an
+		// aws-chunked trailer (Content-Encoding: aws-chunked, x-amz-trailer, and
+		// x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER). Aliyun OSS's
+		// S3-compatible API does not implement aws-chunked trailers: it accepted
+		// the upload with HTTP 200 but stored a 0-byte object, while Cloudflare R2
+		// (which does support the trailer) worked. WhenRequired keeps checksums
+		// available for callers that explicitly ask for one (e.g.
+		// ChecksumAlgorithm on the input) while sending a plain signed payload by
+		// default, which every S3-compatible store accepts.
+		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		// Likewise only validate response checksums when the operation requires
+		// it, so stores that omit x-amz-checksum-* headers are not rejected.
+		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+		awsconfig.WithRetryer(func() aws.Retryer {
+			return retry.AddWithMaxAttempts(retry.NewAdaptiveMode(), 3)
+		}),
+	}
+	if httpClient != nil {
+		loadOptions = append(loadOptions, awsconfig.WithHTTPClient(httpClient))
 	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOptions...)
@@ -403,18 +444,29 @@ func (s *DataStorageService) createS3Fs(ctx context.Context, s3Config *objects.S
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	client := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
+	return awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
 		if s3Config.Endpoint != "" {
 			o.BaseEndpoint = lo.ToPtr(s3Config.Endpoint)
 		}
 		// Enable Path Style access for S3 compatible storage services (e.g., MinIO, Ceph RGW)
 		o.UsePathStyle = s3Config.PathStyle
-	})
+	}), nil
+}
 
-	baseFs := s3fs.NewFsFromClient(s3Config.BucketName, client)
-	cachedFs := afero.NewCacheOnReadFs(baseFs, afero.NewMemMapFs(), 5*time.Minute)
+// createS3Fs creates an S3 filesystem using the afero-s3 adapter.
+func (s *DataStorageService) createS3Fs(ctx context.Context, s3Config *objects.S3) (afero.Fs, error) {
+	client, err := newS3Client(ctx, s3Config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create s3 client: %w", err)
+	}
 
-	return cachedFs, nil
+	// NOTE: do NOT wrap baseFs in afero.NewCacheOnReadFs(..., afero.NewMemMapFs(), ...).
+	// That in-memory layer is never evicted (afero's cacheTime only re-checks
+	// freshness on read), so it retained a copy of every request/response body
+	// ever written and caused recurring OOMs. Request/response bodies are
+	// write-once and read rarely (admin request-detail view), so reads go
+	// directly to the object store instead of through an in-memory cache.
+	return s3fs.NewFsFromClient(s3Config.BucketName, client), nil
 }
 
 // createGcsFs creates a GCS filesystem using the afero gcsfs adapter.
@@ -437,11 +489,10 @@ func (s *DataStorageService) createGcsFs(ctx context.Context, gcsConfig *objects
 		return nil, fmt.Errorf("failed to create GCS filesystem: %w", err)
 	}
 
-	basePathFs := afero.NewBasePathFs(fs, gcsConfig.BucketName)
-
-	cachedFs := afero.NewCacheOnReadFs(basePathFs, afero.NewMemMapFs(), 5*time.Minute)
-
-	return cachedFs, nil
+	// NOTE: do NOT wrap in afero.NewCacheOnReadFs(..., afero.NewMemMapFs(), ...).
+	// The in-memory layer is never evicted and leaks every body forever (see
+	// createS3Fs). Reads go directly to the object store.
+	return afero.NewBasePathFs(fs, gcsConfig.BucketName), nil
 }
 
 // createWebDAVFs creates a WebDAV filesystem using the afero-webdav adapter.
@@ -509,6 +560,14 @@ func (s *DataStorageService) SaveData(ctx context.Context, ds *ent.DataStorage, 
 	case datastorage.TypeDatabase:
 		return nil
 	case datastorage.TypeFs, datastorage.TypeS3, datastorage.TypeGcs, datastorage.TypeWebdav:
+		// Object-store backends (S3) write in a single PutObject via a native
+		// client; other backends fall back to the afero filesystem path below.
+		if store, ok, err := s.objectStoreFor(ctx, ds); err != nil {
+			return err
+		} else if ok {
+			return store.PutObject(ctx, normalizeObjectKey(key), data)
+		}
+
 		// For file-based storage, write to file system
 		fs, err := s.GetFileSystem(ctx, ds)
 		if err != nil {
@@ -531,22 +590,16 @@ func (s *DataStorageService) SaveData(ctx context.Context, ds *ent.DataStorage, 
 			}
 		}
 
-		if ds.Type != datastorage.TypeFs {
-			// For S3 with PathStyle enabled, remove leading slash from key
-			// to avoid InvalidArgument error from S3 compatible storage services
-			if isS3PathStyle(ds) {
-				key = strings.TrimPrefix(key, "/")
-			}
-
-			f, err := fs.Create(key)
-			if err != nil {
-				return fmt.Errorf("failed to create file: %w, key: %s", err, key)
-			}
-
-			_ = f.Close()
+		// For S3 with PathStyle enabled, remove leading slash from key
+		// to avoid InvalidArgument error from S3 compatible storage services
+		if isS3PathStyle(ds) {
+			key = strings.TrimPrefix(key, "/")
 		}
 
-		// Write data to file
+		// Write data to file. afero.WriteFile creates the object in a single
+		// write. We deliberately do NOT pre-create it with fs.Create()+Close():
+		// on object stores (afero-s3) that issued two extra empty PutObject
+		// (Class A) calls per save with no benefit.
 		if err := afero.WriteFile(fs, key, data, 0o777); err != nil {
 			return fmt.Errorf("failed to write file: %w, key: %s", err, key)
 		}
@@ -565,6 +618,21 @@ func (s *DataStorageService) SaveDataFromReader(ctx context.Context, ds *ent.Dat
 	case datastorage.TypeDatabase:
 		return "", 0, fmt.Errorf("database storage does not support streaming writes")
 	case datastorage.TypeFs, datastorage.TypeS3, datastorage.TypeGcs, datastorage.TypeWebdav:
+		// Object-store backends (S3) stream via a native uploader with a tuned
+		// part size; other backends fall back to the afero filesystem path below.
+		if store, ok, err := s.objectStoreFor(ctx, ds); err != nil {
+			return "", 0, err
+		} else if ok {
+			nk := normalizeObjectKey(key)
+
+			n, err := store.PutObjectStream(ctx, nk, r, -1)
+			if err != nil {
+				return "", 0, err
+			}
+
+			return nk, n, nil
+		}
+
 		fs, err := s.GetFileSystem(ctx, ds)
 		if err != nil {
 			return "", 0, fmt.Errorf("failed to get file system: %w", err)
@@ -585,7 +653,10 @@ func (s *DataStorageService) SaveDataFromReader(ctx context.Context, ds *ent.Dat
 			key = strings.TrimPrefix(key, "/")
 		}
 
-		f, err := fs.Create(key)
+		// Open for writing without pre-creating the object. On object stores,
+		// fs.Create() issues a redundant empty PutObject (Class A) before the
+		// real upload; OpenFile only sets up the write stream.
+		f, err := fs.OpenFile(key, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o777)
 		if err != nil {
 			return "", 0, fmt.Errorf("failed to create file: %w, key: %s", err, key)
 		}
@@ -611,6 +682,14 @@ func (s *DataStorageService) DeleteData(ctx context.Context, ds *ent.DataStorage
 	case datastorage.TypeDatabase:
 		return nil
 	case datastorage.TypeFs, datastorage.TypeS3, datastorage.TypeGcs, datastorage.TypeWebdav:
+		// Object-store backends (S3) delete with a single idempotent DeleteObject
+		// (no pre-Stat / ListObjectsV2); other backends fall back to afero below.
+		if store, ok, err := s.objectStoreFor(ctx, ds); err != nil {
+			return err
+		} else if ok {
+			return store.DeleteObject(ctx, normalizeObjectKey(key))
+		}
+
 		fs, err := s.GetFileSystem(ctx, ds)
 		if err != nil {
 			return fmt.Errorf("failed to get file system: %w", err)
@@ -647,6 +726,14 @@ func (s *DataStorageService) LoadData(ctx context.Context, ds *ent.DataStorage, 
 		// For database storage, the key is the data itself
 		return []byte(key), nil
 	case datastorage.TypeFs, datastorage.TypeS3, datastorage.TypeGcs, datastorage.TypeWebdav:
+		// Object-store backends (S3) read with a single GetObject; a missing key
+		// returns os.ErrNotExist (no ListObjectsV2). Others fall back to afero.
+		if store, ok, err := s.objectStoreFor(ctx, ds); err != nil {
+			return nil, err
+		} else if ok {
+			return store.GetObject(ctx, normalizeObjectKey(key))
+		}
+
 		// For file-based storage, read from file system
 		fs, err := s.GetFileSystem(ctx, ds)
 		if err != nil {

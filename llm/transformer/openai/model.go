@@ -95,6 +95,15 @@ type Request struct {
 
 	// Verbosity constrains response verbosity.
 	Verbosity *string `json:"verbosity,omitempty"`
+
+	// Thinking controls reasoning/thinking behavior (used by DeepSeek and compatible providers).
+	Thinking *Thinking `json:"thinking,omitempty"`
+}
+
+// Thinking represents the thinking configuration for reasoning models.
+type Thinking struct {
+	// Type is "enabled" or "disabled".
+	Type string `json:"type"`
 }
 
 // StreamOptions for streaming responses.
@@ -129,6 +138,7 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		s.Stop = &str
 		s.MultipleStop = nil
+
 		return nil
 	}
 
@@ -138,6 +148,7 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		s.Stop = nil
 		s.MultipleStop = strs
+
 		return nil
 	}
 
@@ -179,6 +190,10 @@ type Message struct {
 type Annotation struct {
 	// Type is the type of annotation, e.g., "url_citation"
 	Type string `json:"type,omitempty"`
+	// StartIndex is the start byte offset of the annotated span in the message content.
+	StartIndex *int64 `json:"start_index,omitempty"`
+	// EndIndex is the end byte offset of the annotated span in the message content.
+	EndIndex *int64 `json:"end_index,omitempty"`
 	// URLCitation contains URL citation details when Type is "url_citation"
 	URLCitation *URLCitation `json:"url_citation,omitempty"`
 }
@@ -225,6 +240,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		c.Content = &str
 		c.MultipleContent = nil
+
 		return nil
 	}
 
@@ -234,6 +250,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	if err == nil {
 		c.Content = nil
 		c.MultipleContent = parts
+
 		return nil
 	}
 
@@ -247,6 +264,13 @@ type MessageContentPart struct {
 	ImageURL   *ImageURL   `json:"image_url,omitempty"`
 	VideoURL   *VideoURL   `json:"video_url,omitempty"`
 	InputAudio *InputAudio `json:"input_audio,omitempty"`
+	File       *File       `json:"file,omitempty"`
+}
+
+type File struct {
+	FileData string `json:"file_data,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	Filename string `json:"filename,omitempty"`
 }
 
 // ImageURL represents an image URL with optional detail level.
@@ -365,7 +389,7 @@ type Function struct {
 
 // FunctionCall represents a function call.
 type FunctionCall struct {
-	Name      string `json:"name"`
+	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
 }
 
@@ -400,6 +424,9 @@ type ToolFunction struct {
 type ToolChoice struct {
 	ToolChoice      *string          `json:"tool_choice,omitempty"`
 	NamedToolChoice *NamedToolChoice `json:"named_tool_choice,omitempty"`
+	// AllowedTools carries the mode and tool subset of an "allowed_tools"
+	// choice, which the Chat Completions wire nests under "allowed_tools".
+	AllowedTools *AllowedTools `json:"allowed_tools,omitempty"`
 }
 
 // NamedToolChoice represents a named tool choice.
@@ -408,7 +435,32 @@ type NamedToolChoice struct {
 	Function ToolFunction `json:"function"`
 }
 
+// AllowedTools is the nested object of an "allowed_tools" tool choice.
+// Each entry references a permitted tool with the same shape as a named choice.
+type AllowedTools struct {
+	Mode  *string           `json:"mode,omitempty"`
+	Tools []NamedToolChoice `json:"tools,omitempty"`
+}
+
+// allowedToolsToolChoiceJSON is the Chat Completions wire shape of an
+// "allowed_tools" choice; the mode and tool subset live in a nested object.
+type allowedToolsToolChoiceJSON struct {
+	Type         string        `json:"type"`
+	AllowedTools *AllowedTools `json:"allowed_tools"`
+}
+
 func (t ToolChoice) MarshalJSON() ([]byte, error) {
+	// An allowed_tools choice must keep the nested shape; marshaling it as a
+	// plain named choice would emit an empty function name and drop the subset.
+	if t.NamedToolChoice != nil && t.NamedToolChoice.Type == "allowed_tools" {
+		allowed := t.AllowedTools
+		if allowed == nil {
+			allowed = &AllowedTools{}
+		}
+
+		return json.Marshal(allowedToolsToolChoiceJSON{Type: "allowed_tools", AllowedTools: allowed})
+	}
+
 	if t.ToolChoice != nil {
 		return json.Marshal(t.ToolChoice)
 	}
@@ -422,6 +474,16 @@ func (t *ToolChoice) UnmarshalJSON(data []byte) error {
 	err := json.Unmarshal(data, &str)
 	if err == nil {
 		t.ToolChoice = &str
+		return nil
+	}
+
+	// An allowed_tools choice nests its mode and tool subset; decode it before
+	// the plain named shape, which would silently drop the nested object.
+	var allowed allowedToolsToolChoiceJSON
+	if err := json.Unmarshal(data, &allowed); err == nil && allowed.Type == "allowed_tools" && allowed.AllowedTools != nil {
+		t.NamedToolChoice = &NamedToolChoice{Type: allowed.Type}
+		t.AllowedTools = allowed.AllowedTools
+
 		return nil
 	}
 
