@@ -335,13 +335,14 @@ endpoint `base_url` instead of `https://api.nano-gpt.com`.
 }
 ```
 
-**Manual model entry:** decision models are not listed in the providers'
-`GET /models` catalogs. Add the model id manually to the channel's supported
-models, then create a model-association condition with request format
-`typesafe/systemone` so that model routes to the System One endpoint. Example
-models: `typesafe/jev-1.13`, `liquid/d1`, `inception/mercury-decide` on
-OpenRouter; `typesafe/jev-1.13`, `llmtech/decider-*`, `liquid/d1`,
-`perplexity/pplx-decider-v1.1-27b`, `cloudflare/clef[-flash]` on NanoGPT.
+**Model entry:** OpenRouter does not list its decision models in `GET /models`,
+so add the model id manually to the channel's supported models (e.g.
+`typesafe/jev-1.13`, `liquid/d1`, `inception/mercury-decide`). NanoGPT lists
+its decision models in `GET /models` (e.g. `typesafe/jev-1.13`,
+`llmtech/decider-*`, `liquid/d1`, `perplexity/pplx-decider-v1.1-27b`,
+`cloudflare/clef[-flash]`), so they can be fetched into the channel as usual.
+For either provider, create a model-association condition with request format
+`typesafe/systemone` so the decision model routes to the System One endpoint.
 
 `typesafe/systemone` remains an opt-in custom endpoint on these channels; it
 is never added as a default.

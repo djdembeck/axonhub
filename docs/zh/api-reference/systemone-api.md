@@ -333,13 +333,13 @@ chat/models 路由正常工作：
 }
 ```
 
-**手动添加模型**：决策模型不出现在各服务商的 `GET /models` 目录中。请手动将
-模型 id 添加到渠道的受支持模型列表，然后创建一条请求格式为
-`typesafe/systemone` 的模型关联规则，使该模型路由到 System One 端点。示例
-模型：OpenRouter 提供 `typesafe/jev-1.13`、`liquid/d1`、
-`inception/mercury-decide`；NanoGPT 提供 `typesafe/jev-1.13`、
-`llmtech/decider-*`、`liquid/d1`、`perplexity/pplx-decider-v1.1-27b`、
-`cloudflare/clef[-flash]`。
+**模型录入**：OpenRouter 的 `GET /models` 中不包含其决策模型，请手动将模型
+id 添加到渠道的受支持模型列表（例如 `typesafe/jev-1.13`、`liquid/d1`、
+`inception/mercury-decide`）。NanoGPT 的 `GET /models` 中列有其决策模型
+（例如 `typesafe/jev-1.13`、`llmtech/decider-*`、`liquid/d1`、
+`perplexity/pplx-decider-v1.1-27b`、`cloudflare/clef[-flash]`），因此可以像
+平常一样将它们拉取到渠道中。对于任一服务商，都请创建一条请求格式为
+`typesafe/systemone` 的模型关联条件，使决策模型路由到 System One 端点。
 
 `typesafe/systemone` 在这些渠道上始终是可选的自定义端点，永远不会作为默认
 端点添加。
