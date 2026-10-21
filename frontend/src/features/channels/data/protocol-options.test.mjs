@@ -159,9 +159,13 @@ test('shows the OpenAI Decisions endpoint only for the OpenAI create/edit channe
   }
 });
 
-test('keeps the SystemOne endpoint option unchanged when openai/decisions is offered', () => {
+test('offers the SystemOne endpoint only for the allowed channel types', () => {
   assert.deepEqual(getConfigurableApiFormatsForChannelType('typesafe', configurableFormats), ['typesafe/systemone']);
-  assert.ok(!getConfigurableApiFormatsForChannelType('openai', configurableFormats).includes('typesafe/systemone'));
+  for (const channelType of ['openai', 'openrouter', 'nanogpt', 'nanogpt_responses']) {
+    const formats = getConfigurableApiFormatsForChannelType(channelType, configurableFormats);
+    assert.ok(formats.includes('typesafe/systemone'), `${channelType} should offer typesafe/systemone in the UI`);
+  }
+  assert.ok(!getConfigurableApiFormatsForChannelType('anthropic', configurableFormats).includes('typesafe/systemone'));
 });
 
 test('accepts openai/decisions in the API-format schema and configurable endpoint list', () => {

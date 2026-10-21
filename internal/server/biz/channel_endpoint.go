@@ -350,6 +350,17 @@ var defaultEndpointsForChannelType = map[channel.Type][]objects.ChannelEndpoint{
 	},
 }
 
+// systemOneAllowedChannelTypes lists channel types that may expose a
+// typesafe/systemone endpoint. TypeSafe is native; the others are opt-in for
+// providers that expose a System One-compatible Decisions API (OpenAI, OpenRouter, NanoGPT).
+var systemOneAllowedChannelTypes = map[channel.Type]struct{}{
+	channel.TypeTypesafe:         {},
+	channel.TypeOpenai:           {},
+	channel.TypeOpenrouter:       {},
+	channel.TypeNanogpt:          {},
+	channel.TypeNanogptResponses: {},
+}
+
 func validateEndpointsForChannelType(channelType channel.Type, endpoints []objects.ChannelEndpoint, baseURL ...string) error {
 	if err := ValidateEndpoints(endpoints, baseURL...); err != nil {
 		return err
@@ -364,8 +375,10 @@ func validateEndpointsForChannelType(channelType channel.Type, endpoints []objec
 	}
 
 	for _, endpoint := range endpoints {
-		if endpoint.APIFormat == llm.APIFormatTypeSafeSystemOne.String() && channelType != channel.TypeTypesafe {
-			return fmt.Errorf("api_format %q is only supported by TypeSafe channel types", endpoint.APIFormat)
+		if endpoint.APIFormat == llm.APIFormatTypeSafeSystemOne.String() {
+			if _, ok := systemOneAllowedChannelTypes[channelType]; !ok {
+				return fmt.Errorf("api_format %q is only supported by TypeSafe, OpenAI, OpenRouter, and NanoGPT channel types", endpoint.APIFormat)
+			}
 		}
 	}
 

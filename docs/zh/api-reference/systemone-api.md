@@ -6,6 +6,8 @@ AxonHub 原生支持 **System One** 决策推理 API，并首发支持 **TypeSaf
 
 System One 源于认知心理学中的“系统一”（快速、直觉、确定性决策）概念。不同于逐字生成自由文本的传统生成式大语言模型（LLM），System One 专注于在给定状态（State）上下文下进行快速、高置信度、带校准概率的离散决策与评估。
 
+除 TypeSafe 外，**OpenRouter** 与 **NanoGPT** 也提供与 System One 兼容的决策 API。两者均可通过相同的 `POST /v1/systemone` 路由访问：在对应渠道上配置 `typesafe/systemone` 自定义端点即可，详见下文「4. OpenRouter 与 NanoGPT 渠道」。
+
 > [!IMPORTANT]
 > **System One 不等于 Chat Completion**
 > - System One 是与 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、Embedding、Rerank 平级的**原生一级 API Format**。
@@ -299,6 +301,48 @@ func main() {
 ### 3. 故障转移与重试（Failover）
 - **429（限流）/ 529（上游过载）**：AxonHub 自动识别并触发渠道重试或故障转移到备用 TypeSafe 渠道。
 - **401（鉴权失败）/ 422（参数校验错误）**：精准透传上游错误信息，不进行无效的无限重试。
+
+### 4. OpenRouter 与 NanoGPT 渠道
+OpenRouter 与 NanoGPT 原生使用 System One 线协议，因此无需任何格式转换。
+在渠道上配置 `typesafe/systemone` 自定义端点后，向 `POST /v1/systemone`
+发送标准 System One 请求体（`{model, state, questions}`），响应为
+`{model, answers, usage}`。
+
+**渠道基础 URL**：请保持渠道 `base_url` 为服务商默认值，以保证渠道现有的
+chat/models 路由正常工作：
+
+- OpenRouter：`https://openrouter.ai/api/v1`
+- NanoGPT：`https://nano-gpt.com/api/v1`
+
+**自定义端点**：端点自身的 `base_url` 对该端点具有最高优先级，因此请为端点
+配置服务商的决策 API 路径——不要修改渠道基础 URL（否则会破坏渠道默认路由）：
+
+| 服务商 | 端点 `base_url` | 端点 `path` | 上游 URL |
+| :--- | :--- | :--- | :--- |
+| OpenRouter | `https://openrouter.ai` | `/api/alpha/decisions` | `https://openrouter.ai/api/alpha/decisions` |
+| NanoGPT | `https://api.nano-gpt.com` | `/api/v1/decisions` | `https://api.nano-gpt.com/api/v1/decisions` |
+
+对于 NanoGPT 的 PPLX Decider/Clef/图像模型，端点 `base_url` 请使用
+`https://nano-gpt.com` 而不是 `https://api.nano-gpt.com`。
+
+```json
+{
+  "api_format": "typesafe/systemone",
+  "base_url": "https://openrouter.ai",
+  "path": "/api/alpha/decisions"
+}
+```
+
+**手动添加模型**：决策模型不出现在各服务商的 `GET /models` 目录中。请手动将
+模型 id 添加到渠道的受支持模型列表，然后创建一条请求格式为
+`typesafe/systemone` 的模型关联规则，使该模型路由到 System One 端点。示例
+模型：OpenRouter 提供 `typesafe/jev-1.13`、`liquid/d1`、
+`inception/mercury-decide`；NanoGPT 提供 `typesafe/jev-1.13`、
+`llmtech/decider-*`、`liquid/d1`、`perplexity/pplx-decider-v1.1-27b`、
+`cloudflare/clef[-flash]`。
+
+`typesafe/systemone` 在这些渠道上始终是可选的自定义端点，永远不会作为默认
+端点添加。
 
 ---
 

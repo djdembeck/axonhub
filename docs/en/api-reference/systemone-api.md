@@ -6,6 +6,8 @@ AxonHub natively supports the **System One** decision inference API, launched in
 
 System One is rooted in cognitive psychology's "System 1" thinking (fast, intuitive, and deterministic decision-making). Unlike conventional generative Large Language Models (LLMs) that produce free text token-by-token, System One focuses on making fast, highly calibrated, probabilistic judgments and classifications over a structured input state.
 
+Besides TypeSafe, **OpenRouter** and **NanoGPT** also expose a System-One-compatible decisions API. Both are reachable through the same `POST /v1/systemone` route by configuring a `typesafe/systemone` custom endpoint on the corresponding channel; see [Channel Setup and Features](#4-openrouter-and-nanogpt-channels).
+
 > [!IMPORTANT]
 > **System One is NOT Chat Completion**
 > - System One is a **native first-class API format**, on equal footing with OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Embeddings, and Rerank.
@@ -299,6 +301,50 @@ Client requests can use abstracted aliases via model mapping:
 ### 3. Failover and Retries
 - **429 (Rate Limit) / 529 (Overloaded)**: AxonHub triggers retry or failover to alternative TypeSafe channels.
 - **401 (Auth Failed) / 422 (Unprocessable Entity)**: Pass through immediately without redundant retries.
+
+### 4. OpenRouter and NanoGPT Channels
+OpenRouter and NanoGPT natively speak the System One wire format, so no
+format conversion is needed. Configure a `typesafe/systemone` custom endpoint
+on the channel and send the standard System One body (`{model, state,
+questions}`) to `POST /v1/systemone`; the response is `{model, answers,
+usage}`.
+
+**Channel base URL:** keep the channel `base_url` at the provider default so
+the channel's existing chat/models routes keep working:
+
+- OpenRouter: `https://openrouter.ai/api/v1`
+- NanoGPT: `https://nano-gpt.com/api/v1`
+
+**Custom endpoint:** the endpoint's own `base_url` is authoritative for that
+endpoint, so add it with the provider's decisions path — do not change the
+channel base URL (that would break the channel's default routes):
+
+| Provider | Endpoint `base_url` | Endpoint `path` | Upstream URL |
+| :--- | :--- | :--- | :--- |
+| OpenRouter | `https://openrouter.ai` | `/api/alpha/decisions` | `https://openrouter.ai/api/alpha/decisions` |
+| NanoGPT | `https://api.nano-gpt.com` | `/api/v1/decisions` | `https://api.nano-gpt.com/api/v1/decisions` |
+
+For NanoGPT PPLX Decider/Clef/image models, use `https://nano-gpt.com` as the
+endpoint `base_url` instead of `https://api.nano-gpt.com`.
+
+```json
+{
+  "api_format": "typesafe/systemone",
+  "base_url": "https://openrouter.ai",
+  "path": "/api/alpha/decisions"
+}
+```
+
+**Manual model entry:** decision models are not listed in the providers'
+`GET /models` catalogs. Add the model id manually to the channel's supported
+models, then create a model-association condition with request format
+`typesafe/systemone` so that model routes to the System One endpoint. Example
+models: `typesafe/jev-1.13`, `liquid/d1`, `inception/mercury-decide` on
+OpenRouter; `typesafe/jev-1.13`, `llmtech/decider-*`, `liquid/d1`,
+`perplexity/pplx-decider-v1.1-27b`, `cloudflare/clef[-flash]` on NanoGPT.
+
+`typesafe/systemone` remains an opt-in custom endpoint on these channels; it
+is never added as a default.
 
 ---
 

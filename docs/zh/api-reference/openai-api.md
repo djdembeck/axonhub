@@ -277,6 +277,17 @@ Completions、Responses 或 SystemOne。
 - 原生 Decisions 请求和响应不会转换为 SystemOne。SystemOne 端点配置属于独立
   的协议边界，不是 `/v1/decisions` 的回退或兼容路径。
 
+**OpenRouter 与 NanoGPT 的 System One 替代方案：**
+
+OpenRouter 与 NanoGPT 不实现 OpenAI Decisions 的请求体结构
+（`input` / `questions[]` / `predicate`），而是提供与 System One 兼容的
+决策 API。该 API 通过现有的 System One 路由访问：在 `openrouter` 或
+`nanogpt`（或 `nanogpt_responses`）渠道上配置 `typesafe/systemone` 自定义
+端点，然后向 `POST /v1/systemone` 发送 System One 请求体
+（`{model, state, questions}`）。它与上文 Decisions 端点属于不同的契约，
+请求/响应格式与各服务商的端点配置详见
+[System One API](systemone-api.md)。
+
 **虚构响应示例：**
 
 ```json

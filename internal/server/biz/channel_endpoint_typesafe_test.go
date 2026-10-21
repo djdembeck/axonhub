@@ -11,11 +11,12 @@ import (
 )
 
 func TestChannelEndpoint_TypesafeStrictness(t *testing.T) {
-	// 1. Typesafe channel with typesafe/systemone endpoint should pass
-	validEndpoints := []objects.ChannelEndpoint{
+	systemOneEndpoints := []objects.ChannelEndpoint{
 		{APIFormat: llm.APIFormatTypeSafeSystemOne.String()},
 	}
-	require.NoError(t, validateEndpointsForChannelType(channel.TypeTypesafe, validEndpoints))
+
+	// 1. Typesafe channel with typesafe/systemone endpoint should pass
+	require.NoError(t, validateEndpointsForChannelType(channel.TypeTypesafe, systemOneEndpoints))
 
 	// 2. Typesafe channel with openai/chat_completions endpoint should FAIL
 	invalidEndpoints := []objects.ChannelEndpoint{
@@ -25,15 +26,22 @@ func TestChannelEndpoint_TypesafeStrictness(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "only supports api_format")
 
-	// 3. Non-typesafe channel (e.g. OpenAI) with typesafe/systemone endpoint should FAIL
-	openaiWithSystemOne := []objects.ChannelEndpoint{
-		{APIFormat: llm.APIFormatTypeSafeSystemOne.String()},
+	// 3. Allowed non-typesafe channel types with a typesafe/systemone endpoint should pass
+	for _, channelType := range []channel.Type{
+		channel.TypeOpenai,
+		channel.TypeOpenrouter,
+		channel.TypeNanogpt,
+		channel.TypeNanogptResponses,
+	} {
+		require.NoError(t, validateEndpointsForChannelType(channelType, systemOneEndpoints))
 	}
-	err = validateEndpointsForChannelType(channel.TypeOpenai, openaiWithSystemOne)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "only supported by TypeSafe channel types")
 
-	// 4. Default endpoints for TypeSafe channel must only be typesafe/systemone
+	// 4. Disallowed channel type with a typesafe/systemone endpoint should FAIL
+	err = validateEndpointsForChannelType(channel.TypeAnthropic, systemOneEndpoints)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "only supported by TypeSafe, OpenAI, OpenRouter, and NanoGPT channel types")
+
+	// 5. Default endpoints for TypeSafe channel must only be typesafe/systemone
 	defaults := DefaultEndpointsForChannelType(channel.TypeTypesafe)
 	require.Len(t, defaults, 1)
 	require.Equal(t, llm.APIFormatTypeSafeSystemOne.String(), defaults[0].APIFormat)

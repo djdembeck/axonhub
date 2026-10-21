@@ -298,6 +298,18 @@ kept as native JSON, including unknown fields and typed choice values.
   SystemOne endpoint configuration is a separate protocol boundary and is not
   a fallback or compatibility path for `/v1/decisions`.
 
+**System One alternative for OpenRouter and NanoGPT:**
+
+OpenRouter and NanoGPT do not implement the OpenAI Decisions body shape
+(`input` / `questions[]` / `predicate`). They expose a System-One-compatible
+decisions API instead, reachable through the existing System One route:
+configure a `typesafe/systemone` custom endpoint on an `openrouter` or
+`nanogpt` (or `nanogpt_responses`) channel, then send the System One body
+(`{model, state, questions}`) to `POST /v1/systemone`. This is a separate
+contract from the Decisions endpoint above; see
+[System One API](systemone-api.md) for the request/response format and the
+provider-specific endpoint configuration.
+
 **Synthetic response example:**
 
 ```json
