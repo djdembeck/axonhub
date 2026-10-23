@@ -52,8 +52,8 @@ export function getApiFormatsForProvider(provider: string, configs: ProtocolConf
  * Native video is available as a custom endpoint on every ZenMux channel type.
  * The OpenAI Decisions endpoint is opt-in for the OpenAI channel only; the
  * backend still accepts manual configuration for other channel types.
- * The TypeSafe System One endpoint is opt-in for the `openai`, `openrouter`,
- * `nanogpt`, and `nanogpt_responses` channel types.
+ * The TypeSafe System One endpoint is native to TypeSafe and opt-in for the
+ * `openai`, `cloudflare`, `openrouter`, `nanogpt`, and `nanogpt_responses` channel types.
  * Codex Responses endpoints are managed by the WebSocket checkbox instead.
  * Other custom endpoint formats remain available everywhere.
  */
@@ -64,7 +64,7 @@ export function getConfigurableApiFormatsForChannelType(
   if (channelType === 'typesafe') {
     return ['typesafe/systemone'];
   }
-  const systemOneAllowedChannelTypes = ['openai', 'openrouter', 'nanogpt', 'nanogpt_responses'];
+  const systemOneAllowedChannelTypes = ['openai', 'cloudflare', 'openrouter', 'nanogpt', 'nanogpt_responses'];
   const filtered = configurableFormats
     .filter((format) => systemOneAllowedChannelTypes.includes(channelType) || format !== 'typesafe/systemone')
     .filter((format) => channelType === 'openai' || format !== 'openai/decisions')

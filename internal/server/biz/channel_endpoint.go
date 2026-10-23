@@ -348,17 +348,10 @@ var defaultEndpointsForChannelType = map[channel.Type][]objects.ChannelEndpoint{
 	channel.TypeTypesafe: {
 		{APIFormat: llm.APIFormatTypeSafeSystemOne.String()},
 	},
-}
-
-// systemOneAllowedChannelTypes lists channel types that may expose a
-// typesafe/systemone endpoint. TypeSafe is native; the others are opt-in for
-// providers that expose a System One-compatible Decisions API (OpenAI, OpenRouter, NanoGPT).
-var systemOneAllowedChannelTypes = map[channel.Type]struct{}{
-	channel.TypeTypesafe:         {},
-	channel.TypeOpenai:           {},
-	channel.TypeOpenrouter:       {},
-	channel.TypeNanogpt:          {},
-	channel.TypeNanogptResponses: {},
+	channel.TypeCloudflare: {
+		{APIFormat: llm.APIFormatOpenAIChatCompletion.String()},
+		{APIFormat: llm.APIFormatOpenAIEmbedding.String()},
+	},
 }
 
 func validateEndpointsForChannelType(channelType channel.Type, endpoints []objects.ChannelEndpoint, baseURL ...string) error {
@@ -375,10 +368,8 @@ func validateEndpointsForChannelType(channelType channel.Type, endpoints []objec
 	}
 
 	for _, endpoint := range endpoints {
-		if endpoint.APIFormat == llm.APIFormatTypeSafeSystemOne.String() {
-			if _, ok := systemOneAllowedChannelTypes[channelType]; !ok {
-				return fmt.Errorf("api_format %q is only supported by TypeSafe, OpenAI, OpenRouter, and NanoGPT channel types", endpoint.APIFormat)
-			}
+		if endpoint.APIFormat == llm.APIFormatTypeSafeSystemOne.String() && !supportsSystemOneEndpoint(channelType) {
+			return fmt.Errorf("api_format %q is only supported by TypeSafe, OpenAI, OpenRouter, NanoGPT, and Cloudflare channel types", endpoint.APIFormat)
 		}
 	}
 
@@ -393,6 +384,19 @@ func validateEndpointsForChannelType(channelType channel.Type, endpoints []objec
 	}
 
 	return nil
+}
+
+// supportsSystemOneEndpoint reports whether a channel type may serve the
+// typesafe/systemone api format. TypeSafe is native; OpenAI, OpenRouter, NanoGPT,
+// and Cloudflare Workers AI accept it alongside their existing endpoint surfaces.
+func supportsSystemOneEndpoint(channelType channel.Type) bool {
+	switch channelType {
+	case channel.TypeTypesafe, channel.TypeOpenai, channel.TypeCloudflare,
+		channel.TypeOpenrouter, channel.TypeNanogpt, channel.TypeNanogptResponses:
+		return true
+	default:
+		return false
+	}
 }
 
 func DefaultEndpointsForChannelType(t channel.Type) []objects.ChannelEndpoint {
