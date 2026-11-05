@@ -1967,6 +1967,46 @@ func TestPersistentOutboundTransformer_CanRetry_ChannelRetryableStatusCodes(t *t
 	require.False(t, outbound.CanRetry(&httpclient.Error{StatusCode: http.StatusUnauthorized}))
 }
 
+func TestPersistentOutboundTransformer_CanRetry_RouterCapacityOverridesRetryableCodes(t *testing.T) {
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "local-router",
+			Settings: &objects.ChannelSettings{
+				RetryableStatusCodes: []int{http.StatusTooManyRequests},
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{
+				Channel: channel,
+				Models:  []biz.ChannelModelEntry{{RequestModel: "qwen3.8-27b", ActualModel: "qwen3.8-27b"}},
+			},
+			CurrentModelIndex: 0,
+		},
+	}
+
+	routerErr := &httpclient.Error{
+		StatusCode: http.StatusTooManyRequests,
+		Headers: http.Header{
+			"Retry-After":     []string{"1"},
+			"X-Router-Reason": []string{"session-admission-timeout"},
+		},
+	}
+	require.False(t, outbound.CanRetry(routerErr),
+		"router capacity 429 must switch channels even when 429 is retryable for the channel")
+
+	providerErr := &httpclient.Error{
+		StatusCode: http.StatusTooManyRequests,
+		Headers:    http.Header{"Retry-After": []string{"1"}},
+	}
+	require.True(t, outbound.CanRetry(providerErr),
+		"provider 429 keeps the channel's own retry policy")
+}
+
 func TestPersistentOutboundTransformer_CanRetry_429_WithMultipleModels(t *testing.T) {
 	channel := &biz.Channel{
 		Channel: &ent.Channel{

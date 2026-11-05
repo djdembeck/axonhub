@@ -1059,6 +1059,17 @@ func (p *PersistentOutboundTransformer) CanRetry(err error) bool {
 		return true
 	}
 
+	// Local router capacity 429s always switch channels, even when the channel
+	// lists 429 in RetryableStatusCodes: same-channel retry cannot create local
+	// admission capacity, and the router's own reason header identifies this as
+	// local saturation rather than a flaky upstream endpoint.
+	if isRouterCapacityError(err) {
+		log.Debug(context.Background(), "router capacity 429, switching to the next channel",
+			log.Int("channel_id", p.state.CurrentCandidate.Channel.ID),
+		)
+		return false
+	}
+
 	// 429 Too Many Requests: skip same-channel retry and switch channels.
 	// The upstream is explicitly rate-limiting this channel, so retrying the same
 	// channel would just burn a retry attempt without any chance of success.

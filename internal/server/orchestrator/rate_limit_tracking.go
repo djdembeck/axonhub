@@ -77,8 +77,12 @@ func (m *rateLimitTracking) OnOutboundRawError(ctx context.Context, err error) {
 		return
 	}
 
-	// Local admission rejections never reached upstream — they must not trigger cooldown.
-	if isChannelQueueError(err) || isLocalRPMExhaustedError(err) {
+	// Local admission rejections never reached upstream — they must not trigger
+	// cooldown. Router capacity 429s did reach the router, but they report local
+	// saturation (X-Router-Reason), not an upstream provider quota; cooling the
+	// healthy channel would redirect established conversations and destroy the
+	// locality the router is protecting.
+	if isChannelQueueError(err) || isLocalRPMExhaustedError(err) || isRouterCapacityError(err) {
 		return
 	}
 

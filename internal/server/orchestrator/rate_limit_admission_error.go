@@ -52,3 +52,15 @@ func isLocalRPMExhaustedError(err error) bool {
 	var rpmErr *LocalRPMExhaustedError
 	return errors.As(err, &rpmErr)
 }
+
+// isRouterCapacityError reports a 429 produced by the local LLM router's
+// admission/capacity gates, identified by its X-Router-Reason response header.
+// The router is healthy but its local queue is full; the request should fall
+// back, but the channel must not be cooled down like a provider quota 429.
+func isRouterCapacityError(err error) bool {
+	var httpErr *httpclient.Error
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+	return httpErr.Headers != nil && httpErr.Headers.Get("X-Router-Reason") != ""
+}

@@ -288,6 +288,30 @@ func TestRateLimitTracking_OnOutboundRawError_429(t *testing.T) {
 	assert.True(t, tracker.IsCoolingDown(channel.ID))
 }
 
+func TestRateLimitTracking_OnOutboundRawError_RouterCapacityIgnored(t *testing.T) {
+	tracker := NewChannelRequestTracker()
+
+	channel := &biz.Channel{Channel: &ent.Channel{ID: 8, Name: "local-router"}}
+	state := &PersistenceState{
+		CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+	}
+	outbound := &PersistentOutboundTransformer{state: state}
+	middleware := &rateLimitTracking{outbound: outbound, tracker: tracker}
+
+	routerErr := &httpclient.Error{
+		StatusCode: http.StatusTooManyRequests,
+		Headers: http.Header{
+			"Retry-After":     []string{"1"},
+			"X-Router-Reason": []string{"session-admission-timeout"},
+		},
+	}
+
+	middleware.OnOutboundRawError(context.Background(), routerErr)
+
+	assert.False(t, tracker.IsCoolingDown(channel.ID),
+		"router capacity 429 must not cool down the healthy local channel")
+}
+
 func TestRateLimitTracking_OnOutboundRawError_QueueErrorIgnored(t *testing.T) {
 	tracker := NewChannelRequestTracker()
 
